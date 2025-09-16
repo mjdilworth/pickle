@@ -65,6 +65,24 @@
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
 #endif
 
+// Logging macros for consistent output formatting
+#define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
+#define LOG_DRM(fmt, ...)   fprintf(stderr, "[DRM] " fmt "\n", ##__VA_ARGS__)
+#define LOG_MPV(fmt, ...)   fprintf(stderr, "[MPV] " fmt "\n", ##__VA_ARGS__)
+#define LOG_EGL(fmt, ...)   fprintf(stderr, "[EGL] " fmt "\n", ##__VA_ARGS__)
+#define LOG_GL(fmt, ...)    fprintf(stderr, "[GL] " fmt "\n", ##__VA_ARGS__)
+
+// Debug logging - only prints when g_debug is enabled
+#define LOG_DEBUG(fmt, ...) do { if (g_debug) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
+
+// Timing and performance logging - only prints when g_frame_timing_enabled is enabled
+#define LOG_TIMING(fmt, ...) do { if (g_frame_timing_enabled) fprintf(stderr, "[TIMING] " fmt "\n", ##__VA_ARGS__); } while(0)
+
+// Stats logging - only prints when g_stats_enabled is enabled
+#define LOG_STATS(fmt, ...) do { if (g_stats_enabled) fprintf(stderr, "[STATS] " fmt "\n", ##__VA_ARGS__); } while(0)
+
 // Map mpv end-file reasons to readable strings (see mpv/client.h enum mpv_end_file_reason)
 static const char *mpv_end_reason_str(int r) {
 	switch (r) {
@@ -78,8 +96,14 @@ static const char *mpv_end_reason_str(int r) {
 }
 
 // Simple macro error handling
-#define CHECK(x, msg) do { if (!(x)) { fprintf(stderr, "ERROR: %s failed (%s) at %s:%d\n", msg, strerror(errno), __FILE__, __LINE__); goto fail; } } while (0)
-#define RET(msg) do { fprintf(stderr, "ERROR: %s at %s:%d\n", msg, __FILE__, __LINE__); goto fail; } while (0)
+#define CHECK(x, msg) do { if (!(x)) { LOG_ERROR("%s failed (%s) at %s:%d", msg, strerror(errno), __FILE__, __LINE__); goto fail; } } while (0)
+#define RET(msg) do { LOG_ERROR("%s at %s:%d", msg, __FILE__, __LINE__); goto fail; } while (0)
+
+// Error handling with return values instead of goto
+#define RETURN_ERROR(msg) do { LOG_ERROR("%s", msg); return false; } while (0)
+#define RETURN_ERROR_ERRNO(msg) do { LOG_ERROR("%s: %s", msg, strerror(errno)); return false; } while (0)
+#define RETURN_ERROR_EGL(msg) do { LOG_ERROR("%s (eglError=0x%04x)", msg, eglGetError()); return false; } while (0)
+#define RETURN_ERROR_IF(cond, msg) do { if (cond) { RETURN_ERROR(msg); } } while (0)
 
 static volatile sig_atomic_t g_stop = 0;
 static void handle_sigint(int s){ (void)s; g_stop = 1; }
@@ -93,23 +117,51 @@ static void handle_sigsegv(int s){
 }
 
 // --- mpv OpenGL proc loader ---
-static void *g_libegl;
-static void *g_libgles;
+static void *g_libegl = NULL;
+static void *g_libgles = NULL;
+
+// Initialize OpenGL library handles once
+static void init_gl_proc_resolver(void) {
+    if (g_libegl == NULL) {
+        g_libegl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+        if (!g_libegl) g_libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!g_libegl) LOG_WARN("Failed to dlopen libEGL.so.1 or libEGL.so");
+    }
+    
+    if (g_libgles == NULL) {
+        g_libgles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+        if (!g_libgles) g_libgles = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!g_libgles) LOG_WARN("Failed to dlopen libGLESv2.so.2 or libGLESv2.so");
+    }
+}
+
+static void cleanup_gl_proc_resolver(void) {
+    if (g_libegl) {
+        dlclose(g_libegl);
+        g_libegl = NULL;
+    }
+    
+    if (g_libgles) {
+        dlclose(g_libgles);
+        g_libgles = NULL;
+    }
+}
+
 static void *mpv_get_proc_address(void *ctx, const char *name) {
-	(void)ctx;
-	if (!g_libegl) {
-		g_libegl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
-		if (!g_libegl) g_libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-	}
-	if (!g_libgles) {
-		g_libgles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
-		if (!g_libgles) g_libgles = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
-	}
-	void *p = NULL;
-	if (g_libegl) p = dlsym(g_libegl, name);
-	if (!p && g_libgles) p = dlsym(g_libgles, name);
-	if (!p) p = (void*)eglGetProcAddress(name);
-	return p;
+    (void)ctx;
+    
+    // Initialize libraries if needed
+    if (!g_libegl && !g_libgles) {
+        init_gl_proc_resolver();
+    }
+    
+    // Try to resolve the symbol from loaded libraries
+    void *p = NULL;
+    if (g_libegl) p = dlsym(g_libegl, name);
+    if (!p && g_libgles) p = dlsym(g_libgles, name);
+    if (!p) p = (void*)eglGetProcAddress(name);
+    
+    return p;
 }
 
 struct kms_ctx {
@@ -141,40 +193,59 @@ struct fb_ring {
     int active;     // number of BOs currently in use (for triple buffering)
     int next_index; // next index to use
 };
-static struct fb_ring g_fb_ring = {0};
 
+// Typedefs for clarity
+typedef struct kms_ctx kms_ctx_t;
+typedef struct egl_ctx egl_ctx_t;
+typedef struct fb_ring fb_ring_t;
+typedef struct fb_ring_entry fb_ring_entry_t;
+
+// Global state 
+static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
 
 static bool ensure_drm_master(int fd) {
 	// Attempt to become DRM master; non-fatal if it fails (we may still page flip if compositor allows)
 	if (drmSetMaster(fd) == 0) {
-		fprintf(stderr, "[DRM] Acquired master\n");
+		LOG_DRM("Acquired master");
 		g_have_master = 1;
 		return true;
 	}
-	fprintf(stderr, "[DRM] drmSetMaster failed (%s) – another process may own the display. Modeset might fail.\n", strerror(errno));
+	LOG_DRM("drmSetMaster failed (%s) – another process may own the display. Modeset might fail.", strerror(errno));
 	return false;
 }
 
-static bool init_drm(struct kms_ctx *d) {
+/**
+ * Initialize DRM by scanning available cards and finding one with a connected display
+ * 
+ * @param d Pointer to kms_ctx structure to initialize
+ * @return true on success, false on failure
+ */
+static bool init_drm(kms_ctx_t *d) {
 	memset(d, 0, sizeof(*d));
+	d->fd = -1; // Initialize to invalid
+
 	// Enumerate potential /dev/dri/card* nodes (0-15) to find one with resources + connected connector.
 	// On Raspberry Pi 4 with full KMS (dtoverlay=vc4-kms-v3d), the primary render/display node
 	// is typically card1 (card0 often firmware emulation or simpledrm early driver). We scan
 	// all to stay generic across distro kernels.
 	char path[32];
+	bool found_card = false;
+	
 	for (int idx=0; idx<16; ++idx) {
 		snprintf(path, sizeof(path), "/dev/dri/card%d", idx);
 		int fd = open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0) {
 			continue; // skip silently; permission or non-existent
 		}
+		
 		drmModeRes *res = drmModeGetResources(fd);
 		if (!res) {
-			fprintf(stderr, "[DRM] card%d: drmModeGetResources failed: %s\n", idx, strerror(errno));
+			LOG_DRM("card%d: drmModeGetResources failed: %s", idx, strerror(errno));
 			close(fd);
 			continue;
 		}
+		
 		// Scan for a connected connector
 		drmModeConnector *chosen = NULL;
 		for (int i=0; i<res->count_connectors; ++i) {
@@ -185,76 +256,145 @@ static bool init_drm(struct kms_ctx *d) {
 			}
 			if (conn) drmModeFreeConnector(conn);
 		}
+		
 		if (!chosen) {
 			drmModeFreeResources(res);
 			close(fd);
 			continue; // try next card
 		}
+		
 		// Found a suitable device
 		d->fd = fd;
 		d->res = res;
 		d->connector = chosen;
 		d->connector_id = chosen->connector_id;
+		
 		// Pick preferred mode if flagged, else first.
 		d->mode = chosen->modes[0];
 		for (int mi = 0; mi < chosen->count_modes; ++mi) {
-			if (chosen->modes[mi].type & DRM_MODE_TYPE_PREFERRED) { d->mode = chosen->modes[mi]; break; }
+			if (chosen->modes[mi].type & DRM_MODE_TYPE_PREFERRED) { 
+				d->mode = chosen->modes[mi]; 
+				break; 
+			}
 		}
-		fprintf(stderr, "[DRM] Selected card path %s\n", path);
+		
+		LOG_DRM("Selected card path %s", path);
 		ensure_drm_master(fd);
+		found_card = true;
 		break;
 	}
-	if (d->fd < 0 || !d->connector) {
-		fprintf(stderr, "Failed to locate a usable DRM device.\n");
-		fprintf(stderr, "Troubleshooting: Ensure vc4 KMS overlay enabled and you have permission (try sudo or be in 'video' group).\n");
+	
+	if (!found_card || d->fd < 0 || !d->connector) {
+		LOG_ERROR("Failed to locate a usable DRM device");
+		LOG_ERROR("Troubleshooting: Ensure vc4 KMS overlay enabled and you have permission (try sudo or be in 'video' group)");
 		return false;
 	}
 
 	// Find encoder for connector
-	if (d->connector->encoder_id)
+	if (d->connector->encoder_id) {
 		d->encoder = drmModeGetEncoder(d->fd, d->connector->encoder_id);
+	}
+	
 	if (!d->encoder) {
 		for (int i=0; i<d->connector->count_encoders; ++i) {
 			d->encoder = drmModeGetEncoder(d->fd, d->connector->encoders[i]);
 			if (d->encoder) break;
 		}
 	}
-	if (!d->encoder) { fprintf(stderr, "No encoder for connector %u\n", d->connector_id); return false; }
+	
+	if (!d->encoder) {
+		LOG_ERROR("No encoder found for connector %u", d->connector_id);
+		return false;
+	}
+	
 	d->crtc_id = d->encoder->crtc_id;
 	d->orig_crtc = drmModeGetCrtc(d->fd, d->crtc_id);
-	if (!d->orig_crtc) { fprintf(stderr, "Failed get original CRTC (%s)\n", strerror(errno)); return false; }
-	fprintf(stderr, "[DRM] Using card with fd=%d connector=%u mode=%s %ux%u@%u\n", d->fd, d->connector_id, d->mode.name, d->mode.hdisplay, d->mode.vdisplay, d->mode.vrefresh);
+	
+	if (!d->orig_crtc) {
+		LOG_ERROR("Failed to get original CRTC (%s)", strerror(errno));
+		return false;
+	}
+	
+	LOG_DRM("Using card with fd=%d connector=%u mode=%s %ux%u@%u", 
+		d->fd, d->connector_id, d->mode.name, 
+		d->mode.hdisplay, d->mode.vdisplay, d->mode.vrefresh);
 
 	return true;
 }
 
-static void deinit_drm(struct kms_ctx *d) {
+/**
+ * Clean up DRM resources and restore original CRTC state
+ * 
+ * @param d Pointer to kms_ctx structure to clean up
+ */
+static void deinit_drm(kms_ctx_t *d) {
 	if (!d) return;
+	
 	if (d->orig_crtc) {
+		// Restore original CRTC configuration
 		drmModeSetCrtc(d->fd, d->orig_crtc->crtc_id, d->orig_crtc->buffer_id,
 					   d->orig_crtc->x, d->orig_crtc->y, &d->connector_id, 1, &d->orig_crtc->mode);
 		drmModeFreeCrtc(d->orig_crtc);
+		d->orig_crtc = NULL;
 	}
-	if (d->encoder) drmModeFreeEncoder(d->encoder);
-	if (d->connector) drmModeFreeConnector(d->connector);
-	if (d->res) drmModeFreeResources(d->res);
-	if (d->fd >= 0) close(d->fd);
+	
+	if (d->encoder) {
+		drmModeFreeEncoder(d->encoder);
+		d->encoder = NULL;
+	}
+	
+	if (d->connector) {
+		drmModeFreeConnector(d->connector);
+		d->connector = NULL;
+	}
+	
+	if (d->res) {
+		drmModeFreeResources(d->res);
+		d->res = NULL;
+	}
+	
+	if (d->fd >= 0) {
+		close(d->fd);
+		d->fd = -1;
+	}
 }
 
-static bool init_gbm_egl(const struct kms_ctx *d, struct egl_ctx *e) {
+/**
+ * Initialize GBM and EGL for OpenGL ES rendering
+ * 
+ * @param d Pointer to initialized DRM context
+ * @param e Pointer to EGL context structure to initialize
+ * @return true on success, false on failure
+ */
+static bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
 	memset(e, 0, sizeof(*e));
+	
+	// Create GBM device from DRM file descriptor
 	e->gbm_dev = gbm_create_device(d->fd);
-	if (!e->gbm_dev) { fprintf(stderr, "gbm_create_device failed (%s)\n", strerror(errno)); return false; }
+	if (!e->gbm_dev) {
+		RETURN_ERROR_ERRNO("gbm_create_device failed");
+	}
+	
+	// Create GBM surface matching display resolution
 	e->gbm_surf = gbm_surface_create(e->gbm_dev, d->mode.hdisplay, d->mode.vdisplay,
 						 GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-	if (!e->gbm_surf) { fprintf(stderr, "gbm_surface_create failed (%s)\n", strerror(errno)); return false; }
+	if (!e->gbm_surf) {
+		RETURN_ERROR_ERRNO("gbm_surface_create failed");
+	}
 
+	// Initialize EGL from GBM device
 	e->dpy = eglGetDisplay((EGLNativeDisplayType)e->gbm_dev);
-	if (e->dpy == EGL_NO_DISPLAY) { fprintf(stderr, "eglGetDisplay failed\n"); return false; }
-	if (!eglInitialize(e->dpy, NULL, NULL)) { fprintf(stderr, "eglInitialize failed (eglError=0x%04x)\n", eglGetError()); return false; }
+	if (e->dpy == EGL_NO_DISPLAY) {
+		RETURN_ERROR("eglGetDisplay failed");
+	}
+	
+	if (!eglInitialize(e->dpy, NULL, NULL)) {
+		RETURN_ERROR_EGL("eglInitialize failed");
+	}
+	
 	eglBindAPI(EGL_OPENGL_ES_API);
 
-	// We must pick an EGLConfig compatible with the GBM surface format (XRGB8888). We'll iterate.
+	// We must pick an EGLConfig compatible with the GBM surface format (XRGB8888)
 	EGLint cfg_attrs[] = {
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -264,43 +404,60 @@ static bool init_gbm_egl(const struct kms_ctx *d, struct egl_ctx *e) {
 		EGL_ALPHA_SIZE, 0,
 		EGL_NONE
 	};
-	EGLint num=0;
+	
+	// First query how many configs match our criteria
+	EGLint num = 0;
 	if (!eglChooseConfig(e->dpy, cfg_attrs, NULL, 0, &num) || num == 0) {
-		fprintf(stderr, "eglChooseConfig(query) failed (eglError=0x%04x)\n", eglGetError());
-		return false;
+		RETURN_ERROR_EGL("eglChooseConfig(query) failed");
 	}
+	
+	// Allocate space for matching configs
 	size_t cfg_count = (size_t)num;
 	EGLConfig *cfgs = cfg_count ? calloc(cfg_count, sizeof(EGLConfig)) : NULL;
-	if (!cfgs) { fprintf(stderr, "Out of memory allocating config list\n"); return false; }
-	if (!eglChooseConfig(e->dpy, cfg_attrs, cfgs, num, &num)) {
-		fprintf(stderr, "eglChooseConfig(list) failed (eglError=0x%04x)\n", eglGetError());
-		free(cfgs);
-		return false;
+	if (!cfgs) {
+		RETURN_ERROR("Out of memory allocating config list");
 	}
+	
+	// Get the actual matching configs
+	if (!eglChooseConfig(e->dpy, cfg_attrs, cfgs, num, &num)) {
+		free(cfgs);
+		RETURN_ERROR_EGL("eglChooseConfig(list) failed");
+	}
+	
+	// Choose the best config - prefer one with 0 alpha for XRGB format
 	EGLConfig chosen = NULL;
-	for (int i=0; i<num; ++i) {
-		EGLint r,g,b,a;
+	for (int i = 0; i < num; ++i) {
+		EGLint r, g, b, a;
 		eglGetConfigAttrib(e->dpy, cfgs[i], EGL_RED_SIZE, &r);
 		eglGetConfigAttrib(e->dpy, cfgs[i], EGL_GREEN_SIZE, &g);
 		eglGetConfigAttrib(e->dpy, cfgs[i], EGL_BLUE_SIZE, &b);
 		eglGetConfigAttrib(e->dpy, cfgs[i], EGL_ALPHA_SIZE, &a);
-		if (r==8 && g==8 && b==8) { // alpha may be 0 or 8; either OK with XRGB
+		
+		if (r == 8 && g == 8 && b == 8) { // alpha may be 0 or 8; either OK with XRGB
 			chosen = cfgs[i];
-			if (a==0) break; // perfect match for XRGB
+			if (a == 0) break; // perfect match for XRGB
 		}
 	}
-	if (!chosen) chosen = cfgs[0];
+	
+	if (!chosen) chosen = cfgs[0]; // fallback to first config if no ideal match
 	e->config = chosen;
 	free(cfgs);
+	
+	// Create EGL context
 	EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
 	e->ctx = eglCreateContext(e->dpy, e->config, EGL_NO_CONTEXT, ctx_attr);
-	if (e->ctx == EGL_NO_CONTEXT) { fprintf(stderr, "eglCreateContext failed (eglError=0x%04x)\n", eglGetError()); return false; }
+	if (e->ctx == EGL_NO_CONTEXT) {
+		RETURN_ERROR_EGL("eglCreateContext failed");
+	}
+	
+	// Create window surface
 	EGLint win_attrs[] = { EGL_NONE };
 	e->surf = eglCreateWindowSurface(e->dpy, e->config, (EGLNativeWindowType)e->gbm_surf, win_attrs);
-	if (e->surf == EGL_NO_SURFACE) { fprintf(stderr, "eglCreateWindowSurface failed (eglError=0x%04x) -> trying with alpha config fallback\n", eglGetError()); }
+	
 	if (e->surf == EGL_NO_SURFACE) {
-		// Retry with alpha-enabled config if original lacked alpha.
-		// Simple fallback: request alpha size 8.
+		LOG_EGL("eglCreateWindowSurface failed -> trying with alpha config fallback");
+		
+		// Retry with alpha-enabled config if original lacked alpha
 		EGLint retry_attrs[] = {
 			EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 			EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -310,41 +467,80 @@ static bool init_gbm_egl(const struct kms_ctx *d, struct egl_ctx *e) {
 			EGL_ALPHA_SIZE, 8,
 			EGL_NONE
 		};
-		EGLint n2=0;
-		if (eglChooseConfig(e->dpy, retry_attrs, &e->config, 1, &n2) && n2==1) {
+		
+		EGLint n2 = 0;
+		if (eglChooseConfig(e->dpy, retry_attrs, &e->config, 1, &n2) && n2 == 1) {
 			e->surf = eglCreateWindowSurface(e->dpy, e->config, (EGLNativeWindowType)e->gbm_surf, win_attrs);
 		}
+		
 		if (e->surf == EGL_NO_SURFACE) {
-			fprintf(stderr, "eglCreateWindowSurface still failed (eglError=0x%04x)\n", eglGetError());
-			return false;
+			RETURN_ERROR_EGL("eglCreateWindowSurface still failed after retry");
 		}
 	}
-	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) { fprintf(stderr, "eglMakeCurrent failed (eglError=0x%04x)\n", eglGetError()); return false; }
+	
+	// Make our context current
+	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
+		RETURN_ERROR_EGL("eglMakeCurrent failed");
+	}
+	
+	// Log GL info
 	const char *gl_vendor = (const char*)glGetString(GL_VENDOR);
 	const char *gl_renderer = (const char*)glGetString(GL_RENDERER);
 	const char *gl_version = (const char*)glGetString(GL_VERSION);
-	fprintf(stderr, "[GL] VENDOR='%s' RENDERER='%s' VERSION='%s'\n", gl_vendor?gl_vendor:"?", gl_renderer?gl_renderer:"?", gl_version?gl_version:"?");
+	LOG_GL("VENDOR='%s' RENDERER='%s' VERSION='%s'", 
+		gl_vendor ? gl_vendor : "?", 
+		gl_renderer ? gl_renderer : "?", 
+		gl_version ? gl_version : "?");
+		
 	return true;
 }
 
-static void deinit_gbm_egl(struct egl_ctx *e) {
+/**
+ * Clean up GBM and EGL resources
+ * 
+ * @param e Pointer to EGL context structure to clean up
+ */
+static void deinit_gbm_egl(egl_ctx_t *e) {
 	if (!e) return;
+	
 	if (e->dpy != EGL_NO_DISPLAY) {
+		// Release current context
 		eglMakeCurrent(e->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-		if (e->ctx != EGL_NO_CONTEXT) eglDestroyContext(e->dpy, e->ctx);
-		if (e->surf != EGL_NO_SURFACE) eglDestroySurface(e->dpy, e->surf);
+		
+		// Destroy context and surface if they exist
+		if (e->ctx != EGL_NO_CONTEXT) {
+			eglDestroyContext(e->dpy, e->ctx);
+			e->ctx = EGL_NO_CONTEXT;
+		}
+		
+		if (e->surf != EGL_NO_SURFACE) {
+			eglDestroySurface(e->dpy, e->surf);
+			e->surf = EGL_NO_SURFACE;
+		}
+		
+		// Terminate EGL display
 		eglTerminate(e->dpy);
+		e->dpy = EGL_NO_DISPLAY;
 	}
-	if (e->gbm_surf) gbm_surface_destroy(e->gbm_surf);
-	if (e->gbm_dev) gbm_device_destroy(e->gbm_dev);
+	
+	// Destroy GBM resources
+	if (e->gbm_surf) {
+		gbm_surface_destroy(e->gbm_surf);
+		e->gbm_surf = NULL;
+	}
+	
+	if (e->gbm_dev) {
+		gbm_device_destroy(e->gbm_dev);
+		e->gbm_dev = NULL;
+	}
 }
 
-// mpv rendering integration
-struct mpv_player {
-	mpv_handle *mpv;
-	mpv_render_context *rctx;
-	int using_libmpv; // flag indicating fallback to vo=libmpv occurred
-};
+// MPV rendering integration
+typedef struct {
+	mpv_handle *mpv;             // MPV API handle
+	mpv_render_context *rctx;    // MPV render context for OpenGL rendering
+	int using_libmpv;            // Flag indicating fallback to vo=libmpv occurred
+} mpv_player_t;
 
 // Wakeup callback sets a flag so main loop knows mpv wants processing.
 static volatile int g_mpv_wakeup = 0;
@@ -395,7 +591,7 @@ static double tv_diff(const struct timeval *a, const struct timeval *b) {
 	return (double)(a->tv_sec - b->tv_sec) + (double)(a->tv_usec - b->tv_usec)/1e6;
 }
 
-static void stats_log_periodic(struct mpv_player *p) {
+static void stats_log_periodic(mpv_player_t *p) {
 	if (!g_stats_enabled) return;
 	struct timeval now; gettimeofday(&now, NULL);
 	double since_last = tv_diff(&now, &g_stats_last);
@@ -418,7 +614,7 @@ static void stats_log_periodic(struct mpv_player *p) {
 	g_stats_last_frames = frames_now;
 }
 
-static void stats_log_final(struct mpv_player *p) {
+static void stats_log_final(mpv_player_t *p) {
 	if (!g_stats_enabled) return;
 	struct timeval now; gettimeofday(&now, NULL);
 	double total = tv_diff(&now, &g_stats_start);
@@ -443,7 +639,7 @@ static void log_opt_result(const char *opt, int code) {
 	if (code < 0) fprintf(stderr, "[mpv] option %s failed (%d)\n", opt, code);
 }
 
-static bool init_mpv(struct mpv_player *p, const char *file) {
+static bool init_mpv(mpv_player_t *p, const char *file) {
 	memset(p,0,sizeof(*p));
 	const char *no_mpv = getenv("PICKLE_NO_MPV");
 	if (no_mpv && *no_mpv) {
@@ -588,11 +784,22 @@ static bool init_mpv(struct mpv_player *p, const char *file) {
 	return true;
 }
 
-static void destroy_mpv(struct mpv_player *p) {
+/**
+ * Clean up MPV resources
+ * 
+ * @param p Pointer to MPV player structure to clean up
+ */
+static void destroy_mpv(mpv_player_t *p) {
 	if (!p) return;
-	if (p->rctx) mpv_render_context_free(p->rctx);
+	
+	if (p->rctx) {
+		mpv_render_context_free(p->rctx);
+		p->rctx = NULL;
+	}
+	
 	if (p->mpv) {
 		mpv_terminate_destroy(p->mpv);
+		p->mpv = NULL;
 	}
 }
 
@@ -685,7 +892,7 @@ static void bo_destroy_handler(struct gbm_bo *bo, void *data) {
 	}
 }
 
-static bool render_frame_fixed(struct kms_ctx *d, struct egl_ctx *e, struct mpv_player *p) {
+static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; }
 	mpv_opengl_fbo fbo = { .fbo = 0, .w = d->mode.hdisplay, .h = d->mode.vdisplay, .internal_format = 0 };
@@ -787,7 +994,14 @@ static bool render_frame_fixed(struct kms_ctx *d, struct egl_ctx *e, struct mpv_
 }
 
 // Preallocate (discover) up to ring_size unique GBM BOs + FB IDs by performing dummy swaps.
-static void preallocate_fb_ring(struct kms_ctx *d, struct egl_ctx *e, int ring_size) {
+/**
+ * Pre-allocate framebuffer objects for triple-buffering
+ * 
+ * @param d Pointer to DRM context
+ * @param e Pointer to EGL context
+ * @param ring_size Number of framebuffers to pre-allocate (typically 3 for triple-buffering)
+ */
+static void preallocate_fb_ring(kms_ctx_t *d, egl_ctx_t *e, int ring_size) {
 	if (ring_size <= 0) return;
 	if (g_fb_ring.entries) return; // already done
 	g_fb_ring.entries = calloc((size_t)ring_size, sizeof(*g_fb_ring.entries));
@@ -874,7 +1088,7 @@ int main(int argc, char **argv) {
 
 	struct kms_ctx drm = {0};
 	struct egl_ctx eglc = {0};
-	struct mpv_player player = {0};
+	mpv_player_t player = {0};
 
 	// Parse stats env
 	const char *stats_env = getenv("PICKLE_STATS");
