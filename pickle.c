@@ -41,8 +41,10 @@
 #include <execinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <termios.h>
+#include <linux/joystick.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -146,7 +148,7 @@ static void init_gl_proc_resolver(void) {
     }
 }
 
-static void cleanup_gl_proc_resolver(void) {
+__attribute__((unused)) static void cleanup_gl_proc_resolver(void) {
     if (g_libegl) {
         dlclose(g_libegl);
         g_libegl = NULL;
@@ -207,10 +209,15 @@ struct fb_ring {
 
 // Keystone correction structure
 typedef struct {
-    float points[4][2];  // Normalized corner coordinates [0.0-1.0]
-    int active_corner;   // Which corner is currently being adjusted (-1 = none)
-    bool enabled;        // Whether keystone correction is enabled
-    float matrix[16];    // The transformation matrix for rendering
+    float points[4][2];      // Normalized corner coordinates [0.0-1.0]
+    int active_corner;       // Which corner is currently being adjusted (-1 = none)
+    bool enabled;            // Whether keystone correction is enabled
+    float matrix[16];        // The transformation matrix for rendering
+    bool mesh_enabled;       // Whether to use mesh-based warping instead of simple 4-point
+    int mesh_size;           // Mesh grid size (e.g., 4 = 4x4 grid)
+    float **mesh_points;     // Dynamic mesh control points [mesh_size][mesh_size][2]
+    int active_mesh_point[2];// Active mesh point coordinates (x,y) or (-1,-1) for none
+    bool perspective_pins[4];// Whether each corner is pinned (fixed) during adjustments
 } keystone_t;
 
 // Typedefs for clarity
@@ -224,11 +231,27 @@ static void keystone_update_matrix(void);
 static void keystone_adjust_corner(int corner, float x_delta, float y_delta);
 static bool keystone_handle_key(char key);
 static void keystone_init(void);
+static bool keystone_save_config(const char* path);
+static void cleanup_mesh_resources(void);
 
 // Global state 
 static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
-static keystone_t g_keystone = {0}; // Keystone correction settings
+static keystone_t g_keystone = {
+    .points = {
+        {0.0f, 0.0f},  // Top-left
+        {1.0f, 0.0f},  // Top-right
+        {0.0f, 1.0f},  // Bottom-left
+        {1.0f, 1.0f}   // Bottom-right
+    },
+    .active_corner = -1,
+    .enabled = false,
+    .mesh_enabled = false,
+    .mesh_size = 4,    // 4x4 mesh by default
+    .mesh_points = NULL,
+    .active_mesh_point = {-1, -1},
+    .perspective_pins = {false, false, false, false}
+}; // Keystone correction settings
 static int g_keystone_adjust_step = 1; // Step size for keystone adjustments (in 1/1000 units)
 static bool g_show_border = false; // Whether to show border around the video
 static int g_border_width = 5; // Border width in pixels
@@ -237,11 +260,45 @@ static GLuint g_keystone_shader_program = 0; // Shader program for keystone corr
 static GLuint g_keystone_vertex_shader = 0;
 static GLuint g_keystone_fragment_shader = 0;
 static GLuint g_keystone_vertex_buffer = 0;
+static GLuint g_keystone_texcoord_buffer = 0;
 static GLint g_keystone_a_position_loc = -1;
+static GLint g_keystone_a_texcoord_loc = -1;
 static GLint g_keystone_u_texture_loc = -1;
+
+// Joystick/gamepad support
+static int g_joystick_fd = -1;        // File descriptor for joystick
+static bool g_joystick_enabled = false; // Whether joystick support is enabled
+static char g_joystick_name[128];     // Name of the connected joystick
+static int g_selected_corner = 0;     // Currently selected corner (0-3)
+static struct timeval g_last_js_event_time = {0}; // For debouncing joystick events
+
+// 8BitDo controller button mappings (may vary by model/mode)
+#define JS_BUTTON_A        0
+#define JS_BUTTON_B        1
+#define JS_BUTTON_X        2
+#define JS_BUTTON_Y        3
+#define JS_BUTTON_L1       4
+#define JS_BUTTON_R1       5
+#define JS_BUTTON_SELECT   6
+#define JS_BUTTON_START    7
+#define JS_BUTTON_HOME     8
+#define JS_BUTTON_L3       9
+#define JS_BUTTON_R3       10
+
+// 8BitDo controller axis mappings
+#define JS_AXIS_LEFT_X     0
+#define JS_AXIS_LEFT_Y     1
+#define JS_AXIS_RIGHT_X    2
+#define JS_AXIS_RIGHT_Y    3
+#define JS_AXIS_L2         4
+#define JS_AXIS_R2         5
+#define JS_AXIS_DPAD_X     6
+#define JS_AXIS_DPAD_Y     7
 
 // Forward declarations
 static void cleanup_keystone_shader(void);
+static bool init_joystick(void);
+static bool handle_joystick_event(struct js_event *event);
 
 static bool ensure_drm_master(int fd) {
 	// Attempt to become DRM master; non-fatal if it fails (we may still page flip if compositor allows)
@@ -925,6 +982,105 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 /**
  * Initialize keystone correction with default values (no correction)
  */
+/**
+ * Load keystone configuration from a specified file path
+ * 
+ * @param path The file path to load the configuration from
+ * @return true if the configuration was loaded successfully, false otherwise
+ */
+static bool keystone_load_config(const char* path) {
+    if (!path) return false;
+    
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        if (strncmp(line, "enabled=", 8) == 0) {
+            g_keystone.enabled = (atoi(line + 8) != 0);
+        }
+        else if (strncmp(line, "mesh_enabled=", 13) == 0) {
+            g_keystone.mesh_enabled = (atoi(line + 13) != 0);
+        }
+        else if (strncmp(line, "mesh_size=", 10) == 0) {
+            int new_size = atoi(line + 10);
+            if (new_size >= 2 && new_size <= 10) { // Sanity check
+                // Only change if different (requires reallocation)
+                if (new_size != g_keystone.mesh_size) {
+                    // Clean up old mesh if it exists
+                    cleanup_mesh_resources();
+                    
+                    // Set new size and allocate
+					g_keystone.mesh_size = new_size;
+					g_keystone.mesh_points = malloc((size_t)new_size * sizeof(float*));
+                    if (g_keystone.mesh_points) {
+                        for (int i = 0; i < new_size; i++) {
+							g_keystone.mesh_points[i] = malloc((size_t)new_size * 2 * sizeof(float));
+                            if (g_keystone.mesh_points[i]) {
+                                // Initialize with default grid positions
+                                for (int j = 0; j < new_size; j++) {
+									float x = (float)j / (float)(new_size - 1);
+									float y = (float)i / (float)(new_size - 1);
+                                    g_keystone.mesh_points[i][j*2] = x;
+                                    g_keystone.mesh_points[i][j*2+1] = y;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else if (strncmp(line, "corner1=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &g_keystone.points[0][0], &g_keystone.points[0][1]);
+        }
+        else if (strncmp(line, "corner2=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &g_keystone.points[1][0], &g_keystone.points[1][1]);
+        }
+        else if (strncmp(line, "corner3=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &g_keystone.points[2][0], &g_keystone.points[2][1]);
+        }
+        else if (strncmp(line, "corner4=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &g_keystone.points[3][0], &g_keystone.points[3][1]);
+        }
+        else if (strncmp(line, "pin1=", 5) == 0) {
+            g_keystone.perspective_pins[0] = (atoi(line + 5) != 0);
+        }
+        else if (strncmp(line, "pin2=", 5) == 0) {
+            g_keystone.perspective_pins[1] = (atoi(line + 5) != 0);
+        }
+        else if (strncmp(line, "pin3=", 5) == 0) {
+            g_keystone.perspective_pins[2] = (atoi(line + 5) != 0);
+        }
+        else if (strncmp(line, "pin4=", 5) == 0) {
+            g_keystone.perspective_pins[3] = (atoi(line + 5) != 0);
+        }
+        else if (strncmp(line, "mesh_", 5) == 0) {
+            // Parse mesh point coordinates: mesh_i_j=x,y
+            int i, j;
+            float x, y;
+            if (sscanf(line + 5, "%d_%d=%f,%f", &i, &j, &x, &y) == 4) {
+                if (i >= 0 && i < g_keystone.mesh_size && 
+                    j >= 0 && j < g_keystone.mesh_size &&
+                    g_keystone.mesh_points && g_keystone.mesh_points[i]) {
+                    g_keystone.mesh_points[i][j*2] = x;
+                    g_keystone.mesh_points[i][j*2+1] = y;
+                }
+            }
+        }
+    }
+    fclose(f);
+    
+    // Update matrix based on loaded settings
+    if (g_keystone.enabled) {
+        keystone_update_matrix();
+    }
+    
+    return true;
+}
+
 static void keystone_init(void) {
     // Initialize with default values (rectangle at full screen)
     g_keystone.points[0][0] = 0.0f; g_keystone.points[0][1] = 0.0f; // Top-left
@@ -934,46 +1090,57 @@ static void keystone_init(void) {
     
     g_keystone.active_corner = -1; // No active corner
     g_keystone.enabled = false;
+    g_keystone.mesh_enabled = false;
+    g_keystone.mesh_size = 4; // 4x4 grid by default
+    g_keystone.active_mesh_point[0] = -1;
+    g_keystone.active_mesh_point[1] = -1;
+    
+    // Initialize perspective pins to all unpinned
+    for (int i = 0; i < 4; i++) {
+        g_keystone.perspective_pins[i] = false;
+    }
     
     // Initialize identity matrix
     for (int i = 0; i < 16; i++) {
         g_keystone.matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
     }
     
-    // Try to load saved configuration from file
-    const char* home = getenv("HOME");
-    if (home) {
-        char config_path[512];
-        snprintf(config_path, sizeof(config_path), "%s/.config/pickle_keystone.conf", home);
-        FILE* f = fopen(config_path, "r");
-        if (f) {
-            char line[128];
-            while (fgets(line, sizeof(line), f)) {
-                // Skip comments and empty lines
-                if (line[0] == '#' || line[0] == '\n') continue;
-                
-                if (strncmp(line, "enabled=", 8) == 0) {
-                    g_keystone.enabled = (atoi(line + 8) != 0);
-                }
-                else if (strncmp(line, "corner1=", 8) == 0) {
-                    sscanf(line + 8, "%f,%f", &g_keystone.points[0][0], &g_keystone.points[0][1]);
-                }
-                else if (strncmp(line, "corner2=", 8) == 0) {
-                    sscanf(line + 8, "%f,%f", &g_keystone.points[1][0], &g_keystone.points[1][1]);
-                }
-                else if (strncmp(line, "corner3=", 8) == 0) {
-                    sscanf(line + 8, "%f,%f", &g_keystone.points[2][0], &g_keystone.points[2][1]);
-                }
-                else if (strncmp(line, "corner4=", 8) == 0) {
-                    sscanf(line + 8, "%f,%f", &g_keystone.points[3][0], &g_keystone.points[3][1]);
+    // Allocate mesh points if necessary
+    if (g_keystone.mesh_points == NULL) {
+	g_keystone.mesh_points = malloc((size_t)g_keystone.mesh_size * sizeof(float*));
+        if (g_keystone.mesh_points) {
+            for (int i = 0; i < g_keystone.mesh_size; i++) {
+				g_keystone.mesh_points[i] = malloc((size_t)g_keystone.mesh_size * 2 * sizeof(float));
+                if (g_keystone.mesh_points[i]) {
+                    // Initialize regular grid of points
+                    for (int j = 0; j < g_keystone.mesh_size; j++) {
+						float x = (float)j / (float)(g_keystone.mesh_size - 1);
+						float y = (float)i / (float)(g_keystone.mesh_size - 1);
+                        g_keystone.mesh_points[i][j*2] = x;     // x coordinate
+                        g_keystone.mesh_points[i][j*2+1] = y;   // y coordinate
+                    }
                 }
             }
-            fclose(f);
-            LOG_INFO("Loaded keystone configuration from %s", config_path);
-            
-            // Update matrix based on loaded settings
-            if (g_keystone.enabled) {
-                keystone_update_matrix();
+        }
+    }
+    
+    bool config_loaded = false;
+    
+    // First try to load from local keystone.conf file in current directory
+    config_loaded = keystone_load_config("./keystone.conf");
+    if (config_loaded) {
+        LOG_INFO("Loaded keystone configuration from ./keystone.conf");
+    }
+    
+    // If local config not found, try to load from user's home directory
+    if (!config_loaded) {
+        const char* home = getenv("HOME");
+        if (home) {
+            char config_path[512];
+            snprintf(config_path, sizeof(config_path), "%s/.config/pickle_keystone.conf", home);
+            if (keystone_load_config(config_path)) {
+                LOG_INFO("Loaded keystone configuration from %s", config_path);
+                config_loaded = true;
             }
         }
     }
@@ -992,7 +1159,7 @@ static void keystone_init(void) {
             char* token = strtok(copy, ",");
             
             while (token && count < 8) {
-                values[count++] = atof(token);
+				values[count++] = strtof(token, NULL);
                 token = strtok(NULL, ",");
             }
             
@@ -1066,7 +1233,7 @@ static void keystone_update_matrix(void) {
     }
     
     // Store the matrix as vertex positions for the shader
-    // Vertex order: top-left, top-right, bottom-left, bottom-right
+    // Vertex order for triangle strip: top-left, top-right, bottom-left, bottom-right
     g_keystone.matrix[0] = vertices[0];  // TL.x
     g_keystone.matrix[1] = vertices[1];  // TL.y
     g_keystone.matrix[2] = vertices[2];  // TR.x
@@ -1088,8 +1255,44 @@ static void keystone_update_matrix(void) {
  * @param x_delta X adjustment (positive = right)
  * @param y_delta Y adjustment (positive = down)
  */
+// Adjust a mesh point position
+static void keystone_adjust_mesh_point(int row, int col, float x_delta, float y_delta) {
+    if (row < 0 || row >= g_keystone.mesh_size || 
+        col < 0 || col >= g_keystone.mesh_size ||
+        !g_keystone.mesh_points || !g_keystone.mesh_points[row]) {
+        return;
+    }
+    
+    // Make step 10x larger to make movement more noticeable
+    x_delta *= 10.0f;
+    y_delta *= 10.0f;
+    
+    // Adjust the mesh point position
+    g_keystone.mesh_points[row][col*2] += x_delta;
+    g_keystone.mesh_points[row][col*2+1] += y_delta;
+    
+    // Clamp values to reasonable ranges (slightly beyond 0-1 to allow for overcorrection)
+    g_keystone.mesh_points[row][col*2] = fmaxf(-0.5f, fminf(1.5f, g_keystone.mesh_points[row][col*2]));
+    g_keystone.mesh_points[row][col*2+1] = fmaxf(-0.5f, fminf(1.5f, g_keystone.mesh_points[row][col*2+1]));
+}
+
+// Toggle pinning status of a corner
+static void keystone_toggle_pin(int corner) {
+    if (corner < 0 || corner > 3) return;
+    
+    // Toggle the pin status
+    g_keystone.perspective_pins[corner] = !g_keystone.perspective_pins[corner];
+    LOG_INFO("Corner %d pin %s", corner + 1, g_keystone.perspective_pins[corner] ? "enabled" : "disabled");
+}
+
 static void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
     if (corner < 0 || corner > 3) return;
+    
+    // If this corner is pinned, don't adjust it
+    if (g_keystone.perspective_pins[corner]) {
+        LOG_INFO("Corner %d is pinned. Unpin with Shift+%d to adjust.", corner + 1, corner + 1);
+        return;
+    }
     
     // Make step 10x larger to make movement more noticeable
     x_delta *= 10.0f;
@@ -1113,10 +1316,14 @@ static void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
 // Shader source code for keystone correction
 static const char* g_vertex_shader_src = 
     "attribute vec2 a_position;\n"
+    "attribute vec2 a_texCoord;\n"
     "varying vec2 v_texCoord;\n"
     "void main() {\n"
-    "    gl_Position = vec4(a_position.x, a_position.y, 0.0, 1.0);\n"
-    "    v_texCoord = vec2(0.5, 0.5) + vec2(a_position.x/2.0, a_position.y/2.0);\n"
+    "    // Position is already in clip space coordinates (-1 to 1)\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "    \n"
+    "    // Use the provided texture coordinates directly\n"
+    "    v_texCoord = a_texCoord;\n"
     "}\n";
 
 static const char* g_fragment_shader_src = 
@@ -1144,7 +1351,7 @@ static GLuint compile_shader(GLenum shader_type, const char* source) {
         GLint info_len = 0;
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &info_len);
         if (info_len > 1) {
-            char* info_log = malloc(sizeof(char) * info_len);
+			char* info_log = malloc(sizeof(char) * (size_t)info_len);
             glGetShaderInfoLog(shader, info_len, NULL, info_log);
             LOG_ERROR("Error compiling shader: %s", info_log);
             free(info_log);
@@ -1198,7 +1405,7 @@ static bool init_keystone_shader() {
         GLint info_len = 0;
         glGetProgramiv(g_keystone_shader_program, GL_INFO_LOG_LENGTH, &info_len);
         if (info_len > 1) {
-            char* info_log = malloc(sizeof(char) * info_len);
+			char* info_log = malloc(sizeof(char) * (size_t)info_len);
             glGetProgramInfoLog(g_keystone_shader_program, info_len, NULL, info_log);
             LOG_ERROR("Error linking shader program: %s", info_log);
             free(info_log);
@@ -1214,6 +1421,7 @@ static bool init_keystone_shader() {
     
     // Get attribute and uniform locations
     g_keystone_a_position_loc = glGetAttribLocation(g_keystone_shader_program, "a_position");
+    g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
     g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
     
     // Create vertex buffer for the quad
@@ -1223,11 +1431,29 @@ static bool init_keystone_shader() {
     return true;
 }
 
+// Free allocated mesh resources
+static void cleanup_mesh_resources(void) {
+    if (g_keystone.mesh_points) {
+        for (int i = 0; i < g_keystone.mesh_size; i++) {
+            if (g_keystone.mesh_points[i]) {
+                free(g_keystone.mesh_points[i]);
+            }
+        }
+        free(g_keystone.mesh_points);
+        g_keystone.mesh_points = NULL;
+    }
+}
+
 // Cleanup keystone shader resources
 static void cleanup_keystone_shader(void) {
     if (g_keystone_vertex_buffer) {
         glDeleteBuffers(1, &g_keystone_vertex_buffer);
         g_keystone_vertex_buffer = 0;
+    }
+    
+    if (g_keystone_texcoord_buffer) {
+        glDeleteBuffers(1, &g_keystone_texcoord_buffer);
+        g_keystone_texcoord_buffer = 0;
     }
     
     if (g_keystone_shader_program) {
@@ -1244,6 +1470,9 @@ static void cleanup_keystone_shader(void) {
         glDeleteShader(g_keystone_fragment_shader);
         g_keystone_fragment_shader = 0;
     }
+    
+    // Cleanup mesh resources
+    cleanup_mesh_resources();
 }
 
 /**
@@ -1277,42 +1506,264 @@ static bool keystone_handle_key(char key) {
             
         case '1': case '2': case '3': case '4': // Select corner
             g_keystone.active_corner = key - '1';
+            g_keystone.active_mesh_point[0] = -1; // Deactivate mesh point
+            g_keystone.active_mesh_point[1] = -1;
             LOG_INFO("Adjusting corner %d", g_keystone.active_corner + 1);
             fprintf(stderr, "\rSelected corner %d (Press w/a/s/d to move)   ", g_keystone.active_corner + 1);
             return true;
             
-        case 'w': // Move active corner up
-            keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
-            fprintf(stderr, "\rActive corner: %d, Press w/a/s/d to move    ", g_keystone.active_corner + 1);
+        case '!': case '@': case '#': case '$': // Pin/unpin corners (shift+1,2,3,4)
+            {
+                int corner = -1;
+                if (key == '!') corner = 0;      // Shift+1
+                else if (key == '@') corner = 1; // Shift+2
+                else if (key == '#') corner = 2; // Shift+3
+                else if (key == '$') corner = 3; // Shift+4
+                
+                if (corner >= 0) {
+                    keystone_toggle_pin(corner);
+                    fprintf(stderr, "\rCorner %d pin %s   ", corner + 1, 
+                            g_keystone.perspective_pins[corner] ? "enabled" : "disabled");
+                    return true;
+                }
+            }
+            break;
+            
+        case 'm': // Toggle mesh warping mode
+            g_keystone.mesh_enabled = !g_keystone.mesh_enabled;
+            LOG_INFO("Mesh warping %s", g_keystone.mesh_enabled ? "enabled" : "disabled");
+            
+            // If enabling, ensure mesh points are allocated
+            if (g_keystone.mesh_enabled && !g_keystone.mesh_points) {
+				g_keystone.mesh_points = malloc((size_t)g_keystone.mesh_size * sizeof(float*));
+                if (g_keystone.mesh_points) {
+                    for (int i = 0; i < g_keystone.mesh_size; i++) {
+						g_keystone.mesh_points[i] = malloc((size_t)g_keystone.mesh_size * 2 * sizeof(float));
+                        if (g_keystone.mesh_points[i]) {
+                            // Initialize regular grid
+                            for (int j = 0; j < g_keystone.mesh_size; j++) {
+								float x = (float)j / (float)(g_keystone.mesh_size - 1);
+								float y = (float)i / (float)(g_keystone.mesh_size - 1);
+                                g_keystone.mesh_points[i][j*2] = x;
+                                g_keystone.mesh_points[i][j*2+1] = y;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (g_keystone.mesh_enabled) {
+                // Select first mesh point when enabling
+                g_keystone.active_mesh_point[0] = 0;
+                g_keystone.active_mesh_point[1] = 0;
+                fprintf(stderr, "\rMesh warping enabled, selected point [0,0]. Use 'q/e' to navigate mesh points.");
+            } else {
+                // Deselect mesh point when disabling
+                g_keystone.active_mesh_point[0] = -1;
+                g_keystone.active_mesh_point[1] = -1;
+                fprintf(stderr, "\rMesh warping disabled, using corner-based keystone correction.");
+            }
             return true;
             
-        case 's': // Move active corner down
-            keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
-            fprintf(stderr, "\rActive corner: %d, Press w/a/s/d to move    ", g_keystone.active_corner + 1);
+        case '+': // Increase mesh resolution
+            if (g_keystone.mesh_enabled && g_keystone.mesh_size < 10) {
+                int new_size = g_keystone.mesh_size + 1;
+                
+                // Clean up old mesh
+                cleanup_mesh_resources();
+                
+                // Allocate new mesh
+                g_keystone.mesh_size = new_size;
+				g_keystone.mesh_points = malloc((size_t)new_size * sizeof(float*));
+                if (g_keystone.mesh_points) {
+                    for (int i = 0; i < new_size; i++) {
+						g_keystone.mesh_points[i] = malloc((size_t)new_size * 2 * sizeof(float));
+                        if (g_keystone.mesh_points[i]) {
+                            // Initialize grid
+                            for (int j = 0; j < new_size; j++) {
+								float x = (float)j / (float)(new_size - 1);
+								float y = (float)i / (float)(new_size - 1);
+                                g_keystone.mesh_points[i][j*2] = x;
+                                g_keystone.mesh_points[i][j*2+1] = y;
+                            }
+                        }
+                    }
+                }
+                
+                // Reset active point
+                g_keystone.active_mesh_point[0] = 0;
+                g_keystone.active_mesh_point[1] = 0;
+                
+                LOG_INFO("Mesh size increased to %dx%d", new_size, new_size);
+                fprintf(stderr, "\rMesh size increased to %dx%d", new_size, new_size);
+                return true;
+            }
+            break;
+            
+        case '-': // Decrease mesh resolution
+            if (g_keystone.mesh_enabled && g_keystone.mesh_size > 2) {
+                int new_size = g_keystone.mesh_size - 1;
+                
+                // Clean up old mesh
+                cleanup_mesh_resources();
+                
+                // Allocate new mesh
+                g_keystone.mesh_size = new_size;
+				g_keystone.mesh_points = malloc((size_t)new_size * sizeof(float*));
+                if (g_keystone.mesh_points) {
+                    for (int i = 0; i < new_size; i++) {
+						g_keystone.mesh_points[i] = malloc((size_t)new_size * 2 * sizeof(float));
+                        if (g_keystone.mesh_points[i]) {
+                            // Initialize grid
+                            for (int j = 0; j < new_size; j++) {
+								float x = (float)j / (float)(new_size - 1);
+								float y = (float)i / (float)(new_size - 1);
+                                g_keystone.mesh_points[i][j*2] = x;
+                                g_keystone.mesh_points[i][j*2+1] = y;
+                            }
+                        }
+                    }
+                }
+                
+                // Reset active point
+                g_keystone.active_mesh_point[0] = 0;
+                g_keystone.active_mesh_point[1] = 0;
+                
+                LOG_INFO("Mesh size decreased to %dx%d", new_size, new_size);
+                fprintf(stderr, "\rMesh size decreased to %dx%d", new_size, new_size);
+                return true;
+            }
+            break;
+            
+        case 'q': // Previous mesh point
+            if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                g_keystone.active_mesh_point[1]--;
+                if (g_keystone.active_mesh_point[1] < 0) {
+                    g_keystone.active_mesh_point[1] = g_keystone.mesh_size - 1;
+                    g_keystone.active_mesh_point[0]--;
+                    if (g_keystone.active_mesh_point[0] < 0) {
+                        g_keystone.active_mesh_point[0] = g_keystone.mesh_size - 1;
+                    }
+                }
+                fprintf(stderr, "\rSelected mesh point [%d,%d]", 
+                        g_keystone.active_mesh_point[0], g_keystone.active_mesh_point[1]);
+                return true;
+            }
+            break;
+            
+        case 'e': // Next mesh point
+            if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                g_keystone.active_mesh_point[1]++;
+                if (g_keystone.active_mesh_point[1] >= g_keystone.mesh_size) {
+                    g_keystone.active_mesh_point[1] = 0;
+                    g_keystone.active_mesh_point[0]++;
+                    if (g_keystone.active_mesh_point[0] >= g_keystone.mesh_size) {
+                        g_keystone.active_mesh_point[0] = 0;
+                    }
+                }
+                fprintf(stderr, "\rSelected mesh point [%d,%d]", 
+                        g_keystone.active_mesh_point[0], g_keystone.active_mesh_point[1]);
+                return true;
+            }
+            break;
+            
+        case 'w': // Move active point up
+            if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                           g_keystone.active_mesh_point[1], 
+                                           0.0f, -step);
+            } else {
+                keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
+            }
+            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
             return true;
             
-        case 'a': // Move active corner left
-            keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
-            fprintf(stderr, "\rActive corner: %d, Press w/a/s/d to move    ", g_keystone.active_corner + 1);
+        case 's': // Move active point down
+            if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                           g_keystone.active_mesh_point[1], 
+                                           0.0f, step);
+            } else {
+                keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
+            }
+            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
             return true;
             
-        case 'd': // Move active corner right
-            keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
-            fprintf(stderr, "\rActive corner: %d, Press w/a/s/d to move    ", g_keystone.active_corner + 1);
+        case 'a': // Move active point left
+            if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                           g_keystone.active_mesh_point[1], 
+                                           -step, 0.0f);
+            } else {
+                keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
+            }
+            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
             return true;
             
-        case 'r': // Reset keystone to default
-            keystone_init();
-            LOG_INFO("Keystone reset to default");
+        case 'd': // Move active point right
+            if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                           g_keystone.active_mesh_point[1], 
+                                           step, 0.0f);
+            } else {
+                keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
+            }
+            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
             return true;
             
-        case '+': // Increase adjustment step
-            g_keystone_adjust_step = fminf(g_keystone_adjust_step * 2, 100);
+        case 'r': // Reset to default
+            {
+                // Save the current enabled state
+                bool was_enabled = g_keystone.enabled;
+                bool was_mesh_enabled = g_keystone.mesh_enabled;
+                
+                // Reset corner positions
+                g_keystone.points[0][0] = 0.0f; g_keystone.points[0][1] = 0.0f; // Top-left
+                g_keystone.points[1][0] = 1.0f; g_keystone.points[1][1] = 0.0f; // Top-right
+                g_keystone.points[2][0] = 1.0f; g_keystone.points[2][1] = 1.0f; // Bottom-right
+                g_keystone.points[3][0] = 0.0f; g_keystone.points[3][1] = 1.0f; // Bottom-left
+                
+                // Reset pins
+                for (int i = 0; i < 4; i++) {
+                    g_keystone.perspective_pins[i] = false;
+                }
+                
+                // Reset mesh if enabled
+                if (was_mesh_enabled && g_keystone.mesh_points) {
+                    for (int i = 0; i < g_keystone.mesh_size; i++) {
+                        if (g_keystone.mesh_points[i]) {
+                            for (int j = 0; j < g_keystone.mesh_size; j++) {
+								float x = (float)j / (float)(g_keystone.mesh_size - 1);
+								float y = (float)i / (float)(g_keystone.mesh_size - 1);
+                                g_keystone.mesh_points[i][j*2] = x;
+                                g_keystone.mesh_points[i][j*2+1] = y;
+                            }
+                        }
+                    }
+                }
+                
+                // Restore enabled states
+                g_keystone.enabled = was_enabled;
+                g_keystone.mesh_enabled = was_mesh_enabled;
+                
+                // Update the transformation matrix
+                keystone_update_matrix();
+                
+                LOG_INFO("Reset to default positions");
+                fprintf(stderr, "\rReset to default positions");
+                return true;
+            }
+            
+            LOG_INFO("Keystone reset to default rectangle");
+            return true;
+            
+		case '>': // Increase adjustment step
+			g_keystone_adjust_step = (g_keystone_adjust_step * 2 > 100) ? 100 : (g_keystone_adjust_step * 2);
             LOG_INFO("Keystone step increased to %d", g_keystone_adjust_step);
             return true;
             
-        case '-': // Decrease adjustment step
-            g_keystone_adjust_step = fmaxf(g_keystone_adjust_step / 2, 1);
+		case '<': // Decrease adjustment step
+			g_keystone_adjust_step = (g_keystone_adjust_step / 2 < 1) ? 1 : (g_keystone_adjust_step / 2);
             LOG_INFO("Keystone step decreased to %d", g_keystone_adjust_step);
             return true;
             
@@ -1322,15 +1773,15 @@ static bool keystone_handle_key(char key) {
             return true;
             
         case '[': // Decrease border width
-            if (g_show_border) {
-                g_border_width = fmaxf(g_border_width - 1, 1);
+			if (g_show_border) {
+				g_border_width = (g_border_width - 1 < 1) ? 1 : (g_border_width - 1);
                 LOG_INFO("Border width decreased to %d", g_border_width);
             }
             return true;
             
         case ']': // Increase border width
-            if (g_show_border) {
-                g_border_width = fminf(g_border_width + 1, 50);
+			if (g_show_border) {
+				g_border_width = (g_border_width + 1 > 50) ? 50 : (g_border_width + 1);
                 LOG_INFO("Border width increased to %d", g_border_width);
             }
             return true;
@@ -1340,9 +1791,270 @@ static bool keystone_handle_key(char key) {
             LOG_INFO("Background %s", g_show_background ? "enabled" : "disabled");
             return true;
             
-        default:
-            return false;
+        case 'S': // Save keystone configuration to local file
+            if (keystone_save_config("./keystone.conf")) {
+                LOG_INFO("Keystone configuration saved to local file: keystone.conf");
+            } else {
+                LOG_ERROR("Failed to save keystone configuration to local file");
+            }
+            return true;
+            
+		default:
+			return false;
     }
+	// If we hit a non-returning case due to unmet conditions (e.g., '+' when mesh disabled),
+	// fall back to not-handled to avoid control reaching end of non-void function.
+	return false;
+}
+
+/**
+ * Save keystone configuration to a specified file path
+ * 
+ * @param path The file path to save the configuration to
+ * @return true if the configuration was saved successfully, false otherwise
+ */
+static bool keystone_save_config(const char* path) {
+    if (!path) return false;
+    
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        LOG_ERROR("Failed to open file for writing: %s (%s)", path, strerror(errno));
+        return false;
+    }
+    
+    fprintf(f, "# Pickle keystone configuration\n");
+    fprintf(f, "enabled=%d\n", g_keystone.enabled ? 1 : 0);
+    fprintf(f, "mesh_enabled=%d\n", g_keystone.mesh_enabled ? 1 : 0);
+    fprintf(f, "mesh_size=%d\n", g_keystone.mesh_size);
+    
+    // Save the corner points
+    for (int i = 0; i < 4; i++) {
+        fprintf(f, "corner%d=%.6f,%.6f\n", i+1, g_keystone.points[i][0], g_keystone.points[i][1]);
+        fprintf(f, "pin%d=%d\n", i+1, g_keystone.perspective_pins[i] ? 1 : 0);
+    }
+    
+    // Save mesh points if mesh warping is enabled
+    if (g_keystone.mesh_enabled && g_keystone.mesh_points) {
+        for (int i = 0; i < g_keystone.mesh_size; i++) {
+            for (int j = 0; j < g_keystone.mesh_size; j++) {
+                if (g_keystone.mesh_points[i]) {
+                    fprintf(f, "mesh_%d_%d=%.6f,%.6f\n", i, j, 
+                            g_keystone.mesh_points[i][j*2],
+                            g_keystone.mesh_points[i][j*2+1]);
+                }
+            }
+        }
+    }
+    
+    fclose(f);
+    
+    return true;
+}
+
+/**
+ * Initialize joystick/gamepad support
+ * Attempts to open the first joystick device and set up event handling
+ * 
+ * @return true if a joystick was found and initialized
+ */
+static bool init_joystick(void) {
+    // Try to open joystick device
+    const char *device = "/dev/input/js0";
+    g_joystick_fd = open(device, O_RDONLY | O_NONBLOCK);
+    
+    if (g_joystick_fd < 0) {
+        LOG_WARN("Could not open joystick at %s: %s", device, strerror(errno));
+        return false;
+    }
+    
+    // Get joystick name
+    if (ioctl(g_joystick_fd, JSIOCGNAME(sizeof(g_joystick_name)), g_joystick_name) < 0) {
+        strcpy(g_joystick_name, "Unknown Controller");
+    }
+    
+    LOG_INFO("Joystick initialized: %s", g_joystick_name);
+    g_joystick_enabled = true;
+    
+    // Initialize the first corner as selected
+    g_selected_corner = 0;
+    
+    return true;
+}
+
+/**
+ * Clean up joystick resources
+ */
+static void cleanup_joystick(void) {
+    if (g_joystick_fd >= 0) {
+        close(g_joystick_fd);
+        g_joystick_fd = -1;
+    }
+    g_joystick_enabled = false;
+}
+
+/**
+ * Process a joystick event for keystone control
+ * Maps 8BitDo controller buttons to keystone adjustment actions
+ * 
+ * @param event The joystick event to process
+ * @return true if the event was handled and resulted in a keystone adjustment
+ */
+static bool handle_joystick_event(struct js_event *event) {
+    // Debounce to prevent too many events
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long time_diff_ms = (now.tv_sec - g_last_js_event_time.tv_sec) * 1000 + 
+                       (now.tv_usec - g_last_js_event_time.tv_usec) / 1000;
+    
+    // Require 100ms between events for buttons, 250ms for analog sticks
+    int min_ms = (event->type == JS_EVENT_BUTTON) ? 100 : 250;
+    if (time_diff_ms < min_ms) {
+        return false;
+    }
+    
+    // Track timestamp for debouncing
+    g_last_js_event_time = now;
+    
+    // Skip initial state events sent when joystick is first opened
+    if (event->type & JS_EVENT_INIT) {
+        return false;
+    }
+    
+    // Handle button events
+    if (event->type == JS_EVENT_BUTTON && event->value == 1) {  // Button pressed
+        switch (event->number) {
+            case JS_BUTTON_START:  // Toggle keystone mode
+                if (!g_keystone.enabled) {
+                    g_keystone.enabled = true;
+                    g_keystone.active_corner = g_selected_corner;
+                    keystone_update_matrix();
+                    LOG_INFO("Keystone correction enabled, adjusting corner %d", g_keystone.active_corner + 1);
+                } else {
+                    g_keystone.enabled = false;
+                    g_keystone.active_corner = -1;
+                    LOG_INFO("Keystone correction disabled");
+                }
+                return true;
+                
+            case JS_BUTTON_A:  // Select corner 1
+                if (g_keystone.enabled) {
+                    g_keystone.active_corner = 0;  // Top-left
+                    g_selected_corner = 0;
+                    LOG_INFO("Adjusting corner %d (Top-left)", g_keystone.active_corner + 1);
+                    return true;
+                }
+                break;
+                
+            case JS_BUTTON_B:  // Select corner 2
+                if (g_keystone.enabled) {
+                    g_keystone.active_corner = 1;  // Top-right
+                    g_selected_corner = 1;
+                    LOG_INFO("Adjusting corner %d (Top-right)", g_keystone.active_corner + 1);
+                    return true;
+                }
+                break;
+                
+            case JS_BUTTON_X:  // Select corner 3
+                if (g_keystone.enabled) {
+                    g_keystone.active_corner = 2;  // Bottom-left
+                    g_selected_corner = 2;
+                    LOG_INFO("Adjusting corner %d (Bottom-left)", g_keystone.active_corner + 1);
+                    return true;
+                }
+                break;
+                
+            case JS_BUTTON_Y:  // Select corner 4
+                if (g_keystone.enabled) {
+                    g_keystone.active_corner = 3;  // Bottom-right
+                    g_selected_corner = 3;
+                    LOG_INFO("Adjusting corner %d (Bottom-right)", g_keystone.active_corner + 1);
+                    return true;
+                }
+                break;
+                
+            case JS_BUTTON_SELECT:  // Reset keystone to default
+                if (g_keystone.enabled) {
+                    // Save the current enabled state
+                    bool was_enabled = g_keystone.enabled;
+                    
+                    // Reset to default corner positions
+                    g_keystone.points[0][0] = 0.0f; g_keystone.points[0][1] = 0.0f; // Top-left
+                    g_keystone.points[1][0] = 1.0f; g_keystone.points[1][1] = 0.0f; // Top-right
+                    g_keystone.points[2][0] = 1.0f; g_keystone.points[2][1] = 1.0f; // Bottom-right
+                    g_keystone.points[3][0] = 0.0f; g_keystone.points[3][1] = 1.0f; // Bottom-left
+                    
+                    // Restore the enabled state
+                    g_keystone.enabled = was_enabled;
+                    
+                    // Update the transformation matrix with the new corner positions
+                    keystone_update_matrix();
+                    
+                    LOG_INFO("Keystone reset to default rectangle");
+                    return true;
+                }
+                break;
+                
+			case JS_BUTTON_L1:  // Decrease adjustment step
+                if (g_keystone.enabled) {
+					g_keystone_adjust_step = (g_keystone_adjust_step / 2 < 1) ? 1 : (g_keystone_adjust_step / 2);
+                    LOG_INFO("Keystone step decreased to %d", g_keystone_adjust_step);
+                    return true;
+                }
+                break;
+                
+			case JS_BUTTON_R1:  // Increase adjustment step
+                if (g_keystone.enabled) {
+					g_keystone_adjust_step = (g_keystone_adjust_step * 2 > 100) ? 100 : (g_keystone_adjust_step * 2);
+                    LOG_INFO("Keystone step increased to %d", g_keystone_adjust_step);
+                    return true;
+                }
+                break;
+                
+            case JS_BUTTON_HOME:  // Toggle border
+                if (g_keystone.enabled) {
+                    g_show_border = !g_show_border;
+                    LOG_INFO("Border %s", g_show_border ? "enabled" : "disabled");
+                    return true;
+                }
+                break;
+        }
+    }
+    
+    // Handle axis events (D-pad and analog sticks)
+    else if (event->type == JS_EVENT_AXIS) {
+        // Only process if keystone is enabled
+        if (!g_keystone.enabled) {
+            return false;
+        }
+        
+        float step = (float)g_keystone_adjust_step / 1000.0f; // Convert to 0-1 range
+        
+        // D-pad or left analog stick
+        if ((event->number == JS_AXIS_DPAD_X || event->number == JS_AXIS_LEFT_X) && abs(event->value) > 16384) {
+            if (event->value < 0) {  // Left
+                keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
+                LOG_INFO("Moving corner %d left", g_keystone.active_corner + 1);
+                return true;
+            } else {  // Right
+                keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
+                LOG_INFO("Moving corner %d right", g_keystone.active_corner + 1);
+                return true;
+            }
+        }
+        else if ((event->number == JS_AXIS_DPAD_Y || event->number == JS_AXIS_LEFT_Y) && abs(event->value) > 16384) {
+            if (event->value < 0) {  // Up
+                keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
+                LOG_INFO("Moving corner %d up", g_keystone.active_corner + 1);
+                return true;
+            } else {  // Down
+                keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
+                LOG_INFO("Moving corner %d down", g_keystone.active_corner + 1);
+                return true;
+            }
+        }
+    }
+    
+    return false;
 }
 
 // Removed const from drm_ctx parameter because drmModeSetCrtc expects a non-const drmModeModeInfoPtr.
@@ -1375,10 +2087,10 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	// Set background color based on settings
 	if (g_show_background) {
 		// Light gray background for better visibility of dark content edges
-		glClearColor(0.85, 0.85, 0.85, 1.0);
+		glClearColor(0.85f, 0.85f, 0.85f, 1.0f);
 	} else {
 		// Standard black background
-		glClearColor(0.0, 0.0, 0.0, 1.0);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	}
 	glClear(GL_COLOR_BUFFER_BIT);
 	
@@ -1417,9 +2129,9 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	// Render MPV frame either to our FBO or directly to screen
 	mpv_opengl_fbo mpv_fbo;
 	if (fbo) {
-		mpv_fbo = (mpv_opengl_fbo){ .fbo = fbo, .w = d->mode.hdisplay, .h = d->mode.vdisplay, .internal_format = 0 };
+		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)fbo, .w = (int)d->mode.hdisplay, .h = (int)d->mode.vdisplay, .internal_format = 0 };
 	} else {
-		mpv_fbo = (mpv_opengl_fbo){ .fbo = 0, .w = d->mode.hdisplay, .h = d->mode.vdisplay, .internal_format = 0 };
+		mpv_fbo = (mpv_opengl_fbo){ .fbo = 0, .w = (int)d->mode.hdisplay, .h = (int)d->mode.vdisplay, .internal_format = 0 };
 	}
 	
 	int flip_y = 0;
@@ -1450,26 +2162,49 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glBindTexture(GL_TEXTURE_2D, fbo_texture);
 		glUniform1i(g_keystone_u_texture_loc, 0);
 		
-		// Set up vertex data with keystone corners
+		// Create two triangles that form a quad covering the entire screen (-1 to 1 in both dimensions)
+		// These will be our output positions
 		float vertices[] = {
-			g_keystone.matrix[0], g_keystone.matrix[1],  // Top left
-			g_keystone.matrix[2], g_keystone.matrix[3],  // Top right
-			g_keystone.matrix[4], g_keystone.matrix[5],  // Bottom left
-			g_keystone.matrix[6], g_keystone.matrix[7]   // Bottom right
+			-1.0f,  1.0f,  // Top left (vertex position)
+			 1.0f,  1.0f,  // Top right
+			-1.0f, -1.0f,  // Bottom left
+			 1.0f, -1.0f   // Bottom right
 		};
 		
+		// Define texture coordinates for each vertex based on the keystone corners
+		// These define where in the texture each vertex samples from
+		float texcoords[] = {
+			g_keystone.points[0][0], g_keystone.points[0][1],  // Top left
+			g_keystone.points[1][0], g_keystone.points[1][1],  // Top right
+			g_keystone.points[3][0], g_keystone.points[3][1],  // Bottom left
+			g_keystone.points[2][0], g_keystone.points[2][1]   // Bottom right
+		};
+		
+		// Enable vertex arrays
+	glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+		
+		// Bind and set vertex positions
 		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
 		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
+	glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
 		
-		// Set up vertex attributes
-		glEnableVertexAttribArray(g_keystone_a_position_loc);
-		glVertexAttribPointer(g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+		// We need another VBO for texture coordinates
+		if (g_keystone_texcoord_buffer == 0) {
+			glGenBuffers(1, &g_keystone_texcoord_buffer);
+		}
 		
-		// Draw two triangles (a quad) with keystone correction
+		// Bind and set texture coordinates
+		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_texcoord_buffer);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_DYNAMIC_DRAW);
+	glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+	glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+		
+		// Draw the quad
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		
 		// Clean up
-		glDisableVertexAttribArray(g_keystone_a_position_loc);
+	glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+	glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glUseProgram(0);
 		
@@ -1525,19 +2260,21 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		for (int i = 0; i < 4; i++) {
 			// Calculate screen position from normalized coordinates
-			int x = (int)(g_keystone.points[i][0] * w);
-			int y = (int)(g_keystone.points[i][1] * h);
+			int x = (int)((float)g_keystone.points[i][0] * (float)w);
+			int y = (int)((float)g_keystone.points[i][1] * (float)h);
 			
 			// Set color: active corner is red, others are green
 			if (i == g_keystone.active_corner) {
-				glClearColor(1.0, 0.0, 0.0, 0.8); // Red
+				glClearColor(1.0f, 0.0f, 0.0f, 0.8f); // Red
 			} else {
-				glClearColor(0.0, 1.0, 0.0, 0.8); // Green
+				glClearColor(0.0f, 1.0f, 0.0f, 0.8f); // Green
 			}
 			
-			// Ensure marker stays visible within screen bounds
-			x = fmax(0, fmin(w - corner_size, x - corner_size/2));
-			y = fmax(0, fmin(h - corner_size, y - corner_size/2));
+			// Ensure marker stays visible within screen bounds (integer clamps)
+			x = x - corner_size/2;
+			y = y - corner_size/2;
+			if (x < 0) x = 0; else if (x > w - corner_size) x = w - corner_size;
+			if (y < 0) y = 0; else if (y > h - corner_size) y = h - corner_size;
 			
 			// Draw the corner marker
 			glScissor(x, h - y - corner_size, corner_size, corner_size);
@@ -1806,12 +2543,21 @@ int main(int argc, char **argv) {
 	struct termios old_term, new_term;
 	tcgetattr(STDIN_FILENO, &old_term);
 	new_term = old_term;
-	new_term.c_lflag &= ~(ICANON | ECHO); // Disable canonical mode and echo
+	new_term.c_lflag &= (tcflag_t)~(ICANON | ECHO); // Disable canonical mode and echo
 	tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
 	
 	// Set stdin to non-blocking mode
 	int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
 	fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK);
+	
+	// Initialize joystick/gamepad support for 8BitDo controller
+	init_joystick();
+	if (g_joystick_enabled) {
+		LOG_INFO("8BitDo controller detected and enabled for keystone adjustment");
+		LOG_INFO("Controller mappings: START=Toggle keystone mode, A/B/X/Y=Select corners 1-4");
+		LOG_INFO("D-pad/Left stick=Move corners, L1/R1=Decrease/Increase step size");
+		LOG_INFO("SELECT=Reset keystone, HOME=Toggle border");
+	}
 	
 	while (!g_stop) {
 		// Drain any pending mpv events BEFORE potentially blocking in poll to avoid startup deadlock
@@ -1823,13 +2569,18 @@ int main(int argc, char **argv) {
 				g_mpv_update_flags |= flags;
 			}
 		}
-		// Prepare pollfds: DRM fd (for page flip events) + mpv wakeup pipe + stdin for keyboard
-		struct pollfd pfds[3]; int n=0;
+		// Prepare pollfds: DRM fd (for page flip events) + mpv wakeup pipe + stdin for keyboard + joystick
+		struct pollfd pfds[4]; int n=0;
 		if (!g_scanout_disabled) { pfds[n].fd = drm.fd; pfds[n].events = POLLIN; pfds[n].revents = 0; n++; }
 		if (g_mpv_pipe[0] >= 0) { pfds[n].fd = g_mpv_pipe[0]; pfds[n].events = POLLIN; pfds[n].revents = 0; n++; }
 		
 		// Add stdin to the poll set to capture keyboard input
 		pfds[n].fd = STDIN_FILENO; pfds[n].events = POLLIN; pfds[n].revents = 0; n++;
+		
+		// Add joystick to poll set if available
+		if (g_joystick_enabled && g_joystick_fd >= 0) {
+			pfds[n].fd = g_joystick_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; n++;
+		}
 		int timeout_ms = -1;
 		
 		// Calculate appropriate poll timeout based on frame rate and vsync
@@ -1858,7 +2609,7 @@ int main(int argc, char **argv) {
 		// This allows our watchdog logic to run periodically
 		if (timeout_ms < 0) timeout_ms = 100; // max 100ms poll timeout
 
-		int pr = poll(pfds, n, timeout_ms);
+	int pr = poll(pfds, (nfds_t)n, timeout_ms);
 		if (pr < 0) { if (errno == EINTR) continue; fprintf(stderr, "poll failed (%s)\n", strerror(errno)); break; }
 		for (int i=0;i<n;i++) {
 			if (!(pfds[i].revents & POLLIN)) continue;
@@ -1881,6 +2632,15 @@ int main(int argc, char **argv) {
 					
 					// Handle keystone adjustment keys
 					if (keystone_handle_key(c)) {
+						// Force a redraw when keystone parameters change
+						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+					}
+				}
+			} else if (g_joystick_enabled && pfds[i].fd == g_joystick_fd) {
+				// Handle joystick input
+				struct js_event event;
+				while (read(g_joystick_fd, &event, sizeof(event)) > 0) {
+					if (handle_joystick_event(&event)) {
 						// Force a redraw when keystone parameters change
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 					}
@@ -1948,7 +2708,7 @@ int main(int argc, char **argv) {
 				break; 
 			}
 			frames++;
-			g_mpv_update_flags &= ~MPV_RENDER_UPDATE_FRAME;
+			g_mpv_update_flags &= ~(uint64_t)MPV_RENDER_UPDATE_FRAME;
 			if (g_stats_enabled) { g_stats_frames++; stats_log_periodic(&player); }
 			gettimeofday(&wd_last_activity, NULL);
 			gettimeofday(&g_last_frame_time, NULL); // Update last successful frame time
@@ -1966,25 +2726,34 @@ int main(int argc, char **argv) {
 	
 	// Save keystone settings to a file if they were modified
 	if (g_keystone.enabled) {
-		const char* home = getenv("HOME");
-		if (home) {
-			char config_path[512];
-			snprintf(config_path, sizeof(config_path), "%s/.config/pickle_keystone.conf", home);
-			FILE* f = fopen(config_path, "w");
-			if (f) {
-				fprintf(f, "# Pickle keystone configuration\n");
-				fprintf(f, "enabled=%d\n", g_keystone.enabled ? 1 : 0);
-				for (int i = 0; i < 4; i++) {
-					fprintf(f, "corner%d=%.6f,%.6f\n", i+1, g_keystone.points[i][0], g_keystone.points[i][1]);
+		// First try to save to local directory
+		if (keystone_save_config("./keystone.conf")) {
+			LOG_INFO("Saved keystone configuration to ./keystone.conf");
+		} else {
+			// If that fails, save to user's home directory
+			const char* home = getenv("HOME");
+			if (home) {
+				char config_path[512];
+				snprintf(config_path, sizeof(config_path), "%s/.config", home);
+				
+				// Create .config directory if it doesn't exist
+				mkdir(config_path, 0755);
+				
+				snprintf(config_path, sizeof(config_path), "%s/.config/pickle_keystone.conf", home);
+				if (keystone_save_config(config_path)) {
+					LOG_INFO("Saved keystone configuration to %s", config_path);
 				}
-				fclose(f);
-				LOG_INFO("Saved keystone configuration to %s", config_path);
 			}
 		}
 	}
 	
 	// Restore terminal settings
 	tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+	
+	// Clean up joystick resources
+	if (g_joystick_enabled) {
+		cleanup_joystick();
+	}
 	
 	destroy_mpv(&player);
 	deinit_gbm_egl(&eglc);
@@ -1993,6 +2762,11 @@ int main(int argc, char **argv) {
 fail:
 	// Restore terminal settings in case of failure
 	tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+	
+	// Clean up joystick resources
+	if (g_joystick_enabled) {
+		cleanup_joystick();
+	}
 	
 	destroy_mpv(&player);
 	deinit_gbm_egl(&eglc);

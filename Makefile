@@ -25,13 +25,22 @@ NO_MPV  ?= 0   # build with -DPICKLE_NO_MPV_DEFAULT so runtime can skip mpv init
 PERF    ?= 0   # high-performance build tweaks (e.g. make PERF=1)
 
 PKGS       := mpv gbm egl glesv2 libdrm
-PKG_CFLAGS := $(shell pkg-config --cflags $(PKGS) 2>/dev/null)
-PKG_LIBS   := $(shell pkg-config --libs $(PKGS) 2>/dev/null)
+
+# Allow overriding pkg-config binary
+PKG_CONFIG ?= pkg-config
+PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS) 2>/dev/null)
+PKG_LIBS   := $(shell $(PKG_CONFIG) --libs $(PKGS) 2>/dev/null)
 
 # Basic flags
 CFLAGS  ?= $(OPT) $(DEBUG) $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
 LDFLAGS ?=
+
+# If pkg-config fails, fall back to a reasonable default library set
+ifeq ($(strip $(PKG_LIBS)),)
+LIBS     := -lmpv -lgbm -lEGL -lGLESv2 -ldrm -lpthread -lm
+else
 LIBS     := $(PKG_LIBS) -lpthread -lm
+endif
 
 # Apply toggles
 ifeq ($(LTO),1)
@@ -45,7 +54,7 @@ ifeq ($(PERF),1)
 	CFLAGS += -O3 -DNDEBUG -fomit-frame-pointer -march=native -mtune=native
 	CFLAGS += -ffast-math -fno-math-errno -fno-trapping-math
 	# Enable LTO automatically if not already set
-	ifneq ($(LTO),0)
+	ifeq ($(strip $(LTO)),0)
 		CFLAGS  += -flto
 		LDFLAGS += -flto
 	endif
@@ -63,7 +72,7 @@ BINDIR ?= $(PREFIX)/bin
 all: $(APP)
 
 $(APP): $(OBJ)
-	@ if [ -z "$(PKG_LIBS)" ]; then echo "[warn] pkg-config returned no libs for $(PKGS)."; fi
+	@ if [ -z "$(PKG_LIBS)" ]; then echo "[warn] pkg-config not found or missing pc files; using fallback libs."; fi
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.c
@@ -136,4 +145,4 @@ preflight:
 clean:
 	rm -f $(OBJ) $(APP)
 
-.PHONY: all run clean install uninstall
+.PHONY: all run try-run preflight release debug sanitize strip deps help clean install uninstall
