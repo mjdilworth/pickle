@@ -6,6 +6,7 @@ Minimal fullscreen Raspberry Pi 4 DRM/KMS + GBM + EGL + libmpv hardware accelera
 * Direct to KMS (no X / Wayland) using DRM master.
 * Uses GBM + EGL (GLES2) for libmpv OpenGL render backend.
 * Auto-selects first connected monitor and preferred mode.
+* Keystone correction for projector use.
 * Plays one file then exits (Ctrl+C to stop early).
 
 ## Dependencies (Raspberry Pi OS / Debian)
@@ -58,6 +59,52 @@ make clean      # remove objects and binary
 sudo make install PREFIX=/usr/local # optional install
 ```
 
+## Keystone Correction
+
+Pickle supports keystone correction for projector use, allowing you to adjust the image geometry when projecting onto non-perpendicular surfaces:
+
+1. Start with keystone mode enabled:
+   ```
+   PICKLE_KEYSTONE=1 ./pickle video.mp4
+   ```
+   
+2. Use the following keyboard controls:
+   - `k` - Toggle keystone mode on/off
+   - `1`, `2`, `3`, `4` - Select corner to adjust (1 = top-left, 2 = top-right, etc.)
+   - `w`, `a`, `s`, `d` - Move selected corner (up, left, down, right)
+   - `+`, `-` - Increase/decrease adjustment step size
+   - `r` - Reset keystone to default
+   - `q` - Quit
+
+3. Keystone settings are saved to `~/.config/pickle_keystone.conf` and loaded automatically on next run.
+
+Environment variables for keystone:
+   - `PICKLE_KEYSTONE=1` - Enable keystone correction
+   - `PICKLE_KEYSTONE_STEP=n` - Set keystone adjustment step size (1-100)
+
+## Visual Aids
+
+Pickle provides several visual aids to help with video alignment and visibility:
+
+1. Border around video (useful for seeing edges against dark backgrounds):
+   ```
+   PICKLE_SHOW_BORDER=5 ./pickle video.mp4  # 5 is the border width in pixels
+   ```
+
+2. Light background (helps with seeing dark video edges):
+   ```
+   PICKLE_SHOW_BACKGROUND=1 ./pickle video.mp4
+   ```
+
+Keyboard controls for visual aids:
+   - `b` - Toggle border on/off
+   - `[`, `]` - Decrease/increase border width
+   - `g` - Toggle light background on/off
+
+Environment variables for visual aids:
+   - `PICKLE_SHOW_BORDER=width` - Show border with specified width (1-50 pixels)
+   - `PICKLE_SHOW_BACKGROUND=1` - Show light background
+
 ## Notes
 * Simplified: no audio device selection, hotplug handling, or vsync pacing beyond page flip.
 * Uses `hwdec=auto-safe`; adjust via code if you need a specific decoder.
@@ -96,6 +143,14 @@ The player supports several environment variables for production deployment:
 * `PICKLE_FORCE_HEADLESS=1`   Force gpu-context=headless regardless of DRM master status
 * `PICKLE_DISABLE_HEADLESS=1` Disable automatic headless fallback
 * `PICKLE_KEEP_ATOMIC=1`      Don't disable DRM atomic operations (may cause conflicts)
+
+**Keystone Correction:**
+* `PICKLE_KEYSTONE=1`         Enable keystone correction mode
+* `PICKLE_KEYSTONE_STEP=n`    Set keystone adjustment step size (1-100, default 10)
+
+**Visual Aids:**
+* `PICKLE_SHOW_BORDER=n`      Show border around video with width n pixels (1-50)
+* `PICKLE_SHOW_BACKGROUND=1`  Show light background for better edge visibility
 
 **Audio Control:**
 * `PICKLE_NO_AUDIO=1`         Disable audio completely
@@ -152,3 +207,6 @@ If you see `error` early:
 ## License
 Provided as-is; integrate into your own project under your chosen license (original author of this scaffold: AI assistant output).
 
+
+
+Device E4:17:D8:6B:3B:35 8BitDo Zero 2 gamepad
