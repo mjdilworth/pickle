@@ -1,0 +1,21 @@
+# Build artifacts
+pickle.o
+pickle
+
+# Logs
+*.log
+
+# Editor/IDE
+.vscode/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc
+*.bak
+*.tmp
+*.mp4
+
