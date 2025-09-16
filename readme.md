@@ -208,5 +208,15 @@ If you see `error` early:
 Provided as-is; integrate into your own project under your chosen license (original author of this scaffold: AI assistant output).
 
 
+bluetoothctl
+agent on
+default-agent
+power on
+discoverable on
+pairable on
+scan on
 
 Device E4:17:D8:6B:3B:35 8BitDo Zero 2 gamepad
+pair <MAC_ADDRESS>
+trust <MAC_ADDRESS>
+connect <MAC_ADDRESS>

@@ -233,6 +233,15 @@ static int g_keystone_adjust_step = 1; // Step size for keystone adjustments (in
 static bool g_show_border = false; // Whether to show border around the video
 static int g_border_width = 5; // Border width in pixels
 static bool g_show_background = false; // Whether to show light background for visibility
+static GLuint g_keystone_shader_program = 0; // Shader program for keystone correction
+static GLuint g_keystone_vertex_shader = 0;
+static GLuint g_keystone_fragment_shader = 0;
+static GLuint g_keystone_vertex_buffer = 0;
+static GLint g_keystone_a_position_loc = -1;
+static GLint g_keystone_u_texture_loc = -1;
+
+// Forward declarations
+static void cleanup_keystone_shader(void);
 
 static bool ensure_drm_master(int fd) {
 	// Attempt to become DRM master; non-fatal if it fails (we may still page flip if compositor allows)
@@ -532,6 +541,11 @@ static bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
  */
 static void deinit_gbm_egl(egl_ctx_t *e) {
 	if (!e) return;
+	
+	// Clean up keystone shader resources if initialized
+	if (g_keystone_shader_program) {
+		cleanup_keystone_shader();
+	}
 	
 	if (e->dpy != EGL_NO_DISPLAY) {
 		// Release current context
@@ -1021,18 +1035,19 @@ static void keystone_init(void) {
         g_show_background = true;
         LOG_INFO("Light background enabled for better edge visibility");
     }
+    
+    // Initialize shader program if keystone is enabled
+    if (g_keystone.enabled && g_keystone_shader_program == 0) {
+        // Note: shader initialization must be done after EGL context is created
+        // We'll do it in render_frame_fixed when needed
+    }
 }
 
 /**
  * Calculate the perspective transformation matrix based on the corner points
- * This is a simplified implementation since we're not actually using the matrix
- * in OpenGL ES 2.0 (which doesn't support the fixed-function pipeline)
+ * Updates the vertex coordinates used for rendering with the shader
  */
 static void keystone_update_matrix(void) {
-    // In a proper implementation, we would calculate transformation matrix
-    // coefficients here for a shader-based solution.
-    // For now, we're just storing the corner positions.
-    
     if (!g_keystone.enabled) {
         // Identity matrix
         for (int i = 0; i < 16; i++) {
@@ -1041,12 +1056,29 @@ static void keystone_update_matrix(void) {
         return;
     }
     
-    // Note: In a full implementation, we would calculate perspective transform matrix
-    // coefficients here based on the corner points. For simplicity in this version,
-    // we just ensure the corners are within valid ranges and the keystone effect
-    // is indicated visually.
+    // Convert the normalized corner positions to clip space coordinates (-1 to 1)
+    float vertices[8];
     
-    LOG_DEBUG("Updated keystone matrix");
+    // Map from 0-1 normalized space to -1 to 1 clip space
+    for (int i = 0; i < 4; i++) {
+        vertices[i*2]   = g_keystone.points[i][0] * 2.0f - 1.0f; // x: 0-1 -> -1 to 1
+        vertices[i*2+1] = (1.0f - g_keystone.points[i][1]) * 2.0f - 1.0f; // y: 0-1 -> 1 to -1 (flip y)
+    }
+    
+    // Store the matrix as vertex positions for the shader
+    // Vertex order: top-left, top-right, bottom-left, bottom-right
+    g_keystone.matrix[0] = vertices[0];  // TL.x
+    g_keystone.matrix[1] = vertices[1];  // TL.y
+    g_keystone.matrix[2] = vertices[2];  // TR.x
+    g_keystone.matrix[3] = vertices[3];  // TR.y
+    g_keystone.matrix[4] = vertices[6];  // BL.x
+    g_keystone.matrix[5] = vertices[7];  // BL.y
+    g_keystone.matrix[6] = vertices[4];  // BR.x
+    g_keystone.matrix[7] = vertices[5];  // BR.y
+    
+    LOG_DEBUG("Updated keystone vertices: TL(%.2f,%.2f) TR(%.2f,%.2f) BL(%.2f,%.2f) BR(%.2f,%.2f)",
+        vertices[0], vertices[1], vertices[2], vertices[3], 
+        vertices[6], vertices[7], vertices[4], vertices[5]);
 }
 
 /**
@@ -1076,6 +1108,142 @@ static void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
     
     LOG_INFO("Adjusted corner %d to (%.3f, %.3f)", 
               corner + 1, g_keystone.points[corner][0], g_keystone.points[corner][1]);
+}
+
+// Shader source code for keystone correction
+static const char* g_vertex_shader_src = 
+    "attribute vec2 a_position;\n"
+    "varying vec2 v_texCoord;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_position.x, a_position.y, 0.0, 1.0);\n"
+    "    v_texCoord = vec2(0.5, 0.5) + vec2(a_position.x/2.0, a_position.y/2.0);\n"
+    "}\n";
+
+static const char* g_fragment_shader_src = 
+    "precision mediump float;\n"
+    "varying vec2 v_texCoord;\n"
+    "uniform sampler2D u_texture;\n"
+    "void main() {\n"
+    "    gl_FragColor = texture2D(u_texture, v_texCoord);\n"
+    "}\n";
+
+// Compile shader of the specified type
+static GLuint compile_shader(GLenum shader_type, const char* source) {
+    GLuint shader = glCreateShader(shader_type);
+    if (!shader) {
+        LOG_ERROR("Failed to create shader of type %d", shader_type);
+        return 0;
+    }
+    
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    
+    GLint compiled;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (!compiled) {
+        GLint info_len = 0;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &info_len);
+        if (info_len > 1) {
+            char* info_log = malloc(sizeof(char) * info_len);
+            glGetShaderInfoLog(shader, info_len, NULL, info_log);
+            LOG_ERROR("Error compiling shader: %s", info_log);
+            free(info_log);
+        }
+        glDeleteShader(shader);
+        return 0;
+    }
+    
+    return shader;
+}
+
+// Initialize keystone shader program
+static bool init_keystone_shader() {
+    // Compile vertex shader
+    g_keystone_vertex_shader = compile_shader(GL_VERTEX_SHADER, g_vertex_shader_src);
+    if (!g_keystone_vertex_shader) {
+        LOG_ERROR("Failed to compile vertex shader");
+        return false;
+    }
+    
+    // Compile fragment shader
+    g_keystone_fragment_shader = compile_shader(GL_FRAGMENT_SHADER, g_fragment_shader_src);
+    if (!g_keystone_fragment_shader) {
+        LOG_ERROR("Failed to compile fragment shader");
+        glDeleteShader(g_keystone_vertex_shader);
+        g_keystone_vertex_shader = 0;
+        return false;
+    }
+    
+    // Create shader program
+    g_keystone_shader_program = glCreateProgram();
+    if (!g_keystone_shader_program) {
+        LOG_ERROR("Failed to create shader program");
+        glDeleteShader(g_keystone_vertex_shader);
+        glDeleteShader(g_keystone_fragment_shader);
+        g_keystone_vertex_shader = 0;
+        g_keystone_fragment_shader = 0;
+        return false;
+    }
+    
+    // Attach shaders
+    glAttachShader(g_keystone_shader_program, g_keystone_vertex_shader);
+    glAttachShader(g_keystone_shader_program, g_keystone_fragment_shader);
+    
+    // Link program
+    glLinkProgram(g_keystone_shader_program);
+    
+    GLint linked;
+    glGetProgramiv(g_keystone_shader_program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint info_len = 0;
+        glGetProgramiv(g_keystone_shader_program, GL_INFO_LOG_LENGTH, &info_len);
+        if (info_len > 1) {
+            char* info_log = malloc(sizeof(char) * info_len);
+            glGetProgramInfoLog(g_keystone_shader_program, info_len, NULL, info_log);
+            LOG_ERROR("Error linking shader program: %s", info_log);
+            free(info_log);
+        }
+        glDeleteProgram(g_keystone_shader_program);
+        glDeleteShader(g_keystone_vertex_shader);
+        glDeleteShader(g_keystone_fragment_shader);
+        g_keystone_shader_program = 0;
+        g_keystone_vertex_shader = 0;
+        g_keystone_fragment_shader = 0;
+        return false;
+    }
+    
+    // Get attribute and uniform locations
+    g_keystone_a_position_loc = glGetAttribLocation(g_keystone_shader_program, "a_position");
+    g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
+    
+    // Create vertex buffer for the quad
+    glGenBuffers(1, &g_keystone_vertex_buffer);
+    
+    LOG_INFO("Keystone shader program initialized successfully");
+    return true;
+}
+
+// Cleanup keystone shader resources
+static void cleanup_keystone_shader(void) {
+    if (g_keystone_vertex_buffer) {
+        glDeleteBuffers(1, &g_keystone_vertex_buffer);
+        g_keystone_vertex_buffer = 0;
+    }
+    
+    if (g_keystone_shader_program) {
+        glDeleteProgram(g_keystone_shader_program);
+        g_keystone_shader_program = 0;
+    }
+    
+    if (g_keystone_vertex_shader) {
+        glDeleteShader(g_keystone_vertex_shader);
+        g_keystone_vertex_shader = 0;
+    }
+    
+    if (g_keystone_fragment_shader) {
+        glDeleteShader(g_keystone_fragment_shader);
+        g_keystone_fragment_shader = 0;
+    }
 }
 
 /**
@@ -1196,6 +1364,14 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
 	}
 	
+	// Initialize keystone shader if needed and enabled
+	if (g_keystone.enabled && g_keystone_shader_program == 0) {
+		if (!init_keystone_shader()) {
+			LOG_ERROR("Failed to initialize keystone shader, disabling keystone correction");
+			g_keystone.enabled = false;
+		}
+	}
+	
 	// Set background color based on settings
 	if (g_show_background) {
 		// Light gray background for better visibility of dark content edges
@@ -1206,15 +1382,53 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	}
 	glClear(GL_COLOR_BUFFER_BIT);
 	
-	// Render MPV frame with any keystone correction being handled by mpv itself
-	// Instead of trying to implement our own correction which would require shader code
-	mpv_opengl_fbo fbo = { .fbo = 0, .w = d->mode.hdisplay, .h = d->mode.vdisplay, .internal_format = 0 };
+	// Create an FBO for rendering the mpv frame
+	GLuint fbo_texture = 0;
+	GLuint fbo = 0;
+	
+	if (g_keystone.enabled) {
+		// Create a texture to render mpv output to
+		glGenTextures(1, &fbo_texture);
+		glBindTexture(GL_TEXTURE_2D, fbo_texture);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, d->mode.hdisplay, d->mode.vdisplay, 
+					0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		
+		// Create FBO
+		glGenFramebuffers(1, &fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo_texture, 0);
+		
+		GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		if (status != GL_FRAMEBUFFER_COMPLETE) {
+			LOG_ERROR("FBO setup failed, status: %d", status);
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glDeleteFramebuffers(1, &fbo);
+			glDeleteTextures(1, &fbo_texture);
+			fbo = 0;
+			fbo_texture = 0;
+			// Fall back to non-keystone rendering
+		}
+	}
+	
+	// Render MPV frame either to our FBO or directly to screen
+	mpv_opengl_fbo mpv_fbo;
+	if (fbo) {
+		mpv_fbo = (mpv_opengl_fbo){ .fbo = fbo, .w = d->mode.hdisplay, .h = d->mode.vdisplay, .internal_format = 0 };
+	} else {
+		mpv_fbo = (mpv_opengl_fbo){ .fbo = 0, .w = d->mode.hdisplay, .h = d->mode.vdisplay, .internal_format = 0 };
+	}
+	
 	int flip_y = 0;
 	mpv_render_param r_params[] = {
-		(mpv_render_param){MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
+		(mpv_render_param){MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
 		(mpv_render_param){MPV_RENDER_PARAM_FLIP_Y, &flip_y},
 		(mpv_render_param){0}
 	};
+	
 	if (!p->rctx) {
 		fprintf(stderr, "mpv render context NULL\n");
 		return false;
@@ -1222,6 +1436,47 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	
 	// Render the mpv frame
 	mpv_render_context_render(p->rctx, r_params);
+	
+	// If keystone is enabled, render the FBO texture with our shader
+	if (g_keystone.enabled && fbo && fbo_texture) {
+		// Switch back to default framebuffer
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		
+		// Use our shader program
+		glUseProgram(g_keystone_shader_program);
+		
+		// Set up texture
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, fbo_texture);
+		glUniform1i(g_keystone_u_texture_loc, 0);
+		
+		// Set up vertex data with keystone corners
+		float vertices[] = {
+			g_keystone.matrix[0], g_keystone.matrix[1],  // Top left
+			g_keystone.matrix[2], g_keystone.matrix[3],  // Top right
+			g_keystone.matrix[4], g_keystone.matrix[5],  // Bottom left
+			g_keystone.matrix[6], g_keystone.matrix[7]   // Bottom right
+		};
+		
+		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
+		
+		// Set up vertex attributes
+		glEnableVertexAttribArray(g_keystone_a_position_loc);
+		glVertexAttribPointer(g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+		
+		// Draw two triangles (a quad) with keystone correction
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		
+		// Clean up
+		glDisableVertexAttribArray(g_keystone_a_position_loc);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glUseProgram(0);
+		
+		// Clean up FBO resources
+		glDeleteFramebuffers(1, &fbo);
+		glDeleteTextures(1, &fbo_texture);
+	}
 	
 	// Draw border around the video if enabled
 	if (g_show_border) {
