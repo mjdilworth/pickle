@@ -41,6 +41,7 @@
 #include <execinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <poll.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -130,6 +131,17 @@ struct egl_ctx {
 	EGLContext ctx;
 	EGLSurface surf;
 };
+
+// --- Preallocated FB ring (optional) ---
+struct fb_ring_entry { struct gbm_bo *bo; uint32_t fb_id; };
+struct fb_ring {
+    struct fb_ring_entry *entries;
+    int count;      // allocated entries
+    int produced;   // how many unique BOs discovered during prealloc
+    int active;     // number of BOs currently in use (for triple buffering)
+    int next_index; // next index to use
+};
+static struct fb_ring g_fb_ring = {0};
 
 static int g_have_master = 0; // set if we successfully become DRM master
 
@@ -336,9 +348,25 @@ struct mpv_player {
 
 // Wakeup callback sets a flag so main loop knows mpv wants processing.
 static volatile int g_mpv_wakeup = 0;
-static void mpv_wakeup_cb(void *ctx) { (void)ctx; g_mpv_wakeup = 1; }
+static int g_mpv_pipe[2] = {-1,-1}; // pipe to integrate mpv wakeups into poll loop
+static void mpv_wakeup_cb(void *ctx) {
+	(void)ctx;
+	g_mpv_wakeup = 1;
+	if (g_mpv_pipe[1] >= 0) {
+		unsigned char b = 0;
+		if (write(g_mpv_pipe[1], &b, 1) < 0) { /* ignore EAGAIN */ }
+	}
+}
 static volatile uint64_t g_mpv_update_flags = 0; // bitmask from mpv_render_context_update
 static void on_mpv_events(void *data) { (void)data; g_mpv_wakeup = 1; }
+
+// Debug / instrumentation control (enabled with PICKLE_DEBUG env)
+static int g_debug = 0;
+
+// Performance controls
+static int g_triple_buffer = 1;         // Enable triple buffering by default
+static int g_vsync_enabled = 1;         // Enable vsync by default
+static int g_frame_timing_enabled = 0;  // Detailed frame timing metrics (when PICKLE_TIMING=1)
 
 // --- Statistics ---
 static int g_stats_enabled = 0;
@@ -347,6 +375,21 @@ static uint64_t g_stats_frames = 0;
 static struct timeval g_stats_start = {0};
 static struct timeval g_stats_last = {0};
 static uint64_t g_stats_last_frames = 0;
+// Program start (for watchdogs)
+static struct timeval g_prog_start = {0};
+// Playback monitoring
+static struct timeval g_last_frame_time = {0};
+static int g_stall_reset_count = 0;
+static int g_max_stall_resets = 3; // Maximum stall recovery attempts before giving up
+
+// Frame timing/pacing metrics
+static struct timeval g_last_flip_submit = {0};
+static struct timeval g_last_flip_complete = {0};
+static double g_min_flip_time = 1000.0;
+static double g_max_flip_time = 0.0;
+static double g_avg_flip_time = 0.0;
+static int g_flip_count = 0;
+static int g_pending_flips = 0;  // Track number of page flips in flight
 
 static double tv_diff(const struct timeval *a, const struct timeval *b) {
 	return (double)(a->tv_sec - b->tv_sec) + (double)(a->tv_usec - b->tv_usec)/1e6;
@@ -387,6 +430,12 @@ static void stats_log_final(struct mpv_player *p) {
 	}
 	fprintf(stderr, "[stats-final] duration=%.2fs frames=%llu avg_fps=%.2f dropped_dec=%lld dropped_vo=%lld\n",
 			total, (unsigned long long)g_stats_frames, avg_fps, (long long)drop_dec, (long long)drop_vo);
+	
+	// Print frame timing stats if enabled
+	if (g_frame_timing_enabled && g_flip_count > 0) {
+		fprintf(stderr, "[timing-final] flip_time: min=%.2fms avg=%.2fms max=%.2fms count=%d\n",
+			g_min_flip_time * 1000.0, g_avg_flip_time * 1000.0, g_max_flip_time * 1000.0, g_flip_count);
+	}
 }
 
 // Helper for mpv option failure logging
@@ -429,6 +478,27 @@ static bool init_mpv(struct mpv_player *p, const char *file) {
 	if (!hwdec_pref || !*hwdec_pref) hwdec_pref = "auto-safe";
 	r = mpv_set_option_string(p->mpv, "hwdec", hwdec_pref); log_opt_result("hwdec", r);
 	r = mpv_set_option_string(p->mpv, "opengl-es", "yes"); log_opt_result("opengl-es=yes", r);
+	
+	// Video sync mode for better frame timing
+	const char *video_sync = g_vsync_enabled ? "display-resample" : "audio";
+	r = mpv_set_option_string(p->mpv, "video-sync", video_sync);
+	log_opt_result("video-sync", r);
+	
+	// Set a higher frame queue size for smoother playback
+	r = mpv_set_option_string(p->mpv, "vo-queue-size", "4");
+	log_opt_result("vo-queue-size", r);
+	
+	// Increase demuxer cache for smoother playback
+	r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "64MiB");
+	log_opt_result("demuxer-max-bytes", r);
+	
+	// Optimize for smoother playback over perfect A/V sync
+	r = mpv_set_option_string(p->mpv, "cache-secs", "10");
+	log_opt_result("cache-secs", r);
+	
+	// Set a larger audio buffer for smoother audio output
+	r = mpv_set_option_string(p->mpv, "audio-buffer", "0.2");  // 200ms audio buffer
+	log_opt_result("audio-buffer", r);
 
 	const char *ctx_override = getenv("PICKLE_GPU_CONTEXT");
 	int forced_headless = getenv("PICKLE_FORCE_HEADLESS") ? 1 : 0;
@@ -530,6 +600,9 @@ static void drain_mpv_events(mpv_handle *h) {
 	while (1) {
 		mpv_event *ev = mpv_wait_event(h, 0);
 		if (ev->event_id == MPV_EVENT_NONE) break;
+		if (ev->event_id == MPV_EVENT_VIDEO_RECONFIG) {
+			if (g_debug) fprintf(stderr, "[mpv] VIDEO_RECONFIG\n");
+		}
 		if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
 			mpv_event_log_message *lm = ev->data;
 			// Only print warnings/errors by default; set PICKLE_LOG_MPV for full detail earlier.
@@ -537,6 +610,12 @@ static void drain_mpv_events(mpv_handle *h) {
 				fprintf(stderr, "[mpv-log] %s: %s", lm->level, lm->text ? lm->text : "\n");
 			}
 			continue;
+		}
+		if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) {
+			// This event can indicate that playback is resuming after a pause
+			// Mark it as activity to prevent stall detection from triggering
+			if (g_debug) fprintf(stderr, "[mpv] PLAYBACK_RESTART\n");
+			gettimeofday(&g_last_frame_time, NULL);
 		}
 		if (ev->event_id == MPV_EVENT_END_FILE) {
 			const mpv_event_end_file *ef = ev->data;
@@ -557,16 +636,44 @@ static void drain_mpv_events(mpv_handle *h) {
 // but we also must know the gbm_bo to release. We'll store a static reference to egl_ctx
 // and pass the bo as user data.
 static struct egl_ctx *g_egl_for_handler;
+// Forward state needed by page flip handler (must appear before handler definition)
+static struct gbm_bo *g_first_frame_bo = NULL; // BO used for initial modeset, released after second frame
+static int g_pending_flip = 0; // set after scheduling page flip until event handler fires
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data) {
-	(void)fd; (void)frame; (void)sec; (void)usec;
+	(void)fd; (void)frame;
 	struct gbm_bo *old = data;
 	if (g_egl_for_handler && old) gbm_surface_release_buffer(g_egl_for_handler->gbm_surf, old);
+	g_pending_flip = 0; // flip completed
+	g_pending_flips--; // decrement pending flip count
+	
+	if (g_first_frame_bo && g_first_frame_bo != old) {
+		gbm_surface_release_buffer(g_egl_for_handler->gbm_surf, g_first_frame_bo);
+		g_first_frame_bo = NULL;
+	}
+	
+	// Update last frame time on successful page flip
+	struct timeval now; gettimeofday(&now, NULL);
+	g_last_frame_time = now;
+	g_last_flip_complete = now;
+	
+	// Update flip timing metrics
+	if (g_frame_timing_enabled) {
+		double flip_time = tv_diff(&now, &g_last_flip_submit);
+		if (flip_time < g_min_flip_time) g_min_flip_time = flip_time;
+		if (flip_time > g_max_flip_time) g_max_flip_time = flip_time;
+		g_avg_flip_time = (g_avg_flip_time * g_flip_count + flip_time) / (g_flip_count + 1);
+		g_flip_count++;
+		
+		if (g_debug && (g_flip_count % 60 == 0)) {
+			fprintf(stderr, "[timing] flip min=%.2fms avg=%.2fms max=%.2fms count=%d\n",
+				g_min_flip_time * 1000.0, g_avg_flip_time * 1000.0, g_max_flip_time * 1000.0, g_flip_count);
+		}
+	}
 }
 
 // Removed const from drm_ctx parameter because drmModeSetCrtc expects a non-const drmModeModeInfoPtr.
 // We cache framebuffer IDs per gbm_bo to avoid per-frame AddFB/RmFB churn.
 // user data holds a small struct with fb id + drm fd and a destroy handler.
-static struct gbm_bo *g_first_frame_bo = NULL; // BO used for initial modeset, released after second frame
 static int g_scanout_disabled = 0; // when set, we skip page flips/modeset and just let mpv decode & render offscreen
 struct fb_holder { uint32_t fb; int fd; };
 static void bo_destroy_handler(struct gbm_bo *bo, void *data) {
@@ -635,22 +742,42 @@ static bool render_frame_fixed(struct kms_ctx *d, struct egl_ctx *e, struct mpv_
 	}
 	if (!g_scanout_disabled) {
 		g_egl_for_handler = e;
+		gettimeofday(&g_last_flip_submit, NULL); // Record time of submission
+		
+		// For triple buffering, allow up to 2 page flips in flight
+		// If we already have max pending flips, wait for one to complete
+		int max_pending = g_triple_buffer ? 2 : 1;
+		
+		if (g_pending_flips >= max_pending) {
+			if (g_debug) fprintf(stderr, "[buffer] Waiting for page flip to complete (pending=%d)\n", g_pending_flips);
+			
+			// Wait for a pending flip to complete before scheduling another
+			fd_set fds;
+			FD_ZERO(&fds);
+			FD_SET(d->fd, &fds);
+			
+			// Set reasonable timeout to avoid indefinite wait
+			struct timeval timeout = {0, 100000}; // 100ms
+			
+			if (select(d->fd + 1, &fds, NULL, NULL, &timeout) <= 0) {
+				// Timeout or error occurred, force reset pending flip state
+				if (g_debug) fprintf(stderr, "[buffer] Page flip wait timeout, resetting state\n");
+				g_pending_flip = 0;
+				g_pending_flips = 0;
+			} else if (FD_ISSET(d->fd, &fds)) {
+				// Handle the page flip event
+				drmEventContext ev = { .version = DRM_EVENT_CONTEXT_VERSION, .page_flip_handler = page_flip_handler };
+				drmHandleEvent(d->fd, &ev);
+			}
+		}
+		
 		if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
 			fprintf(stderr, "drmModePageFlip failed (%s)\n", strerror(errno));
 			gbm_surface_release_buffer(e->gbm_surf, bo);
 			return false;
 		}
-		fd_set fds; FD_ZERO(&fds); FD_SET(d->fd, &fds);
-		if (select(d->fd+1, &fds, NULL, NULL, NULL) < 0) {
-			fprintf(stderr, "select failed\n");
-			return false;
-		}
-		drmEventContext ev = { .version = DRM_EVENT_CONTEXT_VERSION, .page_flip_handler = page_flip_handler };
-		drmHandleEvent(d->fd, &ev);
-		if (g_first_frame_bo && g_first_frame_bo != bo) {
-			gbm_surface_release_buffer(e->gbm_surf, g_first_frame_bo);
-			g_first_frame_bo = NULL;
-		}
+		g_pending_flip = 1; // will release in handler
+		g_pending_flips++;  // increment pending flip count
 	} else {
 		// Offscreen mode: just release BO immediately (no scanout usage).
 		gbm_surface_release_buffer(e->gbm_surf, bo);
@@ -659,11 +786,91 @@ static bool render_frame_fixed(struct kms_ctx *d, struct egl_ctx *e, struct mpv_
 	return true;
 }
 
+// Preallocate (discover) up to ring_size unique GBM BOs + FB IDs by performing dummy swaps.
+static void preallocate_fb_ring(struct kms_ctx *d, struct egl_ctx *e, int ring_size) {
+	if (ring_size <= 0) return;
+	if (g_fb_ring.entries) return; // already done
+	g_fb_ring.entries = calloc((size_t)ring_size, sizeof(*g_fb_ring.entries));
+	if (!g_fb_ring.entries) { fprintf(stderr, "[fb-ring] allocation failed\n"); return; }
+	g_fb_ring.count = ring_size;
+	fprintf(stderr, "[fb-ring] Preallocating up to %d framebuffers...\n", ring_size);
+	// We intentionally do NOT modeset here; we only want FB IDs ready so first real frame
+	// can modeset without incurring drmModeAddFB latency.
+	for (int i=0; i<ring_size; ++i) {
+		// Simple clear to ensure back buffer considered updated.
+		glClearColor(0.f,0.f,0.f,1.f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		eglSwapBuffers(e->dpy, e->surf);
+		struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
+		if (!bo) { fprintf(stderr, "[fb-ring] lock_front_buffer failed at %d\n", i); break; }
+		// Check if this BO already seen (gbm may recycle quickly for small surfaces)
+		int seen = 0;
+		for (int j=0; j<g_fb_ring.produced; ++j) {
+			if (g_fb_ring.entries[j].bo == bo) { seen = 1; break; }
+		}
+		if (!seen) {
+			uint32_t fb_id = 0;
+			struct fb_holder *h = gbm_bo_get_user_data(bo);
+			if (h) fb_id = h->fb;
+			if (!fb_id) {
+				uint32_t handle = gbm_bo_get_handle(bo).u32;
+				uint32_t pitch  = gbm_bo_get_stride(bo);
+				uint32_t width  = gbm_bo_get_width(bo);
+				uint32_t height = gbm_bo_get_height(bo);
+				if (drmModeAddFB(d->fd, width, height, 24, 32, pitch, handle, &fb_id)) {
+					fprintf(stderr, "[fb-ring] drmModeAddFB failed (%s)\n", strerror(errno));
+					gbm_surface_release_buffer(e->gbm_surf, bo);
+					break;
+				}
+				struct fb_holder *nh = calloc(1, sizeof(*nh));
+				if (nh) { nh->fb = fb_id; nh->fd = d->fd; gbm_bo_set_user_data(bo, nh, bo_destroy_handler); }
+			}
+			if (g_fb_ring.produced < g_fb_ring.count) {
+				g_fb_ring.entries[g_fb_ring.produced].bo = bo;
+				g_fb_ring.entries[g_fb_ring.produced].fb_id = fb_id;
+				g_fb_ring.produced++;
+			}
+		}
+		// Release immediately so normal rendering path can reacquire; we only needed FB ID.
+		gbm_surface_release_buffer(e->gbm_surf, bo);
+		if (g_fb_ring.produced >= g_fb_ring.count) break;
+	}
+	fprintf(stderr, "[fb-ring] Prepared %d unique framebuffer(s)\n", g_fb_ring.produced);
+}
+
 int main(int argc, char **argv) {
 	if (argc < 2) { fprintf(stderr, "Usage: %s <video-file>\n", argv[0]); return 1; }
 	signal(SIGINT, handle_sigint);
     signal(SIGSEGV, handle_sigsegv);
 	const char *file = argv[1];
+
+	if (getenv("PICKLE_DEBUG")) g_debug = 1;
+	gettimeofday(&g_prog_start, NULL);
+	
+	// Allow customization of max stall resets
+	const char *max_resets = getenv("PICKLE_MAX_STALL_RESETS");
+	if (max_resets) {
+		int val = atoi(max_resets);
+		if (val >= 0) g_max_stall_resets = val;
+	}
+	
+	// Buffer mode configuration
+	const char *disable_triple = getenv("PICKLE_NO_TRIPLE_BUFFER");
+	if (disable_triple && *disable_triple) g_triple_buffer = 0;
+	
+	// Vsync control
+	const char *disable_vsync = getenv("PICKLE_NO_VSYNC");
+	if (disable_vsync && *disable_vsync) g_vsync_enabled = 0;
+	
+	// Frame timing diagnostics
+	const char *timing = getenv("PICKLE_TIMING");
+	if (timing && *timing) g_frame_timing_enabled = 1;
+	
+	// Consider setting a conservative timeout value
+	const char *no_stall_check = getenv("PICKLE_NO_STALL_CHECK");
+	if (no_stall_check && *no_stall_check) {
+		g_max_stall_resets = 0; // Disable stall recovery
+	}
 
 	struct kms_ctx drm = {0};
 	struct egl_ctx eglc = {0};
@@ -685,38 +892,166 @@ int main(int argc, char **argv) {
 
 	if (!init_drm(&drm)) RET("init_drm");
 	if (!init_gbm_egl(&drm, &eglc)) RET("init_gbm_egl");
+	// Optional preallocation of FB ring (env PICKLE_FB_RING, default 3)
+	int fb_ring_n = 3; {
+		const char *re = getenv("PICKLE_FB_RING");
+		if (re && *re) {
+			int v = atoi(re); if (v > 0 && v < 16) fb_ring_n = v; }
+	}
+	preallocate_fb_ring(&drm, &eglc, fb_ring_n);
 	if (!init_mpv(&player, file)) RET("init_mpv");
+	// Prime event processing in case mpv already queued wakeups before pipe creation.
+	g_mpv_wakeup = 1;
 
 	fprintf(stderr, "Playing %s at %dx%d %.2f Hz\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
 			(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal))); 
 
 	// Event-driven loop: render only when mpv signals a frame update unless override forces continuous loop.
-	// Event-driven loop: use mpv_render_context_update flags to decide when to render
-	const int idle_sleep_us = 16000; // used only in force loop mode
+	// If mpv hasn't yet posted MPV_RENDER_UPDATE_FRAME for the very first frame, we still render once to kick things off.
 	int frames = 0;
 	int force_loop = getenv("PICKLE_FORCE_RENDER_LOOP") ? 1 : 0;
+	// Watchdog: if no frame submitted within WD_FIRST_MS, force a render attempt even if mpv flags missing.
+	const int WD_FIRST_MS = 1500; // 1.5s
+	const int WD_ONGOING_MS = 3000; // 3s max between frames during playback
+	struct timeval wd_last_activity; gettimeofday(&wd_last_activity, NULL);
+	gettimeofday(&g_last_frame_time, NULL); // Initialize last frame time
+	int wd_forced_first = 0;
+	// Create wakeup pipe (non-blocking) to integrate mpv callback into poll
+	if (g_mpv_pipe[0] < 0) {
+		if (pipe(g_mpv_pipe) == 0) {
+			int fl = fcntl(g_mpv_pipe[0], F_GETFL, 0); fcntl(g_mpv_pipe[0], F_SETFL, fl | O_NONBLOCK);
+			fl = fcntl(g_mpv_pipe[1], F_GETFL, 0); fcntl(g_mpv_pipe[1], F_SETFL, fl | O_NONBLOCK);
+		} else {
+			fprintf(stderr, "[mpv] pipe() failed (%s)\n", strerror(errno));
+		}
+	}
 	while (!g_stop) {
+		// Drain any pending mpv events BEFORE potentially blocking in poll to avoid startup deadlock
 		if (g_mpv_wakeup) {
 			g_mpv_wakeup = 0;
 			drain_mpv_events(player.mpv);
 			if (player.rctx) {
 				uint64_t flags = mpv_render_context_update(player.rctx);
-				g_mpv_update_flags |= flags; // accumulate until consumed
+				g_mpv_update_flags |= flags;
+			}
+		}
+		// Prepare pollfds: DRM fd (for page flip events) + mpv wakeup pipe.
+		struct pollfd pfds[3]; int n=0;
+		if (!g_scanout_disabled) { pfds[n].fd = drm.fd; pfds[n].events = POLLIN; pfds[n].revents = 0; n++; }
+		if (g_mpv_pipe[0] >= 0) { pfds[n].fd = g_mpv_pipe[0]; pfds[n].events = POLLIN; pfds[n].revents = 0; n++; }
+		int timeout_ms = -1;
+		
+		// Calculate appropriate poll timeout based on frame rate and vsync
+		if (force_loop || (g_mpv_update_flags & MPV_RENDER_UPDATE_FRAME)) {
+			timeout_ms = 0; // don't block if render pending
+		} else if (frames > 0 && g_vsync_enabled) {
+			// Estimate appropriate timeout based on refresh rate for vsync
+			double refresh_rate = drm.mode.vrefresh ? 
+				(double)drm.mode.vrefresh : 
+				(double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal);
+			
+			// Use a more aggressive timeout for better responsiveness
+			// Aim for half the frame interval to ensure we don't miss vsync
+			if (refresh_rate > 0) {
+				timeout_ms = (int)(500.0 / refresh_rate); // half frame time in ms
+				
+				// Clamp to reasonable bounds
+				if (timeout_ms < 4) timeout_ms = 4;       // min 4ms (250fps max)
+				if (timeout_ms > 100) timeout_ms = 100;   // max 100ms (10fps min)
+			} else {
+				timeout_ms = 16; // Default to 60Hz (16.6ms) if refresh rate unknown
+			}
+		}
+		
+		// Add a max timeout to avoid being stuck in poll forever even if no events come
+		// This allows our watchdog logic to run periodically
+		if (timeout_ms < 0) timeout_ms = 100; // max 100ms poll timeout
+
+		int pr = poll(pfds, n, timeout_ms);
+		if (pr < 0) { if (errno == EINTR) continue; fprintf(stderr, "poll failed (%s)\n", strerror(errno)); break; }
+		for (int i=0;i<n;i++) {
+			if (!(pfds[i].revents & POLLIN)) continue;
+			if (pfds[i].fd == drm.fd) {
+				drmEventContext ev = { .version = DRM_EVENT_CONTEXT_VERSION, .page_flip_handler = page_flip_handler };
+				drmHandleEvent(drm.fd, &ev);
+			} else if (pfds[i].fd == g_mpv_pipe[0]) {
+				unsigned char buf[64]; while (read(g_mpv_pipe[0], buf, sizeof(buf)) > 0) { /* drain */ }
+				g_mpv_wakeup = 1;
+			}
+		}
+		if (g_mpv_wakeup) {
+			g_mpv_wakeup = 0;
+			drain_mpv_events(player.mpv);
+			if (player.rctx) {
+				uint64_t flags = mpv_render_context_update(player.rctx);
+				g_mpv_update_flags |= flags;
 			}
 		}
 		if (g_stop) break;
 		int need_frame = 0;
-		if (force_loop) need_frame = 1;
-		else if (g_mpv_update_flags & MPV_RENDER_UPDATE_FRAME) need_frame = 1;
-		if (need_frame) {
-			if (!render_frame_fixed(&drm, &eglc, &player)) { fprintf(stderr, "Render failed, exiting\n"); break; }
-			frames++;
-			g_mpv_update_flags &= ~MPV_RENDER_UPDATE_FRAME; // consume frame flag
-			if (g_stats_enabled) { g_stats_frames++; stats_log_periodic(&player); }
-		} else {
-			usleep(2000);
+		if (frames == 0 && !g_pending_flip) need_frame = 1; // guarantee first frame submission
+		else if (force_loop && !g_pending_flip) need_frame = 1; // continuous mode
+		else if ((g_mpv_update_flags & MPV_RENDER_UPDATE_FRAME) && !g_pending_flip) need_frame = 1;
+
+		// Watchdog: if still no frame after WD_FIRST_MS since start, force once.
+		if (!frames && !need_frame && !wd_forced_first) {
+			struct timeval now; gettimeofday(&now, NULL);
+			double since = tv_diff(&now, &g_prog_start) * 1000.0; // ms
+			if (since > WD_FIRST_MS) {
+				if (g_debug) fprintf(stderr, "[wd] forcing first frame after %.1f ms inactivity\n", since);
+				need_frame = 1; wd_forced_first = 1;
+			}
 		}
-		if (force_loop && !g_mpv_wakeup) usleep(idle_sleep_us);
+		
+		// Ongoing playback stall detection
+		if (frames > 0 && !need_frame && !g_pending_flip) {
+			struct timeval now; gettimeofday(&now, NULL);
+			double since_last_frame = tv_diff(&now, &g_last_frame_time) * 1000.0; // ms
+			
+			// If we haven't rendered a frame in WD_ONGOING_MS, try to recover
+			if (since_last_frame > WD_ONGOING_MS && g_stall_reset_count < g_max_stall_resets) {
+				fprintf(stderr, "[wd] playback stall detected - no frames for %.1f ms, attempting recovery (attempt %d/%d)\n", 
+					since_last_frame, g_stall_reset_count+1, g_max_stall_resets);
+				
+				// Reset potential stuck state
+				g_pending_flip = 0;
+				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME; // Force frame rendering
+				need_frame = 1;
+				g_stall_reset_count++;
+				
+				// Try to get mpv back on track by forcing an update
+				if (player.rctx) {
+					uint64_t flags = mpv_render_context_update(player.rctx);
+					g_mpv_update_flags |= flags;
+					
+					// Reset decoder if needed (for more aggressive recovery)
+					if (g_stall_reset_count > 1) {
+						const char *cmd[] = {"cycle-values", "hwdec", "auto-safe", "no", NULL};
+						mpv_command_async(player.mpv, 0, cmd);
+						fprintf(stderr, "[wd] cycling hwdec as part of recovery\n");
+					}
+				}
+			}
+		}
+		if (need_frame) {
+			if (g_debug && frames < 10) fprintf(stderr, "[debug] rendering frame #%d flags=0x%llx pending_flip=%d\n", frames, (unsigned long long)g_mpv_update_flags, g_pending_flip);
+			if (!render_frame_fixed(&drm, &eglc, &player)) { 
+				fprintf(stderr, "Render failed, exiting\n"); 
+				break; 
+			}
+			frames++;
+			g_mpv_update_flags &= ~MPV_RENDER_UPDATE_FRAME;
+			if (g_stats_enabled) { g_stats_frames++; stats_log_periodic(&player); }
+			gettimeofday(&wd_last_activity, NULL);
+			gettimeofday(&g_last_frame_time, NULL); // Update last successful frame time
+			
+			// Reset stall counter after successful frames
+			if (g_stall_reset_count > 0 && (frames % 10) == 0) {
+				fprintf(stderr, "[wd] playback resumed normally, resetting stall counter\n");
+				g_stall_reset_count = 0;
+			}
+		}
+		if (force_loop && !need_frame && !g_pending_flip) usleep(1000); // light backoff
 	}
 
 	stats_log_final(&player);
