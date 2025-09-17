@@ -123,7 +123,7 @@ Suggested usage for maximum performance:
 ```
 make clean
 make PERF=1 LTO=1
-sudo ./pickle video.mp4
+./pickle vid.mp4
 ```
 
 If you need to measure CPU usage differences, compare with and without `PERF=1` using `pidstat -p <pid> 1` or `perf top`.

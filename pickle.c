@@ -498,6 +498,7 @@ static bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
 		EGL_GREEN_SIZE, 8,
 		EGL_BLUE_SIZE, 8,
 		EGL_ALPHA_SIZE, 0,
+		EGL_STENCIL_SIZE, 8,  // Request stencil buffer for masking
 		EGL_NONE
 	};
 	
@@ -796,6 +797,10 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	// Set a larger audio buffer for smoother audio output
 	r = mpv_set_option_string(p->mpv, "audio-buffer", "0.2");  // 200ms audio buffer
 	log_opt_result("audio-buffer", r);
+	
+	// Set video orientation to fix upside-down video
+	r = mpv_set_option_string(p->mpv, "video-rotate", "180");
+	log_opt_result("video-rotate=180", r);
 
 	const char *ctx_override = getenv("PICKLE_GPU_CONTEXT");
 	int forced_headless = getenv("PICKLE_FORCE_HEADLESS") ? 1 : 0;
@@ -828,6 +833,9 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	if (strcmp(vo_used, "gpu") == 0) {
 		mpv_set_option_string(p->mpv, "terminal", "no");
 		mpv_set_option_string(p->mpv, "input-default-bindings", "no");
+		mpv_set_option_string(p->mpv, "input-vo-keyboard", "no");  // Disable mpv's keyboard handling
+		mpv_set_option_string(p->mpv, "input-cursor", "no");       // Disable cursor handling
+		mpv_set_option_string(p->mpv, "input-media-keys", "no");   // Disable media key handling
 		// Prevent mpv from attempting any DRM/KMS operations since we handle display ourselves
 		if (!getenv("PICKLE_KEEP_ATOMIC")) {
 			mpv_set_option_string(p->mpv, "drm-atomic", "no");
@@ -1481,16 +1489,112 @@ static void cleanup_keystone_shader(void) {
  * @param key The key character pressed
  * @return true if the key was handled, false otherwise
  */
+// Arrow key escape sequences
+#define ESC_CHAR 27
+#define ARROW_UP 'A'
+#define ARROW_DOWN 'B'
+#define ARROW_RIGHT 'C'
+#define ARROW_LEFT 'D'
+
+// Key sequence state for handling escape sequences
+static struct {
+    bool in_escape_seq;
+    bool in_bracket_seq;
+    char last_char;
+} g_key_seq_state = {false, false, 0};
+
 static bool keystone_handle_key(char key) {
+    // Handle multi-character escape sequences for arrow keys
+    LOG_INFO("keystone_handle_key called with key: %d (0x%02x) '%c', escape_seq: %d, bracket_seq: %d", 
+             (int)key, (int)key, (key >= 32 && key < 127) ? key : '?', 
+             g_key_seq_state.in_escape_seq, g_key_seq_state.in_bracket_seq);
+             
+    if (g_key_seq_state.in_escape_seq) {
+        if (g_key_seq_state.in_bracket_seq) {
+            // This is the final character of an escape sequence
+            g_key_seq_state.in_escape_seq = false;
+            g_key_seq_state.in_bracket_seq = false;
+            
+            // Only process arrow keys if keystone mode is enabled
+            if (g_keystone.enabled) {
+                LOG_INFO("Processing arrow key: %d (0x%02x) '%c'", (int)key, (int)key, key);
+                float step = (float)g_keystone_adjust_step / 1000.0f; // Convert to 0-1 range
+                
+                switch (key) {
+                    case ARROW_UP:    // Up arrow
+                        if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                            keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                                      g_keystone.active_mesh_point[1], 
+                                                      0.0f, -step);
+                        } else {
+                            keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
+                        }
+                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+                        return true;
+                        
+                    case ARROW_DOWN:  // Down arrow
+                        if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                            keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                                      g_keystone.active_mesh_point[1], 
+                                                      0.0f, step);
+                        } else {
+                            keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
+                        }
+                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+                        return true;
+                        
+                    case ARROW_LEFT:  // Left arrow
+                        if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                            keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                                      g_keystone.active_mesh_point[1], 
+                                                      -step, 0.0f);
+                        } else {
+                            keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
+                        }
+                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+                        return true;
+                        
+                    case ARROW_RIGHT: // Right arrow
+                        if (g_keystone.mesh_enabled && g_keystone.active_mesh_point[0] >= 0) {
+                            keystone_adjust_mesh_point(g_keystone.active_mesh_point[0], 
+                                                      g_keystone.active_mesh_point[1], 
+                                                      step, 0.0f);
+                        } else {
+                            keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
+                        }
+                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+                        return true;
+                }
+            }
+            return false;
+        } else if (key == '[') {
+            // This is the [ character after ESC
+            g_key_seq_state.in_bracket_seq = true;
+            return false;
+        } else {
+            // Not a sequence we recognize, reset state
+            g_key_seq_state.in_escape_seq = false;
+            return false;
+        }
+    } else if (key == ESC_CHAR) {
+        // Start of a potential escape sequence
+        g_key_seq_state.in_escape_seq = true;
+        g_key_seq_state.in_bracket_seq = false;
+        return false;
+    }
+    
+    // Regular key handling
     if (!g_keystone.enabled) {
         // Only enable keystone mode with 'k' key
         if (key == 'k') {
+            LOG_INFO("Enabling keystone mode");
             g_keystone.enabled = true;
             g_keystone.active_corner = 0; // Start with the first corner
             keystone_update_matrix();
             LOG_INFO("Keystone correction enabled, adjusting corner %d", g_keystone.active_corner + 1);
             return true;
         }
+        LOG_INFO("Keystone mode not enabled, ignoring key");
         return false;
     }
     
@@ -1509,7 +1613,7 @@ static bool keystone_handle_key(char key) {
             g_keystone.active_mesh_point[0] = -1; // Deactivate mesh point
             g_keystone.active_mesh_point[1] = -1;
             LOG_INFO("Adjusting corner %d", g_keystone.active_corner + 1);
-            fprintf(stderr, "\rSelected corner %d (Press w/a/s/d to move)   ", g_keystone.active_corner + 1);
+            fprintf(stderr, "\rSelected corner %d (Press arrow keys or w/a/s/d to move)   ", g_keystone.active_corner + 1);
             return true;
             
         case '!': case '@': case '#': case '$': // Pin/unpin corners (shift+1,2,3,4)
@@ -1675,7 +1779,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
             }
-            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
+            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
             return true;
             
         case 's': // Move active point down
@@ -1686,7 +1790,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
             }
-            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
+            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
             return true;
             
         case 'a': // Move active point left
@@ -1697,7 +1801,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
             }
-            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
+            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
             return true;
             
         case 'd': // Move active point right
@@ -1708,7 +1812,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
             }
-            fprintf(stderr, "\rPoint adjusted. Use w/a/s/d to move.");
+            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
             return true;
             
         case 'r': // Reset to default
@@ -2092,7 +2196,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Standard black background
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	}
-	glClear(GL_COLOR_BUFFER_BIT);
+	glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 	
 	// Create an FBO for rendering the mpv frame
 	GLuint fbo_texture = 0;
@@ -2163,6 +2267,40 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glUniform1i(g_keystone_u_texture_loc, 0);
 		
 		// Create two triangles that form a quad covering the entire screen (-1 to 1 in both dimensions)
+		// Clear stencil buffer
+		glClear(GL_STENCIL_BUFFER_BIT);
+		
+		// Set up stencil test to define the keystone region
+		glEnable(GL_STENCIL_TEST);
+		glStencilFunc(GL_ALWAYS, 1, 0xFF);
+		glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+		glStencilMask(0xFF);
+		
+		// First pass: Define the keystone area in the stencil buffer
+		// Create a polygon that defines the video boundaries based on keystone corners
+		glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); // Don't write to color buffer
+		
+		// Draw polygon to stencil buffer
+		// Define the exact boundary based on keystone corners
+		float boundary_vertices[] = {
+			g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[0][1] * 2.0f,  // Top left
+			g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[1][1] * 2.0f,  // Top right
+			g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[2][1] * 2.0f,  // Bottom right
+			g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[3][1] * 2.0f   // Bottom left
+		};
+		
+		// Use immediate mode (for simplicity, since this is a one-time setup)
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, boundary_vertices);
+		glEnableVertexAttribArray(0);
+		glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+		
+		// Second pass: Now draw the actual content with stencil test
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); // Re-enable color buffer writing
+		glStencilFunc(GL_EQUAL, 1, 0xFF);
+		glStencilMask(0x00); // Don't modify stencil buffer
+		
+		// Now draw the regular quad with texture
 		// These will be our output positions
 		float vertices[] = {
 			-1.0f,  1.0f,  // Top left (vertex position)
@@ -2174,10 +2312,10 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Define texture coordinates for each vertex based on the keystone corners
 		// These define where in the texture each vertex samples from
 		float texcoords[] = {
-			g_keystone.points[0][0], g_keystone.points[0][1],  // Top left
-			g_keystone.points[1][0], g_keystone.points[1][1],  // Top right
-			g_keystone.points[3][0], g_keystone.points[3][1],  // Bottom left
-			g_keystone.points[2][0], g_keystone.points[2][1]   // Bottom right
+			g_keystone.points[0][0], 1.0f - g_keystone.points[0][1],  // Top left (flip Y)
+			g_keystone.points[1][0], 1.0f - g_keystone.points[1][1],  // Top right (flip Y)
+			g_keystone.points[3][0], 1.0f - g_keystone.points[3][1],  // Bottom left (flip Y)
+			g_keystone.points[2][0], 1.0f - g_keystone.points[2][1]   // Bottom right (flip Y)
 		};
 		
 		// Enable vertex arrays
@@ -2201,6 +2339,9 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		// Draw the quad
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		
+		// Disable stencil test now that we're done with masked rendering
+		glDisable(GL_STENCIL_TEST);
 		
 		// Clean up
 	glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
@@ -2623,15 +2764,33 @@ int main(int argc, char **argv) {
 				// Handle keyboard input
 				char c;
 				if (read(STDIN_FILENO, &c, 1) > 0) {
+					// Log keypress for debugging
+					LOG_INFO("Key pressed: %d (0x%02x) '%c'", (int)c, (int)c, (c >= 32 && c < 127) ? c : '?');
+					
+					// Special case: Force keystone mode with 'K' (capital K)
+					if (c == 'K') {
+						LOG_INFO("Force enabling keystone mode with capital K");
+						g_keystone.enabled = true;
+						g_keystone.active_corner = 0;
+						keystone_update_matrix();
+						LOG_INFO("Keystone correction FORCE enabled, adjusting corner %d", g_keystone.active_corner + 1);
+						fprintf(stderr, "\rKeystone correction FORCE enabled, use arrow keys or WASD to adjust corner %d", 
+								g_keystone.active_corner + 1);
+						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+						continue;
+					}
+					
 					// Check for quit key (q)
-					if (c == 'q') {
+					if (c == 'q' && !g_key_seq_state.in_escape_seq) {
 						LOG_INFO("Quit requested by user");
 						g_stop = 1;
 						break;
 					}
 					
 					// Handle keystone adjustment keys
-					if (keystone_handle_key(c)) {
+					bool keystone_handled = keystone_handle_key(c);
+					LOG_INFO("Keystone handler returned: %d", keystone_handled);
+					if (keystone_handled) {
 						// Force a redraw when keystone parameters change
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 					}
