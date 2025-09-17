@@ -498,7 +498,6 @@ static bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
 		EGL_GREEN_SIZE, 8,
 		EGL_BLUE_SIZE, 8,
 		EGL_ALPHA_SIZE, 0,
-		EGL_STENCIL_SIZE, 8,  // Request stencil buffer for masking
 		EGL_NONE
 	};
 	
@@ -2196,7 +2195,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Standard black background
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	}
-	glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+	glClear(GL_COLOR_BUFFER_BIT);
 	
 	// Create an FBO for rendering the mpv frame
 	GLuint fbo_texture = 0;
@@ -2266,65 +2265,30 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glBindTexture(GL_TEXTURE_2D, fbo_texture);
 		glUniform1i(g_keystone_u_texture_loc, 0);
 		
-		// Create two triangles that form a quad covering the entire screen (-1 to 1 in both dimensions)
-		// Clear stencil buffer
-		glClear(GL_STENCIL_BUFFER_BIT);
-		
-		// Set up stencil test to define the keystone region
-		glEnable(GL_STENCIL_TEST);
-		glStencilFunc(GL_ALWAYS, 1, 0xFF);
-		glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-		glStencilMask(0xFF);
-		
-		// First pass: Define the keystone area in the stencil buffer
-		// Create a polygon that defines the video boundaries based on keystone corners
-		glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); // Don't write to color buffer
-		
-		// Draw polygon to stencil buffer
-		// Define the exact boundary based on keystone corners
-		float boundary_vertices[] = {
-			g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[0][1] * 2.0f,  // Top left
-			g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[1][1] * 2.0f,  // Top right
-			g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[2][1] * 2.0f,  // Bottom right
-			g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - g_keystone.points[3][1] * 2.0f   // Bottom left
-		};
-		
-		// Use immediate mode (for simplicity, since this is a one-time setup)
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
-		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, boundary_vertices);
-		glEnableVertexAttribArray(0);
-		glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-		
-		// Second pass: Now draw the actual content with stencil test
-		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); // Re-enable color buffer writing
-		glStencilFunc(GL_EQUAL, 1, 0xFF);
-		glStencilMask(0x00); // Don't modify stencil buffer
-		
-		// Now draw the regular quad with texture
-		// These will be our output positions
+		// Correct warping approach: Draw a warped quad where vertices match the keystone corners
+		// Convert keystone points from normalized [0,1] space to clip space [-1,1]
 		float vertices[] = {
-			-1.0f,  1.0f,  // Top left (vertex position)
-			 1.0f,  1.0f,  // Top right
-			-1.0f, -1.0f,  // Bottom left
-			 1.0f, -1.0f   // Bottom right
+			g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[0][1] * 2.0f),  // Top left 
+			g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[1][1] * 2.0f),  // Top right
+			g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[3][1] * 2.0f),  // Bottom left 
+			g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[2][1] * 2.0f)   // Bottom right
 		};
 		
-		// Define texture coordinates for each vertex based on the keystone corners
-		// These define where in the texture each vertex samples from
+		// Use standard texture coordinates for proper mapping
 		float texcoords[] = {
-			g_keystone.points[0][0], 1.0f - g_keystone.points[0][1],  // Top left (flip Y)
-			g_keystone.points[1][0], 1.0f - g_keystone.points[1][1],  // Top right (flip Y)
-			g_keystone.points[3][0], 1.0f - g_keystone.points[3][1],  // Bottom left (flip Y)
-			g_keystone.points[2][0], 1.0f - g_keystone.points[2][1]   // Bottom right (flip Y)
+			0.0f, 0.0f,  // Top left
+			1.0f, 0.0f,  // Top right
+			0.0f, 1.0f,  // Bottom left
+			1.0f, 1.0f   // Bottom right
 		};
 		
 		// Enable vertex arrays
-	glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+		glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
 		
 		// Bind and set vertex positions
 		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
 		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
-	glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+		glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
 		
 		// We need another VBO for texture coordinates
 		if (g_keystone_texcoord_buffer == 0) {
@@ -2334,18 +2298,30 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Bind and set texture coordinates
 		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_texcoord_buffer);
 		glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_DYNAMIC_DRAW);
-	glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
-	glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+		glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+		glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
 		
-		// Draw the quad
-		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		// Set up GL_TRIANGLES drawing mode instead of GL_TRIANGLE_STRIP
+		// This ensures correct vertex order for warping
+		GLushort indices[] = {0, 1, 2, 2, 1, 3};  // Define triangles by indices
 		
-		// Disable stencil test now that we're done with masked rendering
-		glDisable(GL_STENCIL_TEST);
+		// Generate index buffer if needed
+		GLuint indexBuffer = 0;
+		glGenBuffers(1, &indexBuffer);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_DYNAMIC_DRAW);
+		
+		// Draw using indexed triangles
+		glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
 		
 		// Clean up
-	glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
-	glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+		glDeleteBuffers(1, &indexBuffer);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+		
+		// Clean up
+		glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+		glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glUseProgram(0);
 		
