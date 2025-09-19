@@ -288,6 +288,17 @@ static char g_joystick_name[128];     // Name of the connected joystick
 static int g_selected_corner = 0;     // Currently selected corner (0-3)
 static struct timeval g_last_js_event_time = {0}; // For debouncing joystick events
 
+// Gamepad layout for ABXY (xbox vs nintendo)
+typedef enum { GP_LAYOUT_AUTO = 0, GP_LAYOUT_XBOX, GP_LAYOUT_NINTENDO } gp_layout_t;
+static gp_layout_t g_gamepad_layout = GP_LAYOUT_AUTO;
+
+// Track Start+Select hold for safe quit
+static bool g_js_start_down = false;
+static bool g_js_select_down = false;
+static struct timeval g_js_start_time = {0};
+static struct timeval g_js_select_time = {0};
+static bool g_js_quit_fired = false;
+
 // 8BitDo controller button mappings (may vary by model/mode)
 #define JS_BUTTON_A        0
 #define JS_BUTTON_B        1
@@ -301,6 +312,13 @@ static struct timeval g_last_js_event_time = {0}; // For debouncing joystick eve
 #define JS_BUTTON_L3       9
 #define JS_BUTTON_R3       10
 
+// Some controllers (incl. certain 8BitDo modes) report D-Pad as buttons.
+// These indices are common but not universal; we handle them opportunistically.
+#define JS_BUTTON_DPAD_UP     11
+#define JS_BUTTON_DPAD_DOWN   12
+#define JS_BUTTON_DPAD_LEFT   13
+#define JS_BUTTON_DPAD_RIGHT  14
+
 // 8BitDo controller axis mappings
 #define JS_AXIS_LEFT_X     0
 #define JS_AXIS_LEFT_Y     1
@@ -310,6 +328,139 @@ static struct timeval g_last_js_event_time = {0}; // For debouncing joystick eve
 #define JS_AXIS_R2         5
 #define JS_AXIS_DPAD_X     6
 #define JS_AXIS_DPAD_Y     7
+
+// Optional explicit ABXY mapping via env (decl after macros to use their defaults)
+static int g_btn_code_X = JS_BUTTON_X;
+static int g_btn_code_A = JS_BUTTON_A;
+static int g_btn_code_B = JS_BUTTON_B;
+static int g_btn_code_Y = JS_BUTTON_Y;
+// Corner indices: 0=TL,1=TR,2=BL,3=BR
+static int g_corner_for_X = 0; // X->TL
+static int g_corner_for_A = 1; // A->TR
+static int g_corner_for_B = 3; // B->BR
+static int g_corner_for_Y = 2; // Y->BL
+static bool g_use_label_mapping = false;
+static int g_x_cycle_enabled = 1; // default: X cycles corners TL->TR->BR->BL
+static int g_cycle_button_code = JS_BUTTON_X; // which button number cycles corners
+static int g_help_button_code = JS_BUTTON_B;  // which button number toggles help
+static int g_help_toggle_request = 0;         // raised by joystick, handled in main loop
+
+static int parse_corner_token(const char *t) {
+	if (!t) return -1;
+	if (!strcasecmp(t, "TL")) return 0;
+	if (!strcasecmp(t, "TR")) return 1;
+	if (!strcasecmp(t, "BL")) return 2;
+	if (!strcasecmp(t, "BR")) return 3;
+	return -1;
+}
+
+static void parse_btn_code_env(void) {
+	const char *s = getenv("PICKLE_BTN_CODE");
+	if (!s || !*s) return;
+	char buf[128]; strncpy(buf, s, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
+	for (char *p = buf; *p; ++p) if (*p == ';') *p = ',';
+	char *saveptr = NULL; char *tok = strtok_r(buf, ", ", &saveptr);
+	while (tok) {
+		char key[8]={0}; int val=-1;
+		if (sscanf(tok, "%7[^=]=%d", key, &val) == 2) {
+			if (!strcasecmp(key, "X")) g_btn_code_X = val;
+			else if (!strcasecmp(key, "A")) g_btn_code_A = val;
+			else if (!strcasecmp(key, "B")) g_btn_code_B = val;
+			else if (!strcasecmp(key, "Y")) g_btn_code_Y = val;
+		}
+		tok = strtok_r(NULL, ", ", &saveptr);
+	}
+}
+
+static void parse_corner_map_env(void) {
+	const char *s = getenv("PICKLE_CORNER_MAP");
+	if (!s || !*s) return;
+	char buf[128]; strncpy(buf, s, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
+	for (char *p = buf; *p; ++p) if (*p == ';') *p = ',';
+	char *saveptr = NULL; char *tok = strtok_r(buf, ", ", &saveptr);
+	while (tok) {
+		char key[8]={0}, val[8]={0};
+		if (sscanf(tok, "%7[^=]=%7s", key, val) == 2) {
+			int corner = parse_corner_token(val);
+			if (corner >= 0) {
+				if (!strcasecmp(key, "X")) g_corner_for_X = corner;
+				else if (!strcasecmp(key, "A")) g_corner_for_A = corner;
+				else if (!strcasecmp(key, "B")) g_corner_for_B = corner;
+				else if (!strcasecmp(key, "Y")) g_corner_for_Y = corner;
+			}
+		}
+		tok = strtok_r(NULL, ", ", &saveptr);
+	}
+}
+
+static void setup_label_mapping(void) {
+	parse_btn_code_env();
+	parse_corner_map_env();
+	const char *use = getenv("PICKLE_USE_LABEL_MAPPING");
+	if (use && *use && atoi(use) != 0) g_use_label_mapping = true;
+	const char *xc = getenv("PICKLE_X_CYCLE");
+	if (xc && *xc) g_x_cycle_enabled = (atoi(xc) != 0);
+	if (g_use_label_mapping) {
+		LOG_INFO("Using explicit ABXY mapping: codes X=%d A=%d B=%d Y=%d; corners X=%d A=%d B=%d Y=%d",
+				 g_btn_code_X, g_btn_code_A, g_btn_code_B, g_btn_code_Y,
+				 g_corner_for_X, g_corner_for_A, g_corner_for_B, g_corner_for_Y);
+	}
+	LOG_INFO("X button cycling: %s (PICKLE_X_CYCLE=%s)", g_x_cycle_enabled ? "enabled" : "disabled", xc && *xc ? xc : "(default)");
+}
+
+static int label_to_code_default(const char *label) {
+	if (!label) return -1;
+	if (!strcasecmp(label, "X")) return JS_BUTTON_X;
+	if (!strcasecmp(label, "A")) return JS_BUTTON_A;
+	if (!strcasecmp(label, "B")) return JS_BUTTON_B;
+	if (!strcasecmp(label, "Y")) return JS_BUTTON_Y;
+	return -1;
+}
+
+static void configure_special_buttons(void) {
+	// Defaults based on layout or explicit label mapping
+	if (g_use_label_mapping) {
+		g_cycle_button_code = g_btn_code_X;
+		g_help_button_code = g_btn_code_B;
+	} else {
+		if (g_gamepad_layout == GP_LAYOUT_NINTENDO) {
+			// Typical Nintendo-style mapping: B=0, A=1, Y=2, X=3
+			g_cycle_button_code = 3; // physical X
+			g_help_button_code = 0;  // physical B
+		} else {
+			// Xbox-style default mapping
+			g_cycle_button_code = JS_BUTTON_X;
+			g_help_button_code = JS_BUTTON_B;
+		}
+	}
+
+	// Env overrides: numeric or label
+	const char *cb = getenv("PICKLE_CYCLE_BUTTON");
+	if (cb && *cb) {
+		char *end=NULL; long v = strtol(cb, &end, 10);
+		if (end && *end=='\0') g_cycle_button_code = (int)v; else {
+			int code = g_use_label_mapping ?
+				(!strcasecmp(cb,"X")?g_btn_code_X:!strcasecmp(cb,"A")?g_btn_code_A:!strcasecmp(cb,"B")?g_btn_code_B:!strcasecmp(cb,"Y")?g_btn_code_Y:-1)
+				: label_to_code_default(cb);
+			if (code >= 0) g_cycle_button_code = code;
+		}
+	}
+    
+	const char *hb = getenv("PICKLE_HELP_BUTTON");
+	if (hb && *hb) {
+		char *end=NULL; long v = strtol(hb, &end, 10);
+		if (end && *end=='\0') g_help_button_code = (int)v; else {
+			int code = g_use_label_mapping ?
+				(!strcasecmp(hb,"X")?g_btn_code_X:!strcasecmp(hb,"A")?g_btn_code_A:!strcasecmp(hb,"B")?g_btn_code_B:!strcasecmp(hb,"Y")?g_btn_code_Y:-1)
+				: label_to_code_default(hb);
+			if (code >= 0) g_help_button_code = code;
+		}
+	}
+
+	LOG_INFO("Cycle button code=%d%s, Help button code=%d%s",
+			 g_cycle_button_code, (cb&&*cb)?" (env)":"",
+			 g_help_button_code, (hb&&*hb)?" (env)":"");
+}
 
 // Forward declarations
 static void cleanup_keystone_shader(void);
@@ -722,6 +873,16 @@ static double g_avg_flip_time = 0.0;
 static int g_flip_count = 0;
 static int g_pending_flips = 0;  // Track number of page flips in flight
 
+// Saved OSD settings for help overlay placement
+static struct {
+	int saved;
+	int64_t font_size;
+	int64_t margin_x;
+	int64_t margin_y;
+	char align_x[8];
+	char align_y[8];
+} g_osd_saved = {0};
+
 static double tv_diff(const struct timeval *a, const struct timeval *b) {
 	return (double)(a->tv_sec - b->tv_sec) + (double)(a->tv_usec - b->tv_usec)/1e6;
 }
@@ -776,15 +937,52 @@ static void show_help_overlay(mpv_handle *mpv) {
 		"Pickle controls:\n"
 		"  q: quit    h: help overlay\n"
 		"  k: toggle keystone    1-4: select corner\n"
-		"  arrows / WASD: move point    +/-: step    r: reset\n"
+		"  arrows / WASD: move point\n"
+		"  +/-: step    r: reset\n"
 		"  b: toggle border    [ / ]: border width\n"
 	"  c: toggle corner markers\n"
 		"  o: flip X (mirror)  p: flip Y (invert)\n"
-		"  m: mesh mode (experimental)    S: save keystone\n"
+		"  m: mesh mode (experimental)\n"
+		"  S: save keystone\n"
 		"\nGamepad:\n"
-		"  START: toggle keystone    A/B/X/Y: select corner 1-4\n"
+		"  START: toggle keystone\n"
+		"  Cycle button (default X): corners TL -> TR -> BR -> BL\n"
+		"  Help button (default B): toggle this help\n"
 		"  D-Pad/Left stick: move point\n"
-		"  L1/R1: step -/+    SELECT: reset    HOME: toggle border\n";
+		"  L1/R1: step -/+    SELECT: reset    Y/Home(Guide): toggle border\n"
+		"  START+SELECT (hold 2s): quit\n";
+	// Reduce font size and move OSD to top-left with small margins so it fits better
+	if (!g_osd_saved.saved) {
+		int64_t v=0; char *s=NULL;
+		if (mpv_get_property(mpv, "osd-font-size", MPV_FORMAT_INT64, &v) >= 0) g_osd_saved.font_size = v; else g_osd_saved.font_size = 36;
+		if (mpv_get_property(mpv, "osd-margin-x", MPV_FORMAT_INT64, &v) >= 0) g_osd_saved.margin_x = v; else g_osd_saved.margin_x = 10;
+		if (mpv_get_property(mpv, "osd-margin-y", MPV_FORMAT_INT64, &v) >= 0) g_osd_saved.margin_y = v; else g_osd_saved.margin_y = 10;
+		if (mpv_get_property(mpv, "osd-align-x", MPV_FORMAT_STRING, &s) >= 0 && s) {
+			strncpy(g_osd_saved.align_x, s, sizeof(g_osd_saved.align_x)-1);
+			g_osd_saved.align_x[sizeof(g_osd_saved.align_x)-1]='\0';
+			mpv_free(s);
+		} else strcpy(g_osd_saved.align_x, "center");
+		s = NULL;
+		if (mpv_get_property(mpv, "osd-align-y", MPV_FORMAT_STRING, &s) >= 0 && s) {
+			strncpy(g_osd_saved.align_y, s, sizeof(g_osd_saved.align_y)-1);
+			g_osd_saved.align_y[sizeof(g_osd_saved.align_y)-1]='\0';
+			mpv_free(s);
+		} else strcpy(g_osd_saved.align_y, "center");
+		g_osd_saved.saved = 1;
+	}
+
+	int64_t small = 20;
+	int64_t mx = 12;
+	int64_t my = 12;
+	const char *ax = "left";
+	const char *ay = "top";
+	mpv_set_property(mpv, "osd-font-size", MPV_FORMAT_INT64, &small);
+	mpv_set_property(mpv, "osd-margin-x", MPV_FORMAT_INT64, &mx);
+	mpv_set_property(mpv, "osd-margin-y", MPV_FORMAT_INT64, &my);
+	// Use mpv_set_property_string for string properties to avoid char** misuse
+	mpv_set_property_string(mpv, "osd-align-x", ax);
+	mpv_set_property_string(mpv, "osd-align-y", ay);
+
 	const char *cmd[] = { "show-text", text, "600000", NULL }; // long duration; we'll clear on toggle
 	mpv_command(mpv, cmd);
 }
@@ -794,6 +992,15 @@ static void hide_help_overlay(mpv_handle *mpv) {
 	// Clear by showing empty text for 1ms
 	const char *cmd[] = { "show-text", "", "1", NULL };
 	mpv_command(mpv, cmd);
+	// Restore previous OSD settings if we saved them
+	if (g_osd_saved.saved) {
+		mpv_set_property(mpv, "osd-font-size", MPV_FORMAT_INT64, &g_osd_saved.font_size);
+		mpv_set_property(mpv, "osd-margin-x", MPV_FORMAT_INT64, &g_osd_saved.margin_x);
+		mpv_set_property(mpv, "osd-margin-y", MPV_FORMAT_INT64, &g_osd_saved.margin_y);
+		mpv_set_property_string(mpv, "osd-align-x", g_osd_saved.align_x);
+		mpv_set_property_string(mpv, "osd-align-y", g_osd_saved.align_y);
+		g_osd_saved.saved = 0;
+	}
 }
 
 // Helper for mpv option failure logging
@@ -2118,6 +2325,27 @@ static bool init_joystick(void) {
     
     // Initialize the first corner as selected
     g_selected_corner = 0;
+
+	// Determine gamepad layout
+	const char *layout_env = getenv("PICKLE_GAMEPAD_LAYOUT");
+	if (layout_env && *layout_env) {
+		if (!strcasecmp(layout_env, "xbox")) g_gamepad_layout = GP_LAYOUT_XBOX;
+		else if (!strcasecmp(layout_env, "nintendo")) g_gamepad_layout = GP_LAYOUT_NINTENDO;
+		else g_gamepad_layout = GP_LAYOUT_AUTO;
+	} else {
+		// Heuristic: prefer Nintendo layout for 8BitDo Zero or Nintendo devices
+		if (strstr(g_joystick_name, "Nintendo") || strstr(g_joystick_name, "Zero")) {
+			g_gamepad_layout = GP_LAYOUT_NINTENDO;
+		} else {
+			g_gamepad_layout = GP_LAYOUT_XBOX;
+		}
+	}
+	LOG_INFO("Gamepad layout: %s", (g_gamepad_layout==GP_LAYOUT_NINTENDO?"nintendo":(g_gamepad_layout==GP_LAYOUT_XBOX?"xbox":"auto")));
+    
+	// Apply optional explicit ABXY mapping from environment (takes precedence for ABXY selection)
+	setup_label_mapping();
+	// Configure which buttons perform cycle and help based on layout/env
+	configure_special_buttons();
     
     return true;
 }
@@ -2161,9 +2389,69 @@ static bool handle_joystick_event(struct js_event *event) {
         return false;
     }
     
-    // Handle button events
-    if (event->type == JS_EVENT_BUTTON && event->value == 1) {  // Button pressed
-        switch (event->number) {
+	// Handle button events
+	if (event->type == JS_EVENT_BUTTON) {
+		// Track Start/Select state for quit combo
+		if (event->number == JS_BUTTON_START) {
+			if (event->value == 1) { g_js_start_down = true; gettimeofday(&g_js_start_time, NULL); }
+			else if (event->value == 0) { g_js_start_down = false; }
+		} else if (event->number == JS_BUTTON_SELECT) {
+			if (event->value == 1) { g_js_select_down = true; gettimeofday(&g_js_select_time, NULL); }
+			else if (event->value == 0) { g_js_select_down = false; }
+		}
+
+		// If keystone enabled and cycle button is pressed, optionally cycle corners TL->TR->BR->BL
+		if (event->value == 1 && g_keystone.enabled && g_x_cycle_enabled && event->number == g_cycle_button_code) {
+			int order[4] = {0,1,2,3}; // TL,TR,BL,BR -> next
+			int cur = g_keystone.active_corner;
+			if (cur < 0) cur = g_selected_corner >= 0 ? g_selected_corner : 0;
+			int idx = 0;
+			for (int i=0;i<4;i++) if (order[i] == cur) { idx = i; break; }
+			int next = order[(idx+1)&3];
+			g_keystone.active_corner = next;
+			g_selected_corner = next;
+			static const char *names[4] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
+			LOG_INFO("Cycling to corner %d (%s) via button %d", next+1, names[next], event->number);
+			return true;
+		}
+
+		// Help button: toggle help overlay via main-loop request (safe access to player.mpv)
+		if (event->value == 1 && event->number == g_help_button_code) {
+			g_help_toggle_request = 1;
+			LOG_INFO("Help toggle requested via button %d", event->number);
+			return true;
+		}
+
+		// Y button toggles border (layout/env adapt)
+		if (event->value == 1) {
+			int y_code = g_use_label_mapping ? g_btn_code_Y : (g_gamepad_layout == GP_LAYOUT_NINTENDO ? 2 : JS_BUTTON_Y);
+			if (event->number == y_code) {
+				if (g_keystone.enabled) {
+					g_show_border = !g_show_border;
+					LOG_INFO("Border %s (via Y)", g_show_border ? "enabled" : "disabled");
+					return true;
+				}
+			}
+		}
+
+		// If using explicit label mapping from environment, handle ABXY selection first
+		if (event->value == 1 && g_keystone.enabled && g_use_label_mapping) {
+			int corner = -1;
+			if (event->number == g_btn_code_X) corner = g_corner_for_X;
+			else if (event->number == g_btn_code_A) corner = g_corner_for_A;
+			else if (event->number == g_btn_code_B) corner = g_corner_for_B;
+			else if (event->number == g_btn_code_Y) corner = g_corner_for_Y;
+			if (corner >= 0 && corner <= 3) {
+				g_keystone.active_corner = corner;
+				g_selected_corner = corner;
+				static const char *names[4] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
+				LOG_INFO("Adjusting corner %d (%s) [env mapping]", g_keystone.active_corner + 1, names[corner]);
+				return true;
+			}
+		}
+
+		if (event->value == 1) {  // Button pressed
+		switch (event->number) {
             case JS_BUTTON_START:  // Toggle keystone mode
                 if (!g_keystone.enabled) {
                     g_keystone.enabled = true;
@@ -2177,41 +2465,45 @@ static bool handle_joystick_event(struct js_event *event) {
                 }
                 return true;
                 
-            case JS_BUTTON_A:  // Select corner 1
-                if (g_keystone.enabled) {
-                    g_keystone.active_corner = 0;  // Top-left
-                    g_selected_corner = 0;
-                    LOG_INFO("Adjusting corner %d (Top-left)", g_keystone.active_corner + 1);
-                    return true;
-                }
-                break;
-                
-            case JS_BUTTON_B:  // Select corner 2
-                if (g_keystone.enabled) {
-                    g_keystone.active_corner = 1;  // Top-right
-                    g_selected_corner = 1;
-                    LOG_INFO("Adjusting corner %d (Top-right)", g_keystone.active_corner + 1);
-                    return true;
-                }
-                break;
-                
-            case JS_BUTTON_X:  // Select corner 3
-                if (g_keystone.enabled) {
-                    g_keystone.active_corner = 2;  // Bottom-left
-                    g_selected_corner = 2;
-                    LOG_INFO("Adjusting corner %d (Bottom-left)", g_keystone.active_corner + 1);
-                    return true;
-                }
-                break;
-                
-            case JS_BUTTON_Y:  // Select corner 4
-                if (g_keystone.enabled) {
-                    g_keystone.active_corner = 3;  // Bottom-right
-                    g_selected_corner = 3;
-                    LOG_INFO("Adjusting corner %d (Bottom-right)", g_keystone.active_corner + 1);
-                    return true;
-                }
-                break;
+			case JS_BUTTON_X:  // Select top-left (Nintendo layout puts X at top)
+				if (g_keystone.enabled) {
+					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 0 : 2; // Xbox X is left -> BL
+					g_keystone.active_corner = corner;
+					g_selected_corner = corner;
+					LOG_INFO("Adjusting corner %d (Top-left)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
+
+			case JS_BUTTON_A:  // Select top-right (Nintendo A is right)
+				if (g_keystone.enabled) {
+					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 1 : 0; // Xbox A is bottom -> TL
+					g_keystone.active_corner = corner;
+					g_selected_corner = corner;
+					LOG_INFO("Adjusting corner %d (Top-right)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
+
+			case JS_BUTTON_B:  // Select bottom-right (Nintendo B is bottom)
+				if (g_keystone.enabled) {
+					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 3 : 1; // Xbox B is right -> TR
+					g_keystone.active_corner = corner;
+					g_selected_corner = corner;
+					LOG_INFO("Adjusting corner %d (Bottom-right)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
+
+			case JS_BUTTON_Y:  // Select bottom-left (Nintendo Y is left)
+				if (g_keystone.enabled) {
+					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 2 : 3; // Xbox Y is top -> BR
+					g_keystone.active_corner = corner;
+					g_selected_corner = corner;
+					LOG_INFO("Adjusting corner %d (Bottom-left)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
                 
             case JS_BUTTON_SELECT:  // Reset keystone to default
                 if (g_keystone.enabled) {
@@ -2258,7 +2550,47 @@ static bool handle_joystick_event(struct js_event *event) {
                     return true;
                 }
                 break;
-        }
+
+			// D-Pad as buttons: move selected corner. Useful for 8BitDo Zero 2.
+			case JS_BUTTON_DPAD_LEFT:
+				if (g_keystone.enabled) {
+					float step = (float)g_keystone_adjust_step / 1000.0f;
+					keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
+					LOG_INFO("Moving corner %d left (dpad button)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
+			case JS_BUTTON_DPAD_RIGHT:
+				if (g_keystone.enabled) {
+					float step = (float)g_keystone_adjust_step / 1000.0f;
+					keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
+					LOG_INFO("Moving corner %d right (dpad button)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
+			case JS_BUTTON_DPAD_UP:
+				if (g_keystone.enabled) {
+					float step = (float)g_keystone_adjust_step / 1000.0f;
+					keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
+					LOG_INFO("Moving corner %d up (dpad button)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
+			case JS_BUTTON_DPAD_DOWN:
+				if (g_keystone.enabled) {
+					float step = (float)g_keystone_adjust_step / 1000.0f;
+					keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
+					LOG_INFO("Moving corner %d down (dpad button)", g_keystone.active_corner + 1);
+					return true;
+				}
+				break;
+
+			default:
+				if (g_debug) {
+					LOG_DEBUG("Joystick button %u pressed (unmapped)", (unsigned)event->number);
+				}
+				break;
+		}}
     }
     
     // Handle axis events (D-pad and analog sticks)
@@ -2821,9 +3153,12 @@ int main(int argc, char **argv) {
 	init_joystick();
 	if (g_joystick_enabled) {
 		LOG_INFO("8BitDo controller detected and enabled for keystone adjustment");
-		LOG_INFO("Controller mappings: START=Toggle keystone mode, A/B/X/Y=Select corners 1-4");
-		LOG_INFO("D-pad/Left stick=Move corners, L1/R1=Decrease/Increase step size");
-		LOG_INFO("SELECT=Reset keystone, HOME=Toggle border");
+		LOG_INFO("Controller mappings: START=Toggle keystone mode");
+		LOG_INFO("Cycle button (default X) = Corners TL->TR->BR->BL");
+		LOG_INFO("Help button (default B) = Toggle help overlay");
+	LOG_INFO("D-pad/Left stick=Move corners, L1/R1=Decrease/Increase step size");
+	LOG_INFO("SELECT=Reset keystone, HOME(Guide)=Toggle border");
+	LOG_INFO("START+SELECT (hold 2s)=Quit");
 	}
 	
 	while (!g_stop) {
@@ -2835,6 +3170,38 @@ int main(int argc, char **argv) {
 				uint64_t flags = mpv_render_context_update(player.rctx);
 				g_mpv_update_flags |= flags;
 			}
+		}
+		// Check controller quit combo (START+SELECT 2s)
+		if (g_joystick_enabled) {
+			// Polling cadence: on every loop iteration; guarded by state flags
+			struct timeval now; gettimeofday(&now, NULL);
+			(void)now; // currently unused beyond gettimeofday side effect
+			// Reuse debounce window — quit independent of debounce thresholds
+			if (g_js_start_down && g_js_select_down) {
+				long ms_start = (now.tv_sec - g_js_start_time.tv_sec) * 1000 + (now.tv_usec - g_js_start_time.tv_usec) / 1000;
+				long ms_select = (now.tv_sec - g_js_select_time.tv_sec) * 1000 + (now.tv_usec - g_js_select_time.tv_usec) / 1000;
+				long held_ms = (ms_start < ms_select) ? ms_start : ms_select;
+				if (!g_js_quit_fired && held_ms >= 2000) {
+					LOG_INFO("Quit via controller: START+SELECT held for %ld ms", held_ms);
+					g_stop = 1;
+					g_js_quit_fired = true;
+				}
+			} else {
+				g_js_quit_fired = false;
+			}
+		}
+
+		// Process help toggle request from controller
+		if (g_help_toggle_request) {
+			g_help_toggle_request = 0;
+			if (!g_help_visible) {
+				show_help_overlay(player.mpv);
+				g_help_visible = 1;
+			} else {
+				hide_help_overlay(player.mpv);
+				g_help_visible = 0;
+			}
+			g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 		}
 		// Prepare pollfds: DRM fd (for page flip events) + mpv wakeup pipe + stdin for keyboard + joystick
 		struct pollfd pfds[4]; int n=0;
