@@ -197,6 +197,9 @@ struct egl_ctx {
 	EGLSurface surf;
 };
 
+// Forward declaration for vsync toggle used before its definition
+static int g_vsync_enabled;
+
 // --- Preallocated FB ring (optional) ---
 struct fb_ring_entry { struct gbm_bo *bo; uint32_t fb_id; };
 struct fb_ring {
@@ -255,15 +258,27 @@ static keystone_t g_keystone = {
 static int g_keystone_adjust_step = 1; // Step size for keystone adjustments (in 1/1000 units)
 static bool g_show_border = false; // Whether to show border around the video
 static int g_border_width = 5; // Border width in pixels
-static bool g_show_background = false; // Whether to show light background for visibility
+static bool g_show_background = false; // Deprecated: background is always black now
 static GLuint g_keystone_shader_program = 0; // Shader program for keystone correction
 static GLuint g_keystone_vertex_shader = 0;
 static GLuint g_keystone_fragment_shader = 0;
 static GLuint g_keystone_vertex_buffer = 0;
 static GLuint g_keystone_texcoord_buffer = 0;
+static GLuint g_keystone_index_buffer = 0;   // Cached index buffer for quad
+static GLuint g_keystone_fbo = 0;            // Cached FBO for mpv render target
+static GLuint g_keystone_fbo_texture = 0;    // Texture attached to FBO
+static int g_keystone_fbo_w = 0;             // FBO width
+static int g_keystone_fbo_h = 0;             // FBO height
 static GLint g_keystone_a_position_loc = -1;
 static GLint g_keystone_a_texcoord_loc = -1;
 static GLint g_keystone_u_texture_loc = -1;
+
+// Simple solid-color shader for drawing outlines/borders around keystone quad
+static GLuint g_border_shader_program = 0;
+static GLuint g_border_vertex_shader = 0;
+static GLuint g_border_fragment_shader = 0;
+static GLint  g_border_a_position_loc = -1;
+static GLint  g_border_u_color_loc = -1;
 
 // Joystick/gamepad support
 static int g_joystick_fd = -1;        // File descriptor for joystick
@@ -308,6 +323,7 @@ static bool ensure_drm_master(int fd) {
 		return true;
 	}
 	LOG_DRM("drmSetMaster failed (%s) – another process may own the display. Modeset might fail.", strerror(errno));
+	g_have_master = 0;
 	return false;
 }
 
@@ -450,6 +466,11 @@ static void deinit_drm(kms_ctx_t *d) {
 	}
 	
 	if (d->fd >= 0) {
+		// Drop DRM master if we had it
+		if (g_have_master) {
+			drmDropMaster(d->fd);
+			g_have_master = 0;
+		}
 		close(d->fd);
 		d->fd = -1;
 	}
@@ -579,6 +600,9 @@ static bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
 		RETURN_ERROR_EGL("eglMakeCurrent failed");
 	}
 	
+	// Set swap interval to control vsync behavior
+	eglSwapInterval(e->dpy, g_vsync_enabled ? 1 : 0);
+
 	// Log GL info
 	const char *gl_vendor = (const char*)glGetString(GL_VENDOR);
 	const char *gl_renderer = (const char*)glGetString(GL_RENDERER);
@@ -603,6 +627,10 @@ static void deinit_gbm_egl(egl_ctx_t *e) {
 	if (g_keystone_shader_program) {
 		cleanup_keystone_shader();
 	}
+	// Ensure any cached FBO/texture are cleaned even if shader program wasn't created
+	if (g_keystone_fbo) { glDeleteFramebuffers(1, &g_keystone_fbo); g_keystone_fbo = 0; }
+	if (g_keystone_fbo_texture) { glDeleteTextures(1, &g_keystone_fbo_texture); g_keystone_fbo_texture = 0; }
+	g_keystone_fbo_w = g_keystone_fbo_h = 0;
 	
 	if (e->dpy != EGL_NO_DISPLAY) {
 		// Release current context
@@ -797,9 +825,7 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	r = mpv_set_option_string(p->mpv, "audio-buffer", "0.2");  // 200ms audio buffer
 	log_opt_result("audio-buffer", r);
 	
-	// Set video orientation to fix upside-down video
-	r = mpv_set_option_string(p->mpv, "video-rotate", "180");
-	log_opt_result("video-rotate=180", r);
+	// Prefer using MPV_RENDER_PARAM_FLIP_Y during rendering instead of global rotation
 
 	const char *ctx_override = getenv("PICKLE_GPU_CONTEXT");
 	int forced_headless = getenv("PICKLE_FORCE_HEADLESS") ? 1 : 0;
@@ -1203,12 +1229,8 @@ static void keystone_init(void) {
         LOG_INFO("Video border enabled with width %d", g_border_width);
     }
     
-    // Check for environment variable to enable light background
-    const char* bg_env = getenv("PICKLE_SHOW_BACKGROUND");
-    if (bg_env && *bg_env) {
-        g_show_background = true;
-        LOG_INFO("Light background enabled for better edge visibility");
-    }
+	// Background is always black; ignore PICKLE_SHOW_BACKGROUND
+	g_show_background = false;
     
     // Initialize shader program if keystone is enabled
     if (g_keystone.enabled && g_keystone_shader_program == 0) {
@@ -1340,6 +1362,47 @@ static const char* g_fragment_shader_src =
     "void main() {\n"
     "    gl_FragColor = texture2D(u_texture, v_texCoord);\n"
     "}\n";
+
+// Border shader: positions only, uniform color
+static const char* g_border_vs_src =
+	"attribute vec2 a_position;\n"
+	"void main(){\n"
+	"  gl_Position = vec4(a_position, 0.0, 1.0);\n"
+	"}\n";
+
+static const char* g_border_fs_src =
+	"precision mediump float;\n"
+	"uniform vec4 u_color;\n"
+	"void main(){\n"
+	"  gl_FragColor = u_color;\n"
+	"}\n";
+
+// Forward declaration for shader compiler utility
+static GLuint compile_shader(GLenum shader_type, const char* source);
+
+static bool init_border_shader() {
+	g_border_vertex_shader = compile_shader(GL_VERTEX_SHADER, g_border_vs_src);
+	if (!g_border_vertex_shader) return false;
+	g_border_fragment_shader = compile_shader(GL_FRAGMENT_SHADER, g_border_fs_src);
+	if (!g_border_fragment_shader) { glDeleteShader(g_border_vertex_shader); g_border_vertex_shader = 0; return false; }
+	g_border_shader_program = glCreateProgram();
+	if (!g_border_shader_program) { glDeleteShader(g_border_vertex_shader); glDeleteShader(g_border_fragment_shader); return false; }
+	glAttachShader(g_border_shader_program, g_border_vertex_shader);
+	glAttachShader(g_border_shader_program, g_border_fragment_shader);
+	glLinkProgram(g_border_shader_program);
+	GLint linked = 0; glGetProgramiv(g_border_shader_program, GL_LINK_STATUS, &linked);
+	if (!linked) {
+		GLint info_len=0; glGetProgramiv(g_border_shader_program, GL_INFO_LOG_LENGTH, &info_len);
+		if (info_len>1) { char* buf = malloc((size_t)info_len); glGetProgramInfoLog(g_border_shader_program, info_len, NULL, buf); LOG_ERROR("Border shader link: %s", buf); free(buf);}        
+		glDeleteProgram(g_border_shader_program); g_border_shader_program=0;
+		glDeleteShader(g_border_vertex_shader); g_border_vertex_shader=0;
+		glDeleteShader(g_border_fragment_shader); g_border_fragment_shader=0;
+		return false;
+	}
+	g_border_a_position_loc = glGetAttribLocation(g_border_shader_program, "a_position");
+	g_border_u_color_loc = glGetUniformLocation(g_border_shader_program, "u_color");
+	return true;
+}
 
 // Compile shader of the specified type
 static GLuint compile_shader(GLenum shader_type, const char* source) {
@@ -1478,6 +1541,28 @@ static void cleanup_keystone_shader(void) {
         g_keystone_fragment_shader = 0;
     }
     
+	// Cached index buffer
+	if (g_keystone_index_buffer) {
+		glDeleteBuffers(1, &g_keystone_index_buffer);
+		g_keystone_index_buffer = 0;
+	}
+
+	// Cached FBO/texture
+	if (g_keystone_fbo) {
+		glDeleteFramebuffers(1, &g_keystone_fbo);
+		g_keystone_fbo = 0;
+	}
+	if (g_keystone_fbo_texture) {
+		glDeleteTextures(1, &g_keystone_fbo_texture);
+		g_keystone_fbo_texture = 0;
+	}
+	g_keystone_fbo_w = g_keystone_fbo_h = 0;
+
+	// Border shader
+	if (g_border_shader_program) { glDeleteProgram(g_border_shader_program); g_border_shader_program=0; }
+	if (g_border_vertex_shader) { glDeleteShader(g_border_vertex_shader); g_border_vertex_shader=0; }
+	if (g_border_fragment_shader) { glDeleteShader(g_border_fragment_shader); g_border_fragment_shader=0; }
+
     // Cleanup mesh resources
     cleanup_mesh_resources();
 }
@@ -1503,10 +1588,10 @@ static struct {
 } g_key_seq_state = {false, false, 0};
 
 static bool keystone_handle_key(char key) {
-    // Handle multi-character escape sequences for arrow keys
-    LOG_INFO("keystone_handle_key called with key: %d (0x%02x) '%c', escape_seq: %d, bracket_seq: %d", 
-             (int)key, (int)key, (key >= 32 && key < 127) ? key : '?', 
-             g_key_seq_state.in_escape_seq, g_key_seq_state.in_bracket_seq);
+	// Handle multi-character escape sequences for arrow keys
+	LOG_DEBUG("keystone_handle_key key=%d(0x%02x) '%c' esc=%d br=%d", 
+			 (int)key, (int)key, (key >= 32 && key < 127) ? key : '?', 
+			 g_key_seq_state.in_escape_seq, g_key_seq_state.in_bracket_seq);
              
     if (g_key_seq_state.in_escape_seq) {
         if (g_key_seq_state.in_bracket_seq) {
@@ -1516,7 +1601,7 @@ static bool keystone_handle_key(char key) {
             
             // Only process arrow keys if keystone mode is enabled
             if (g_keystone.enabled) {
-                LOG_INFO("Processing arrow key: %d (0x%02x) '%c'", (int)key, (int)key, key);
+				LOG_DEBUG("Processing arrow key: %d (0x%02x) '%c'", (int)key, (int)key, key);
                 float step = (float)g_keystone_adjust_step / 1000.0f; // Convert to 0-1 range
                 
                 switch (key) {
@@ -1528,7 +1613,7 @@ static bool keystone_handle_key(char key) {
                         } else {
                             keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
                         }
-                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+						LOG_DEBUG("Point adjusted (UP)");
                         return true;
                         
                     case ARROW_DOWN:  // Down arrow
@@ -1539,7 +1624,7 @@ static bool keystone_handle_key(char key) {
                         } else {
                             keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
                         }
-                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+						LOG_DEBUG("Point adjusted (DOWN)");
                         return true;
                         
                     case ARROW_LEFT:  // Left arrow
@@ -1550,7 +1635,7 @@ static bool keystone_handle_key(char key) {
                         } else {
                             keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
                         }
-                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+						LOG_DEBUG("Point adjusted (LEFT)");
                         return true;
                         
                     case ARROW_RIGHT: // Right arrow
@@ -1561,7 +1646,7 @@ static bool keystone_handle_key(char key) {
                         } else {
                             keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
                         }
-                        fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+						LOG_DEBUG("Point adjusted (RIGHT)");
                         return true;
                 }
             }
@@ -1604,15 +1689,14 @@ static bool keystone_handle_key(char key) {
         case 'k': // Toggle keystone mode
             g_keystone.enabled = false;
             g_keystone.active_corner = -1;
-            LOG_INFO("Keystone correction disabled");
+			LOG_INFO("Keystone correction disabled");
             return true;
             
         case '1': case '2': case '3': case '4': // Select corner
             g_keystone.active_corner = key - '1';
             g_keystone.active_mesh_point[0] = -1; // Deactivate mesh point
             g_keystone.active_mesh_point[1] = -1;
-            LOG_INFO("Adjusting corner %d", g_keystone.active_corner + 1);
-            fprintf(stderr, "\rSelected corner %d (Press arrow keys or w/a/s/d to move)   ", g_keystone.active_corner + 1);
+			LOG_INFO("Adjusting corner %d", g_keystone.active_corner + 1);
             return true;
             
         case '!': case '@': case '#': case '$': // Pin/unpin corners (shift+1,2,3,4)
@@ -1625,8 +1709,8 @@ static bool keystone_handle_key(char key) {
                 
                 if (corner >= 0) {
                     keystone_toggle_pin(corner);
-                    fprintf(stderr, "\rCorner %d pin %s   ", corner + 1, 
-                            g_keystone.perspective_pins[corner] ? "enabled" : "disabled");
+			LOG_INFO("Corner %d pin %s", corner + 1, 
+				g_keystone.perspective_pins[corner] ? "enabled" : "disabled");
                     return true;
                 }
             }
@@ -1659,12 +1743,12 @@ static bool keystone_handle_key(char key) {
                 // Select first mesh point when enabling
                 g_keystone.active_mesh_point[0] = 0;
                 g_keystone.active_mesh_point[1] = 0;
-                fprintf(stderr, "\rMesh warping enabled, selected point [0,0]. Use 'q/e' to navigate mesh points.");
+				LOG_INFO("Mesh warping enabled, selected point [0,0]");
             } else {
                 // Deselect mesh point when disabling
                 g_keystone.active_mesh_point[0] = -1;
                 g_keystone.active_mesh_point[1] = -1;
-                fprintf(stderr, "\rMesh warping disabled, using corner-based keystone correction.");
+				LOG_INFO("Mesh warping disabled, using corner-based keystone");
             }
             return true;
             
@@ -1697,8 +1781,7 @@ static bool keystone_handle_key(char key) {
                 g_keystone.active_mesh_point[0] = 0;
                 g_keystone.active_mesh_point[1] = 0;
                 
-                LOG_INFO("Mesh size increased to %dx%d", new_size, new_size);
-                fprintf(stderr, "\rMesh size increased to %dx%d", new_size, new_size);
+				LOG_INFO("Mesh size increased to %dx%d", new_size, new_size);
                 return true;
             }
             break;
@@ -1732,8 +1815,7 @@ static bool keystone_handle_key(char key) {
                 g_keystone.active_mesh_point[0] = 0;
                 g_keystone.active_mesh_point[1] = 0;
                 
-                LOG_INFO("Mesh size decreased to %dx%d", new_size, new_size);
-                fprintf(stderr, "\rMesh size decreased to %dx%d", new_size, new_size);
+				LOG_INFO("Mesh size decreased to %dx%d", new_size, new_size);
                 return true;
             }
             break;
@@ -1748,8 +1830,8 @@ static bool keystone_handle_key(char key) {
                         g_keystone.active_mesh_point[0] = g_keystone.mesh_size - 1;
                     }
                 }
-                fprintf(stderr, "\rSelected mesh point [%d,%d]", 
-                        g_keystone.active_mesh_point[0], g_keystone.active_mesh_point[1]);
+		LOG_INFO("Selected mesh point [%d,%d]", 
+			g_keystone.active_mesh_point[0], g_keystone.active_mesh_point[1]);
                 return true;
             }
             break;
@@ -1764,8 +1846,8 @@ static bool keystone_handle_key(char key) {
                         g_keystone.active_mesh_point[0] = 0;
                     }
                 }
-                fprintf(stderr, "\rSelected mesh point [%d,%d]", 
-                        g_keystone.active_mesh_point[0], g_keystone.active_mesh_point[1]);
+		LOG_INFO("Selected mesh point [%d,%d]", 
+			g_keystone.active_mesh_point[0], g_keystone.active_mesh_point[1]);
                 return true;
             }
             break;
@@ -1778,7 +1860,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
             }
-            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+			LOG_DEBUG("Point adjusted (W)");
             return true;
             
         case 's': // Move active point down
@@ -1789,7 +1871,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
             }
-            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+			LOG_DEBUG("Point adjusted (S)");
             return true;
             
         case 'a': // Move active point left
@@ -1800,7 +1882,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
             }
-            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+			LOG_DEBUG("Point adjusted (A)");
             return true;
             
         case 'd': // Move active point right
@@ -1811,7 +1893,7 @@ static bool keystone_handle_key(char key) {
             } else {
                 keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
             }
-            fprintf(stderr, "\rPoint adjusted. Use arrow keys or w/a/s/d to move.");
+			LOG_DEBUG("Point adjusted (D)");
             return true;
             
         case 'r': // Reset to default
@@ -1852,8 +1934,7 @@ static bool keystone_handle_key(char key) {
                 // Update the transformation matrix
                 keystone_update_matrix();
                 
-                LOG_INFO("Reset to default positions");
-                fprintf(stderr, "\rReset to default positions");
+				LOG_INFO("Reset to default positions");
                 return true;
             }
             
@@ -1889,10 +1970,9 @@ static bool keystone_handle_key(char key) {
             }
             return true;
             
-        case 'g': // Toggle background
-            g_show_background = !g_show_background;
-            LOG_INFO("Background %s", g_show_background ? "enabled" : "disabled");
-            return true;
+		// 'g' background toggle removed; background is always black
+		case 'g':
+			return false;
             
         case 'S': // Save keystone configuration to local file
             if (keystone_save_config("./keystone.conf")) {
@@ -2186,58 +2266,71 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			g_keystone.enabled = false;
 		}
 	}
-	
-	// Set background color based on settings
-	if (g_show_background) {
-		// Light gray background for better visibility of dark content edges
-		glClearColor(0.85f, 0.85f, 0.85f, 1.0f);
-	} else {
-		// Standard black background
-		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	// Initialize border shader lazily if needed for border rendering
+	if (g_show_border && g_border_shader_program == 0) {
+		if (!init_border_shader()) {
+			LOG_WARN("Failed to initialize border shader; border will be disabled");
+			g_show_border = false;
+		}
 	}
+	
+	// Background is always black
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 	
-	// Create an FBO for rendering the mpv frame
-	GLuint fbo_texture = 0;
-	GLuint fbo = 0;
-	
+	// Ensure reusable FBO exists when keystone is enabled, sized to current mode
 	if (g_keystone.enabled) {
-		// Create a texture to render mpv output to
-		glGenTextures(1, &fbo_texture);
-		glBindTexture(GL_TEXTURE_2D, fbo_texture);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, d->mode.hdisplay, d->mode.vdisplay, 
-					0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-		
-		// Create FBO
-		glGenFramebuffers(1, &fbo);
-		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo_texture, 0);
-		
-		GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-		if (status != GL_FRAMEBUFFER_COMPLETE) {
-			LOG_ERROR("FBO setup failed, status: %d", status);
-			glBindFramebuffer(GL_FRAMEBUFFER, 0);
-			glDeleteFramebuffers(1, &fbo);
-			glDeleteTextures(1, &fbo_texture);
-			fbo = 0;
-			fbo_texture = 0;
-			// Fall back to non-keystone rendering
+		int want_w = (int)d->mode.hdisplay;
+		int want_h = (int)d->mode.vdisplay;
+		bool need_recreate = (g_keystone_fbo == 0) || (g_keystone_fbo_w != want_w) || (g_keystone_fbo_h != want_h);
+		if (need_recreate) {
+			// Destroy previous if any
+			if (g_keystone_fbo) {
+				glDeleteFramebuffers(1, &g_keystone_fbo);
+				g_keystone_fbo = 0;
+			}
+			if (g_keystone_fbo_texture) {
+				glDeleteTextures(1, &g_keystone_fbo_texture);
+				g_keystone_fbo_texture = 0;
+			}
+			// Create texture
+			glGenTextures(1, &g_keystone_fbo_texture);
+			glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			// Create FBO
+			glGenFramebuffers(1, &g_keystone_fbo);
+			glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_keystone_fbo_texture, 0);
+			GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+			if (status != GL_FRAMEBUFFER_COMPLETE) {
+				LOG_ERROR("FBO setup failed, status: %d", status);
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+				glDeleteFramebuffers(1, &g_keystone_fbo);
+				glDeleteTextures(1, &g_keystone_fbo_texture);
+				g_keystone_fbo = 0;
+				g_keystone_fbo_texture = 0;
+			} else {
+				g_keystone_fbo_w = want_w;
+				g_keystone_fbo_h = want_h;
+			}
 		}
 	}
 	
 	// Render MPV frame either to our FBO or directly to screen
 	mpv_opengl_fbo mpv_fbo;
-	if (fbo) {
-		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)fbo, .w = (int)d->mode.hdisplay, .h = (int)d->mode.vdisplay, .internal_format = 0 };
+	if (g_keystone.enabled && g_keystone_fbo) {
+		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
+		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)g_keystone_fbo, .w = g_keystone_fbo_w, .h = g_keystone_fbo_h, .internal_format = 0 };
 	} else {
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = 0, .w = (int)d->mode.hdisplay, .h = (int)d->mode.vdisplay, .internal_format = 0 };
 	}
 	
-	int flip_y = 0;
+	int flip_y = 1;
 	mpv_render_param r_params[] = {
 		(mpv_render_param){MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
 		(mpv_render_param){MPV_RENDER_PARAM_FLIP_Y, &flip_y},
@@ -2253,7 +2346,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	mpv_render_context_render(p->rctx, r_params);
 	
 	// If keystone is enabled, render the FBO texture with our shader
-	if (g_keystone.enabled && fbo && fbo_texture) {
+	if (g_keystone.enabled && g_keystone_fbo && g_keystone_fbo_texture) {
 		// Switch back to default framebuffer
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		
@@ -2262,7 +2355,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		// Set up texture
 		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, fbo_texture);
+	glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
 		glUniform1i(g_keystone_u_texture_loc, 0);
 		
 		// Correct warping approach: Draw a warped quad where vertices match the keystone corners
@@ -2301,22 +2394,19 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
 		glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
 		
-		// Set up GL_TRIANGLES drawing mode instead of GL_TRIANGLE_STRIP
-		// This ensures correct vertex order for warping
-		GLushort indices[] = {0, 1, 2, 2, 1, 3};  // Define triangles by indices
+		// Prepare a cached index buffer for two triangles
+		if (g_keystone_index_buffer == 0) {
+			GLushort indices[] = {0, 1, 2, 2, 1, 3};
+			glGenBuffers(1, &g_keystone_index_buffer);
+			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
+			glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+		} else {
+			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
+		}
 		
-		// Generate index buffer if needed
-		GLuint indexBuffer = 0;
-		glGenBuffers(1, &indexBuffer);
-		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-		glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_DYNAMIC_DRAW);
-		
-		// Draw using indexed triangles
-		glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
-		
-		// Clean up
-		glDeleteBuffers(1, &indexBuffer);
-		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+	// Draw using indexed triangles
+	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 		
 		// Clean up
 		glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
@@ -2324,44 +2414,40 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glUseProgram(0);
-		
-		// Clean up FBO resources
-		glDeleteFramebuffers(1, &fbo);
-		glDeleteTextures(1, &fbo_texture);
 	}
 	
-	// Draw border around the video if enabled
+	// Draw border around the keystone quad if enabled
 	if (g_show_border) {
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		
-		// Yellow border - using glClearColor since glColor4f is not available in GLES2
-		float border_color[4] = {1.0f, 1.0f, 0.0f, 1.0f}; // Yellow
-		
-		int w = d->mode.hdisplay;
-		int h = d->mode.vdisplay;
-		int bw = g_border_width;
-		
-		// Top border
-		glClearColor(border_color[0], border_color[1], border_color[2], border_color[3]);
-		glScissor(0, h - bw, w, bw);
-		glEnable(GL_SCISSOR_TEST);
-		glClear(GL_COLOR_BUFFER_BIT);
-		
-		// Bottom border
-		glScissor(0, 0, w, bw);
-		glClear(GL_COLOR_BUFFER_BIT);
-		
-		// Left border
-		glScissor(0, 0, bw, h);
-		glClear(GL_COLOR_BUFFER_BIT);
-		
-		// Right border
-		glScissor(w - bw, 0, bw, h);
-		glClear(GL_COLOR_BUFFER_BIT);
-		
-		glDisable(GL_SCISSOR_TEST);
-		glDisable(GL_BLEND);
+		// Determine quad positions in clip space matching the keystone corners
+		float vx = g_keystone.points[0][0]*2.0f-1.0f;
+		float vy = 1.0f-(g_keystone.points[0][1]*2.0f);
+		float v0[2] = { vx, vy }; // TL
+		float v1[2] = { g_keystone.points[1][0]*2.0f-1.0f, 1.0f-(g_keystone.points[1][1]*2.0f) }; // TR
+		float v2[2] = { g_keystone.points[3][0]*2.0f-1.0f, 1.0f-(g_keystone.points[3][1]*2.0f) }; // BL
+		float v3[2] = { g_keystone.points[2][0]*2.0f-1.0f, 1.0f-(g_keystone.points[2][1]*2.0f) }; // BR
+		float lines[] = {
+			v0[0], v0[1], v1[0], v1[1], // top edge
+			v1[0], v1[1], v3[0], v3[1], // right edge
+			v3[0], v3[1], v2[0], v2[1], // bottom edge
+			v2[0], v2[1], v0[0], v0[1], // left edge
+		};
+		// Use border shader
+		glUseProgram(g_border_shader_program);
+		glUniform4f(g_border_u_color_loc, 1.0f, 1.0f, 0.0f, 1.0f); // Yellow
+	// Upload a tiny VBO on existing vertex buffer to avoid creating a new one
+		if (g_keystone_vertex_buffer == 0) glGenBuffers(1, &g_keystone_vertex_buffer);
+		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(lines), lines, GL_DYNAMIC_DRAW);
+		glEnableVertexAttribArray((GLuint)g_border_a_position_loc);
+		glVertexAttribPointer((GLuint)g_border_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+	// Set line width (may be clamped to 1 on some GLES2 drivers)
+	glLineWidth((GLfloat)g_border_width);
+	// Draw 4 line segments (each pair of vertices forms a segment)
+		glDrawArrays(GL_LINES, 0, 8);
+		// Cleanup
+		glDisableVertexAttribArray((GLuint)g_border_a_position_loc);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glUseProgram(0);
 	}
 	
 	// Draw corner markers for keystone adjustment if enabled
@@ -2634,7 +2720,7 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "  r - Reset keystone to default\n");
 	fprintf(stderr, "  b - Toggle border around video\n");
 	fprintf(stderr, "  [/] - Decrease/increase border width\n");
-	fprintf(stderr, "  g - Toggle light background for better edge visibility\n\n");
+	fprintf(stderr, "  (border draws around keystone quad; background is always black)\n\n");
 
 	// Event-driven loop: render only when mpv signals a frame update unless override forces continuous loop.
 	// If mpv hasn't yet posted MPV_RENDER_UPDATE_FRAME for the very first frame, we still render once to kick things off.
@@ -2740,8 +2826,8 @@ int main(int argc, char **argv) {
 				// Handle keyboard input
 				char c;
 				if (read(STDIN_FILENO, &c, 1) > 0) {
-					// Log keypress for debugging
-					LOG_INFO("Key pressed: %d (0x%02x) '%c'", (int)c, (int)c, (c >= 32 && c < 127) ? c : '?');
+					// Log keypress for debugging (quiet by default)
+					LOG_DEBUG("Key pressed: %d (0x%02x) '%c'", (int)c, (int)c, (c >= 32 && c < 127) ? c : '?');
 					
 					// Special case: Force keystone mode with 'K' (capital K)
 					if (c == 'K') {
@@ -2756,19 +2842,19 @@ int main(int argc, char **argv) {
 						continue;
 					}
 					
-					// Check for quit key (q)
+					// Handle keystone adjustment keys first (to avoid 'q' conflict)
+					bool keystone_handled = keystone_handle_key(c);
+					LOG_DEBUG("Keystone handler returned: %d", keystone_handled);
+					if (keystone_handled) {
+						// Force a redraw when keystone parameters change
+						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+						continue;
+					}
+					// If not handled by keystone, allow 'q' to quit
 					if (c == 'q' && !g_key_seq_state.in_escape_seq) {
 						LOG_INFO("Quit requested by user");
 						g_stop = 1;
 						break;
-					}
-					
-					// Handle keystone adjustment keys
-					bool keystone_handled = keystone_handle_key(c);
-					LOG_INFO("Keystone handler returned: %d", keystone_handled);
-					if (keystone_handled) {
-						// Force a redraw when keystone parameters change
-						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 					}
 				}
 			} else if (g_joystick_enabled && pfds[i].fd == g_joystick_fd) {
