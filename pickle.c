@@ -693,6 +693,11 @@ static int g_triple_buffer = 1;         // Enable triple buffering by default
 static int g_vsync_enabled = 1;         // Enable vsync by default
 static int g_frame_timing_enabled = 0;  // Detailed frame timing metrics (when PICKLE_TIMING=1)
 
+// Texture orientation controls for final keystone pass
+static int g_tex_flip_x = 0; // 1 = mirror horizontally (left/right)
+static int g_tex_flip_y = 0; // 1 = flip vertically (top/bottom)
+static int g_help_visible = 0; // toggle state for help overlay
+
 // --- Statistics ---
 static int g_stats_enabled = 0;
 static double g_stats_interval_sec = 2.0; // default
@@ -761,6 +766,28 @@ static void stats_log_final(mpv_player_t *p) {
 		fprintf(stderr, "[timing-final] flip_time: min=%.2fms avg=%.2fms max=%.2fms count=%d\n",
 			g_min_flip_time * 1000.0, g_avg_flip_time * 1000.0, g_max_flip_time * 1000.0, g_flip_count);
 	}
+}
+
+// Display a help overlay using mpv's built-in OSD
+static void show_help_overlay(mpv_handle *mpv) {
+	if (!mpv) return;
+	const char *text =
+		"Pickle controls:\n"
+		"  q: quit    h: help overlay\n"
+		"  k: toggle keystone    1-4: select corner\n"
+		"  arrows / WASD: move point    +/-: step    r: reset\n"
+		"  b: toggle border    [ / ]: border width\n"
+		"  o: flip X (mirror)  p: flip Y (invert)\n"
+		"  m: mesh mode (experimental)    S: save keystone\n";
+	const char *cmd[] = { "show-text", text, "600000", NULL }; // long duration; we'll clear on toggle
+	mpv_command(mpv, cmd);
+}
+
+static void hide_help_overlay(mpv_handle *mpv) {
+	if (!mpv) return;
+	// Clear by showing empty text for 1ms
+	const char *cmd[] = { "show-text", "", "1", NULL };
+	mpv_command(mpv, cmd);
 }
 
 // Helper for mpv option failure logging
@@ -1237,6 +1264,12 @@ static void keystone_init(void) {
         // Note: shader initialization must be done after EGL context is created
         // We'll do it in render_frame_fixed when needed
     }
+
+	// Texture flip defaults via env
+	const char* flipx = getenv("PICKLE_TEX_FLIP_X");
+	const char* flipy = getenv("PICKLE_TEX_FLIP_Y");
+	if (flipx && *flipx) g_tex_flip_x = atoi(flipx) ? 1 : 0;
+	if (flipy && *flipy) g_tex_flip_y = atoi(flipy) ? 1 : 0;
 }
 
 /**
@@ -1955,6 +1988,16 @@ static bool keystone_handle_key(char key) {
             g_show_border = !g_show_border;
             LOG_INFO("Border %s", g_show_border ? "enabled" : "disabled");
             return true;
+
+		case 'o': // Toggle horizontal flip
+			g_tex_flip_x = !g_tex_flip_x;
+			LOG_INFO("Texture flip X %s", g_tex_flip_x ? "ON" : "off");
+			return true;
+
+		case 'p': // Toggle vertical flip
+			g_tex_flip_y = !g_tex_flip_y;
+			LOG_INFO("Texture flip Y %s", g_tex_flip_y ? "ON" : "off");
+			return true;
             
         case '[': // Decrease border width
 			if (g_show_border) {
@@ -2330,7 +2373,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = 0, .w = (int)d->mode.hdisplay, .h = (int)d->mode.vdisplay, .internal_format = 0 };
 	}
 	
-	int flip_y = 1;
+	int flip_y = 0; // handle orientation in final keystone pass via texcoords
 	mpv_render_param r_params[] = {
 		(mpv_render_param){MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
 		(mpv_render_param){MPV_RENDER_PARAM_FLIP_Y, &flip_y},
@@ -2367,12 +2410,16 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[2][1] * 2.0f)   // Bottom right
 		};
 		
-		// Use standard texture coordinates for proper mapping
+		// Texture coordinates with optional flips
+		float u0 = g_tex_flip_x ? 1.0f : 0.0f;
+		float u1 = g_tex_flip_x ? 0.0f : 1.0f;
+		float v0 = g_tex_flip_y ? 1.0f : 0.0f;
+		float v1 = g_tex_flip_y ? 0.0f : 1.0f;
 		float texcoords[] = {
-			0.0f, 0.0f,  // Top left
-			1.0f, 0.0f,  // Top right
-			0.0f, 1.0f,  // Bottom left
-			1.0f, 1.0f   // Bottom right
+			u0, v0,  // Top left
+			u1, v0,  // Top right
+			u0, v1,  // Bottom left
+			u1, v1   // Bottom right
 		};
 		
 		// Enable vertex arrays
@@ -2842,6 +2889,19 @@ int main(int argc, char **argv) {
 						continue;
 					}
 					
+					// Help overlay
+					if (c == 'h' && !g_key_seq_state.in_escape_seq) {
+						if (!g_help_visible) {
+							show_help_overlay(player.mpv);
+							g_help_visible = 1;
+						} else {
+							hide_help_overlay(player.mpv);
+							g_help_visible = 0;
+						}
+						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+						continue;
+					}
+
 					// Handle keystone adjustment keys first (to avoid 'q' conflict)
 					bool keystone_handled = keystone_handle_key(c);
 					LOG_DEBUG("Keystone handler returned: %d", keystone_handled);
