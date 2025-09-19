@@ -259,6 +259,7 @@ static int g_keystone_adjust_step = 1; // Step size for keystone adjustments (in
 static bool g_show_border = false; // Whether to show border around the video
 static int g_border_width = 5; // Border width in pixels
 static bool g_show_background = false; // Deprecated: background is always black now
+static bool g_show_corner_markers = true; // Show keystone corner highlights
 static GLuint g_keystone_shader_program = 0; // Shader program for keystone correction
 static GLuint g_keystone_vertex_shader = 0;
 static GLuint g_keystone_fragment_shader = 0;
@@ -777,6 +778,7 @@ static void show_help_overlay(mpv_handle *mpv) {
 		"  k: toggle keystone    1-4: select corner\n"
 		"  arrows / WASD: move point    +/-: step    r: reset\n"
 		"  b: toggle border    [ / ]: border width\n"
+	"  c: toggle corner markers\n"
 		"  o: flip X (mirror)  p: flip Y (invert)\n"
 		"  m: mesh mode (experimental)    S: save keystone\n";
 	const char *cmd[] = { "show-text", text, "600000", NULL }; // long duration; we'll clear on toggle
@@ -1270,6 +1272,10 @@ static void keystone_init(void) {
 	const char* flipy = getenv("PICKLE_TEX_FLIP_Y");
 	if (flipx && *flipx) g_tex_flip_x = atoi(flipx) ? 1 : 0;
 	if (flipy && *flipy) g_tex_flip_y = atoi(flipy) ? 1 : 0;
+
+	// Corner markers env (1=on, 0=off)
+	const char* show_corners = getenv("PICKLE_SHOW_CORNERS");
+	if (show_corners && *show_corners) g_show_corner_markers = atoi(show_corners) ? true : false;
 }
 
 /**
@@ -1989,6 +1995,11 @@ static bool keystone_handle_key(char key) {
             LOG_INFO("Border %s", g_show_border ? "enabled" : "disabled");
             return true;
 
+		case 'c': // Toggle corner markers
+			g_show_corner_markers = !g_show_corner_markers;
+			LOG_INFO("Corner markers %s", g_show_corner_markers ? "enabled" : "disabled");
+			return true;
+
 		case 'o': // Toggle horizontal flip
 			g_tex_flip_x = !g_tex_flip_x;
 			LOG_INFO("Texture flip X %s", g_tex_flip_x ? "ON" : "off");
@@ -2499,7 +2510,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	
 	// Draw corner markers for keystone adjustment if enabled
 	// This is simplistic and would need a shader-based approach for proper GLES2 implementation
-	if (g_keystone.enabled) {
+	if (g_keystone.enabled && g_show_corner_markers) {
 		// Draw colored markers at each corner position to show their current locations
 		int corner_size = 10;
 		glEnable(GL_BLEND);
