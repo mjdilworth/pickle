@@ -694,7 +694,7 @@ static int g_triple_buffer = 1;         // Enable triple buffering by default
 static int g_vsync_enabled = 1;         // Enable vsync by default
 static int g_frame_timing_enabled = 0;  // Detailed frame timing metrics (when PICKLE_TIMING=1)
 
-// Texture orientation controls for final keystone pass
+// Texture orientation controls (used in keystone pass only)
 static int g_tex_flip_x = 0; // 1 = mirror horizontally (left/right)
 static int g_tex_flip_y = 0; // 1 = flip vertically (top/bottom)
 static int g_help_visible = 0; // toggle state for help overlay
@@ -780,7 +780,11 @@ static void show_help_overlay(mpv_handle *mpv) {
 		"  b: toggle border    [ / ]: border width\n"
 	"  c: toggle corner markers\n"
 		"  o: flip X (mirror)  p: flip Y (invert)\n"
-		"  m: mesh mode (experimental)    S: save keystone\n";
+		"  m: mesh mode (experimental)    S: save keystone\n"
+		"\nGamepad:\n"
+		"  START: toggle keystone    A/B/X/Y: select corner 1-4\n"
+		"  D-Pad/Left stick: move point\n"
+		"  L1/R1: step -/+    SELECT: reset    HOME: toggle border\n";
 	const char *cmd[] = { "show-text", text, "600000", NULL }; // long duration; we'll clear on toggle
 	mpv_command(mpv, cmd);
 }
@@ -2376,18 +2380,20 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	
 	// Render MPV frame either to our FBO or directly to screen
 	mpv_opengl_fbo mpv_fbo;
+	int mpv_flip_y = 0; // default: no flip (handled in final pass if needed)
 	if (g_keystone.enabled && g_keystone_fbo) {
 		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)g_keystone_fbo, .w = g_keystone_fbo_w, .h = g_keystone_fbo_h, .internal_format = 0 };
 	} else {
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = 0, .w = (int)d->mode.hdisplay, .h = (int)d->mode.vdisplay, .internal_format = 0 };
+		// When rendering directly to the default framebuffer (no keystone), mpv should flip vertically
+		mpv_flip_y = 1;
 	}
 	
-	int flip_y = 0; // handle orientation in final keystone pass via texcoords
 	mpv_render_param r_params[] = {
 		(mpv_render_param){MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
-		(mpv_render_param){MPV_RENDER_PARAM_FLIP_Y, &flip_y},
+		(mpv_render_param){MPV_RENDER_PARAM_FLIP_Y, &mpv_flip_y},
 		(mpv_render_param){0}
 	};
 	
