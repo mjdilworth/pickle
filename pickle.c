@@ -1348,6 +1348,12 @@ static bool keystone_load_config(const char* path) {
         else if (strncmp(line, "pin4=", 5) == 0) {
             g_keystone.perspective_pins[3] = (atoi(line + 5) != 0);
         }
+        else if (strncmp(line, "border=", 7) == 0) {
+            g_show_border = (atoi(line + 7) != 0);
+        }
+        else if (strncmp(line, "cornermarks=", 12) == 0) {
+            g_show_corner_markers = (atoi(line + 12) != 0);
+        }
         else if (strncmp(line, "mesh_", 5) == 0) {
             // Parse mesh point coordinates: mesh_i_j=x,y
             int i, j;
@@ -2299,6 +2305,10 @@ static bool keystone_save_config(const char* path) {
         fprintf(f, "corner%d=%.6f,%.6f\n", i+1, g_keystone.points[i][0], g_keystone.points[i][1]);
         fprintf(f, "pin%d=%d\n", i+1, g_keystone.perspective_pins[i] ? 1 : 0);
     }
+    
+    // Save border and corner marker settings
+    fprintf(f, "border=%d\n", g_show_border ? 1 : 0);
+    fprintf(f, "cornermarks=%d\n", g_show_corner_markers ? 1 : 0);
     
     // Save mesh points if mesh warping is enabled
     if (g_keystone.mesh_enabled && g_keystone.mesh_points) {
