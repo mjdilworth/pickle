@@ -94,3 +94,25 @@ GLuint link_program(GLuint vertex_shader, GLuint fragment_shader) {
     
     return program;
 }
+
+void cleanup_shader_resources(GLuint program, GLuint vertex_shader, GLuint fragment_shader) {
+    // Delete program if it exists
+    if (program) {
+        // Detach shaders before deleting program
+        if (vertex_shader) {
+            glDetachShader(program, vertex_shader);
+        }
+        if (fragment_shader) {
+            glDetachShader(program, fragment_shader);
+        }
+        glDeleteProgram(program);
+    }
+    
+    // Delete shaders if they exist
+    if (vertex_shader) {
+        glDeleteShader(vertex_shader);
+    }
+    if (fragment_shader) {
+        glDeleteShader(fragment_shader);
+    }
+}

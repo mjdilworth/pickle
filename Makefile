@@ -5,16 +5,16 @@
 # ✅ Create utils module (utils.c/utils.h)
 # ✅ Create shader module (shader.c/shader.h)
 # ✅ Clean up redundant adapter files and scripts
-# 🔄 Create DRM module (drm.c/drm.h)
-# 🔄 Create EGL module (egl.c/egl.h)
-# 🔄 Create input module (input.c/input.h)
+# ✅ Create DRM module (drm.c/drm.h)
+# ✅ Create EGL module (egl.c/egl.h)
+# ✅ Create input module (input.c/input.h)
 
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c drm.c drm_atomic.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c
 OBJECTS  := $(SOURCES:.c=.o)
-HEADERS  := utils.h shader.h keystone.h
+HEADERS  := utils.h shader.h keystone.h drm.h egl.h input.h error.h frame_pacing.h render.h mpv.h
 
 # Toolchain / standards
 CROSS   ?=
@@ -73,6 +73,56 @@ ifeq ($(PERF),1)
 	endif
 endif
 
+# RPi4-specific optimizations
+RPI4_OPT ?= 0
+ifeq ($(RPI4_OPT),1)
+	# Cortex-A72 specific flags for RPi4
+	CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
+	CFLAGS += -DRPI4_OPTIMIZED=1
+endif
+
+# Maximum performance mode (combines all optimizations)
+MAXPERF ?= 0
+ifeq ($(MAXPERF),1)
+	CFLAGS := -O3 -DNDEBUG -fomit-frame-pointer -march=native -mtune=native
+	CFLAGS += -ffast-math -fno-math-errno -fno-trapping-math
+	CFLAGS += -funroll-loops -fprefetch-loop-arrays -ftree-vectorize
+	CFLAGS += -flto -fuse-linker-plugin
+	CFLAGS += $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
+	LDFLAGS += -flto -Wl,-O3 -Wl,--as-needed
+	ifneq (,$(shell command -v mold 2>/dev/null))
+		LDFLAGS += -fuse-ld=mold
+	else ifneq (,$(shell command -v ld.lld 2>/dev/null))
+		LDFLAGS += -fuse-ld=lld
+	endif
+endif
+
+# RPi4-specific optimizations
+RPI4_OPT ?= 0
+ifeq ($(RPI4_OPT),1)
+	# Cortex-A72 specific flags for RPi4
+	CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
+	CFLAGS += -DRPI4_OPTIMIZED=1
+endif
+
+# Maximum performance mode (combines all optimizations)
+MAXPERF ?= 0
+ifeq ($(MAXPERF),1)
+	CFLAGS := -O3 -DNDEBUG -fomit-frame-pointer -march=native -mtune=native
+	CFLAGS += -ffast-math -fno-math-errno -fno-trapping-math
+	CFLAGS += -funroll-loops -fprefetch-loop-arrays -ftree-vectorize
+	CFLAGS += -flto -fuse-linker-plugin
+	CFLAGS += $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
+	LDFLAGS += -flto -Wl,-O3 -Wl,--as-needed
+	ifneq (,$(shell command -v mold 2>/dev/null))
+		LDFLAGS += -fuse-ld=mold
+	else ifneq (,$(shell command -v ld.lld 2>/dev/null))
+		LDFLAGS += -fuse-ld=lld
+	endif
+endif
+
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
@@ -107,9 +157,12 @@ try-run: $(APP)
 	./$(APP) "$(VIDEO)" $(MPV_ARGS) || { echo "Hint: use 'sudo make run VIDEO=...' if permission denied."; exit 1; }
 
 # Build mode convenience targets
-release: CFLAGS := -O3 -DNDEBUG $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
+release: CFLAGS := -O3 -DNDEBUG -flto $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
+release: LDFLAGS += -flto
 release: clean $(APP)
-	@echo "Built release binary: $(APP)"
+	strip $(APP)
+	@echo "Built and stripped release binary: $(APP)"
+	@ls -lh $(APP)
 
 debug: CFLAGS := -O0 -g3 $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
 debug: clean $(APP)

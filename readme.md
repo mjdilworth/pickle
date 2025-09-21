@@ -5,10 +5,13 @@ Minimal fullscreen Raspberry Pi 4 DRM/KMS + GBM + EGL + libmpv hardware accelera
 ## Features
 * Direct to KMS (no X / Wayland) using DRM master.
 * Uses GBM + EGL (GLES2) for libmpv OpenGL render backend.
+* Zero-copy buffer path using DMA-BUF for optimal performance.
+* Atomic modesetting for tear-free video updates.
 * Auto-selects first connected monitor and preferred mode.
 * Keystone correction for projector use.
 * Plays one file then exits (Ctrl+C to stop early).
 * Optional continuous playback looping.
+* Optimized performance for Raspberry Pi 4 with CPU and memory reduction strategies.
 
 ## Dependencies (Raspberry Pi OS / Debian)
 Install development headers:
@@ -21,6 +24,18 @@ Make sure `dtoverlay=vc4-kms-v3d` (or `dtoverlay=vc4-kms-v3d-pi4`) is enabled in
 
 ## Build
 ```
+# Standard build
+make
+
+# Release build (smaller, optimized)
+make RELEASE=1
+
+# Maximum performance build with Raspberry Pi 4 optimizations
+make RELEASE=1 MAXPERF=1 RPI4_OPT=1
+```
+
+Or manually:
+```
 gcc -O2 -Wall -std=c11 pickle.c -o pickle \
 	-lmpv -ldrm -lgbm -lEGL -lGLESv2 -lpthread -lm
 ```
@@ -29,6 +44,67 @@ If `pkg-config` is preferred:
 ```
 gcc -O2 -Wall -std=c11 pickle.c -o pickle $(pkg-config --cflags --libs mpv gbm egl glesv2) -ldrm
 ```
+
+## Performance Tuning
+
+Pickle includes several optimization features that can be controlled through environment variables:
+
+### CPU and Process Priority
+```
+# Set real-time priority (1-99, requires root or CAP_SYS_NICE)
+PICKLE_PRIORITY=10 sudo ./pickle video.mp4
+
+# Assign process to specific CPU cores (e.g., cores 2 and 3)
+PICKLE_CPU_AFFINITY=2,3 ./pickle video.mp4
+```
+
+### Rendering Optimizations
+```
+# Enable/disable frame change detection (1=enabled, 0=disabled)
+PICKLE_SKIP_UNCHANGED=1 ./pickle video.mp4
+
+# Enable/disable direct rendering path when possible (1=enabled, 0=disabled)
+PICKLE_DIRECT_RENDERING=1 ./pickle video.mp4
+
+# Completely disable keystone for maximum performance
+PICKLE_DISABLE_KEYSTONE=1 ./pickle video.mp4
+```
+
+### Diagnostics
+```
+# Enable detailed frame timing logs
+PICKLE_FRAME_TIMING=1 ./pickle video.mp4
+
+# Enable performance statistics
+PICKLE_STATS=1 ./pickle video.mp4
+```
+
+### Playback
+```
+# Enable looping
+PICKLE_LOOP=1 ./pickle video.mp4
+```
+
+### Performance Tips for Raspberry Pi 4
+
+1. Use the maximum performance build option:
+   ```
+   make RELEASE=1 MAXPERF=1 RPI4_OPT=1
+   ```
+
+2. Disable keystone correction if not needed:
+   ```
+   PICKLE_DISABLE_KEYSTONE=1 ./pickle video.mp4
+   ```
+
+3. Run with elevated priority and CPU affinity:
+   ```
+   PICKLE_PRIORITY=10 PICKLE_CPU_AFFINITY=2,3 sudo ./pickle video.mp4
+   ```
+
+4. Use small, efficiently encoded videos (H.264/H.265) for best results.
+
+5. Make sure your Raspberry Pi has adequate cooling and is not throttling due to overheating.
 
 ## Run
 You need DRM master access (non-root possible if logind/seatd grants it and your user is in correct groups).
@@ -71,6 +147,31 @@ make run VIDEO=/path/to/video.mp4   # build then run (uses sudo)
 make clean      # remove objects and binary
 sudo make install PREFIX=/usr/local # optional install
 ```
+
+## Zero-Copy and Atomic Modesetting
+
+Pickle implements two key optimizations for improved performance and display quality:
+
+### DMA-BUF Zero-Copy Path
+
+The DMA-BUF zero-copy path eliminates unnecessary buffer copies between the GPU and display controller:
+
+- Directly shares buffers between GPU and display using Linux DMA-BUF mechanism
+- Reduces memory bandwidth usage and CPU overhead
+- Automatically detected and used when supported by hardware
+- Falls back to standard path when unsupported
+
+### Atomic Modesetting
+
+Atomic modesetting provides tear-free display updates:
+
+- Uses the modern DRM atomic API for synchronized display updates
+- All display changes happen in one synchronized operation
+- Eliminates tearing artifacts during video playback
+- Automatically used when supported by the driver
+- Falls back to legacy modesetting when unsupported
+
+These features are automatically enabled when supported by your hardware and drivers, with no additional configuration required.
 
 ## Keystone Correction
 

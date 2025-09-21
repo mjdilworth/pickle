@@ -7,6 +7,7 @@
 // Shader compilation and program linking
 GLuint compile_shader(GLenum type, const char *source);
 GLuint link_program(GLuint vertex_shader, GLuint fragment_shader);
+void cleanup_shader_resources(GLuint program, GLuint vertex_shader, GLuint fragment_shader);
 
 // Shader source strings
 extern const char *g_vertex_shader_src;

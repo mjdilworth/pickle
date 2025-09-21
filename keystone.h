@@ -50,6 +50,8 @@ void keystone_adjust_corner(int corner, float x_delta, float y_delta);
 void keystone_update_matrix(void);
 bool keystone_save_config(const char* path);
 bool keystone_load_config(const char* path);
+void cleanup_mesh_resources(void);
+void cleanup_keystone_resources(void);
 
 // Rendering functions
 bool init_keystone_shader(void);

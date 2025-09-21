@@ -43,6 +43,8 @@
 #include "utils.h"
 #include "shader.h"
 #include "keystone.h"
+#include "drm.h"
+#include "egl.h"
 #include <execinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -178,26 +180,6 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     return p;
 }
 
-struct kms_ctx {
-	int fd;
-	drmModeRes *res;
-	drmModeConnector *connector;
-	drmModeEncoder *encoder;
-	drmModeCrtc *orig_crtc;
-	uint32_t crtc_id;
-	uint32_t connector_id;
-	drmModeModeInfo mode;
-};
-
-struct egl_ctx {
-	struct gbm_device *gbm_dev;
-	struct gbm_surface *gbm_surf;
-	EGLDisplay dpy;
-	EGLConfig config;
-	EGLContext ctx;
-	EGLSurface surf;
-};
-
 // Forward declaration for vsync toggle used before its definition
 static int g_vsync_enabled;
 
@@ -212,8 +194,6 @@ struct fb_ring {
 };
 
 // Typedefs for clarity
-typedef struct kms_ctx kms_ctx_t;
-typedef struct egl_ctx egl_ctx_t;
 typedef struct fb_ring fb_ring_t;
 typedef struct fb_ring_entry fb_ring_entry_t;
 
@@ -419,7 +399,8 @@ static void configure_special_buttons(void) {
 static bool init_joystick(void);
 static bool handle_joystick_event(struct js_event *event);
 
-static bool ensure_drm_master(int fd) {
+bool ensure_drm_master(int fd) __attribute__((weak)); 
+bool ensure_drm_master(int fd) {
 	// Attempt to become DRM master; non-fatal if it fails (we may still page flip if compositor allows)
 	if (drmSetMaster(fd) == 0) {
 		LOG_DRM("Acquired master");
@@ -437,7 +418,8 @@ static bool ensure_drm_master(int fd) {
  * @param d Pointer to kms_ctx structure to initialize
  * @return true on success, false on failure
  */
-static bool init_drm(kms_ctx_t *d) {
+bool init_drm(kms_ctx_t *d) __attribute__((weak));
+bool init_drm(kms_ctx_t *d) {
 	memset(d, 0, sizeof(*d));
 	d->fd = -1; // Initialize to invalid
 
@@ -543,7 +525,8 @@ static bool init_drm(kms_ctx_t *d) {
  * 
  * @param d Pointer to kms_ctx structure to clean up
  */
-static void deinit_drm(kms_ctx_t *d) {
+void deinit_drm(kms_ctx_t *d) __attribute__((weak));
+void deinit_drm(kms_ctx_t *d) {
 	if (!d) return;
 	
 	if (d->orig_crtc) {
@@ -587,7 +570,8 @@ static void deinit_drm(kms_ctx_t *d) {
  * @param e Pointer to EGL context structure to initialize
  * @return true on success, false on failure
  */
-static bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
+bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) __attribute__((weak));
+bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
 	memset(e, 0, sizeof(*e));
 	
 	// Create GBM device from DRM file descriptor
@@ -724,7 +708,8 @@ static bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
  * 
  * @param e Pointer to EGL context structure to clean up
  */
-static void deinit_gbm_egl(egl_ctx_t *e) {
+void deinit_gbm_egl(egl_ctx_t *e) __attribute__((weak));
+void deinit_gbm_egl(egl_ctx_t *e) {
 	if (!e) return;
 	
 	// Clean up keystone shader resources if initialized
@@ -1727,7 +1712,8 @@ static bool handle_joystick_event(struct js_event *event) {
 // user data holds a small struct with fb id + drm fd and a destroy handler.
 static int g_scanout_disabled = 0; // when set, we skip page flips/modeset and just let mpv decode & render offscreen
 struct fb_holder { uint32_t fb; int fd; };
-static void bo_destroy_handler(struct gbm_bo *bo, void *data) {
+void bo_destroy_handler(struct gbm_bo *bo, void *data) __attribute__((weak));
+void bo_destroy_handler(struct gbm_bo *bo, void *data) {
 	(void)bo;
 	struct fb_holder *h = data;
 	if (h) {
@@ -1980,6 +1966,36 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	// Swap buffers to display the rendered frame
 	eglSwapBuffers(e->dpy, e->surf);
 
+	static bool first_frame = true;
+
+	// Check if we should use zero-copy path
+	// For now, we'll disable the zero-copy path until we can properly integrate it
+	if (false && !g_scanout_disabled && should_use_zero_copy(d, e)) {
+		// We'd need a way to get the MPV rendered texture, but that's not directly exposed
+		// This is something to implement in the future when we can extract the texture from MPV
+		GLuint video_texture = 0; 
+		
+		// Setup source and destination rectangles
+		float src_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full texture
+		float dst_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full screen
+		
+		// Use zero-copy path to present the frame
+		if (present_frame_zero_copy(d, e, video_texture, src_rect, dst_rect)) {
+			// Successfully presented using zero-copy path
+			if (g_debug && first_frame) {
+				fprintf(stderr, "[debug] Using zero-copy DMA-BUF path with %s modesetting\n", 
+						d->atomic_supported ? "atomic" : "legacy");
+			}
+			return true;
+		}
+		
+		// If zero-copy fails, fall back to standard path
+		if (g_debug && first_frame) {
+			fprintf(stderr, "[debug] Zero-copy path failed, falling back to standard path\n");
+		}
+	}
+
+	// Standard (non-zero-copy) path
 	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
 	if (!bo) { fprintf(stderr, "gbm_surface_lock_front_buffer failed\n"); return false; }
 	struct fb_holder *h = gbm_bo_get_user_data(bo);
@@ -2002,9 +2018,22 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	static bool first=true;
 	if (!g_scanout_disabled && first) {
 		// Initial modeset; retain BO until next successful page flip to avoid premature release while scanning out.
-		if (drmModeSetCrtc(d->fd, d->crtc_id, fb_id, 0,0, &d->connector_id,1,&d->mode)) {
+		bool success = false;
+		
+		if (d->atomic_supported) {
+			// Use atomic modesetting for tear-free updates
+			success = atomic_present_framebuffer(d, fb_id, g_vsync_enabled);
+		} else {
+			// Legacy modesetting
+			success = (drmModeSetCrtc(d->fd, d->crtc_id, fb_id, 0, 0, &d->connector_id, 1, &d->mode) == 0);
+		}
+		
+		if (!success) {
 			int err = errno;
-			fprintf(stderr, "drmModeSetCrtc failed (%s)\n", strerror(err));
+			fprintf(stderr, "%s failed (%s)\n", 
+				d->atomic_supported ? "atomic_present_framebuffer" : "drmModeSetCrtc", 
+				strerror(err));
+				
 			if (err == EACCES || err == EPERM) {
 				fprintf(stderr, "[DRM] Permission denied on modeset – entering NO-SCANOUT fallback (offscreen decode).\n");
 				g_scanout_disabled = 1;
@@ -2048,9 +2077,18 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			}
 		}
 		
-		if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
-			gbm_surface_release_buffer(e->gbm_surf, bo);
-			return false;
+		if (d->atomic_supported) {
+			// Use atomic modesetting for page flip
+			if (!atomic_present_framebuffer(d, fb_id, g_vsync_enabled)) {
+				gbm_surface_release_buffer(e->gbm_surf, bo);
+				return false;
+			}
+		} else {
+			// Legacy page flip
+			if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
+				gbm_surface_release_buffer(e->gbm_surf, bo);
+				return false;
+			}
 		}
 		g_pending_flip = 1; // will release in handler
 		g_pending_flips++;  // increment pending flip count

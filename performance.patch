@@ -1,0 +1,120 @@
+diff --git a/pickle.c b/pickle.c
+index 7fb80a4..0e8e0ef 100644
+--- a/pickle.c
++++ b/pickle.c
+@@ -37,6 +37,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <sched.h>        // For CPU affinity
++#include <sys/resource.h> // For process priority
++
+ #include <signal.h>
+ 
+ // Include our refactored modules
+@@ -263,6 +266,12 @@ struct fb_ring {
+ 
+ #define JS_BUTTON_X        2
+ #define JS_BUTTON_Y        3
++
++// Performance optimization flags
++static bool g_needs_render = true;
++static uint64_t g_last_pts = 0;
++static int g_skip_unchanged_frames = 1;  // Skip rendering if frame hasn't changed
++static int g_use_direct_rendering = 1;   // Use direct rendering when possible
+ #define JS_BUTTON_L1       4
+ 
+ // Performance optimization flags
+@@ -1753,6 +1762,11 @@ static void init_border_shader_uniforms(void) {
+ }
+ 
+ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
++	// Performance timing
++	struct timeval start_time, end_time;
++	if (g_frame_timing_enabled) {
++		gettimeofday(&start_time, NULL);
++	}
+ 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
+ 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
+ 	}
+@@ -2041,6 +2055,12 @@ swap_buffers:
+ 	// Swap buffers to display the rendered frame
+ 	eglSwapBuffers(e->dpy, e->surf);
+ 
++	// Performance timing
++	if (g_frame_timing_enabled) {
++		gettimeofday(&end_time, NULL);
++		long render_time_us = (end_time.tv_sec - start_time.tv_sec) * 1000000 + (end_time.tv_usec - start_time.tv_usec);
++		fprintf(stderr, "[TIMING] Frame render time: %.2f ms\n", render_time_us / 1000.0f);
++	}
+ 	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
+ 	if (!bo) { fprintf(stderr, "gbm_surface_lock_front_buffer failed\n"); return false; }
+ 	struct fb_holder *h = gbm_bo_get_user_data(bo);
+@@ -2248,6 +2268,68 @@ int main(int argc, char **argv) {
+ 	if (loop_env && *loop_env) {
+ 		g_loop_playback = atoi(loop_env);
+ 	}
++
++	// Performance optimization: Set process priority (if requested)
++	const char *priority_env = getenv("PICKLE_PRIORITY");
++	if (priority_env && *priority_env) {
++		int priority = atoi(priority_env);
++		if (priority > 0) {
++			// Set real-time priority if requested
++			struct sched_param param;
++			param.sched_priority = priority;
++			if (sched_setscheduler(0, SCHED_RR, &param) != 0) {
++				fprintf(stderr, "Warning: Failed to set real-time priority (needs root or CAP_SYS_NICE)\n");
++			} else {
++				fprintf(stderr, "Set real-time priority to %d\n", priority);
++			}
++		} else {
++			// Set standard nice value (-20 to 19)
++			if (setpriority(PRIO_PROCESS, 0, priority) != 0) {
++				fprintf(stderr, "Warning: Failed to set process nice value\n");
++			} else {
++				fprintf(stderr, "Set nice value to %d\n", priority);
++			}
++		}
++	}
++	
++	// Performance optimization: Set CPU affinity (if requested)
++	const char *affinity_env = getenv("PICKLE_CPU_AFFINITY");
++	if (affinity_env && *affinity_env) {
++		cpu_set_t set;
++		CPU_ZERO(&set);
++		
++		// Parse comma-separated list of CPU cores
++		char *affinity_str = strdup(affinity_env);
++		char *token = strtok(affinity_str, ",");
++		while (token) {
++			int cpu = atoi(token);
++			if (cpu >= 0 && cpu < CPU_SETSIZE) {
++				CPU_SET(cpu, &set);
++				fprintf(stderr, "Adding CPU %d to affinity mask\n", cpu);
++			}
++			token = strtok(NULL, ",");
++		}
++		free(affinity_str);
++		
++		// Apply CPU affinity
++		if (sched_setaffinity(0, sizeof(set), &set) != 0) {
++			fprintf(stderr, "Warning: Failed to set CPU affinity\n");
++		} else {
++			fprintf(stderr, "Set CPU affinity mask\n");
++		}
++	}
++	
++	// Read other performance-related environment variables
++	const char *skip_env = getenv("PICKLE_SKIP_UNCHANGED");
++	if (skip_env && *skip_env) {
++		g_skip_unchanged_frames = atoi(skip_env);
++	}
++	
++	const char *direct_env = getenv("PICKLE_DIRECT_RENDERING");
++	if (direct_env && *direct_env) {
++		g_use_direct_rendering = atoi(direct_env);
++	}
+ 
+ 	struct kms_ctx drm = {0};
+ 	struct egl_ctx eglc = {0};

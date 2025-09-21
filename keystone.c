@@ -221,6 +221,7 @@ void keystone_cleanup(void) {
     cleanup_keystone_shader();
     cleanup_keystone_fbo();
     cleanup_mesh_resources();
+    cleanup_keystone_resources();
 }
 
 bool init_border_shader(void) {
@@ -362,6 +363,35 @@ void cleanup_mesh_resources(void) {
         free(g_keystone.mesh_points);
         g_keystone.mesh_points = NULL;
     }
+}
+
+void cleanup_keystone_resources(void) {
+    // Clean up mesh resources
+    cleanup_mesh_resources();
+    
+    // Clean up OpenGL resources
+    if (g_keystone_vertex_buffer) {
+        glDeleteBuffers(1, &g_keystone_vertex_buffer);
+        g_keystone_vertex_buffer = 0;
+    }
+    
+    if (g_keystone_shader_program) {
+        glDeleteProgram(g_keystone_shader_program);
+        g_keystone_shader_program = 0;
+    }
+    
+    if (g_keystone_vertex_shader) {
+        glDeleteShader(g_keystone_vertex_shader);
+        g_keystone_vertex_shader = 0;
+    }
+    
+    if (g_keystone_fragment_shader) {
+        glDeleteShader(g_keystone_fragment_shader);
+        g_keystone_fragment_shader = 0;
+    }
+    
+    // Reset keystone state
+    g_keystone.initialized = false;
 }
 
 void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
