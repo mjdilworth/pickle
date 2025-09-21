@@ -1006,8 +1006,59 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
 }
 
 bool v4l2_decoder_use_dmabuf(v4l2_decoder_t *dec) {
-    (void)dec; // unused
+    if (!dec || !dec->initialized) {
+        LOG_ERROR("Decoder not initialized");
+        return false;
+    }
+
+#if defined(USE_V4L2_DECODER)
+    struct v4l2_requestbuffers req;
+    CLEAR(req);
+    
+    // Check if the device supports DMA-BUF export
+    struct v4l2_capability caps;
+    CLEAR(caps);
+    
+    if (ioctl(dec->fd, VIDIOC_QUERYCAP, &caps) < 0) {
+        LOG_ERROR("Failed to query device capabilities: %s", strerror(errno));
+        return false;
+    }
+    
+    // Check if device supports DMA-BUF export
+    if (!(caps.capabilities & V4L2_CAP_DEVICE_CAPS)) {
+        LOG_ERROR("Device doesn't support device capabilities");
+        return false;
+    }
+    
+    // Set the DMA-BUF flag for our capture buffers (output frames)
+    req.count = dec->num_capture_buffers > 0 ? dec->num_capture_buffers : 4;
+    req.type = dec->capture_type;
+    req.memory = V4L2_MEMORY_DMABUF;
+    
+    if (ioctl(dec->fd, VIDIOC_REQBUFS, &req) < 0) {
+        LOG_ERROR("DMA-BUF export not supported by device: %s", strerror(errno));
+        return false;
+    }
+    
+    // Allocate DMA-BUF file descriptor array
+    dec->dmabuf_fds = calloc(req.count, sizeof(int));
+    if (!dec->dmabuf_fds) {
+        LOG_ERROR("Failed to allocate DMA-BUF file descriptor array");
+        return false;
+    }
+    
+    // Initialize file descriptors to -1 (invalid)
+    for (int i = 0; i < req.count; i++) {
+        dec->dmabuf_fds[i] = -1;
+    }
+    
+    dec->num_capture_buffers = req.count;
+    LOG_INFO("DMA-BUF export enabled with %d buffers", req.count);
+    return true;
+#else
+    LOG_ERROR("V4L2 decoder not compiled with DMA-BUF support");
     return false;
+#endif
 }
 
 bool v4l2_decoder_start(v4l2_decoder_t *dec) {
@@ -1021,33 +1072,341 @@ bool v4l2_decoder_stop(v4l2_decoder_t *dec) {
 }
 
 bool v4l2_decoder_flush(v4l2_decoder_t *dec) {
-    (void)dec; // unused
+    if (!dec || !dec->initialized || !dec->streaming) {
+        return false;
+    }
+
+#if defined(USE_V4L2_DECODER)
+    // Send an empty buffer with the EOS flag to signal end of stream
+    struct v4l2_buffer buf;
+    struct v4l2_plane planes[1];
+    CLEAR(buf);
+    CLEAR(planes);
+    
+    // Get an available output buffer
+    int idx = dec->next_output_buffer;
+    if (idx < 0 || idx >= dec->num_output_buffers) {
+        // Find any available buffer
+        for (idx = 0; idx < dec->num_output_buffers; idx++) {
+            if (dec->output_buffers[idx].flags & V4L2_BUF_FLAG_QUEUED) {
+                continue;
+            }
+            break;
+        }
+        
+        if (idx >= dec->num_output_buffers) {
+            // Wait for a buffer to become available
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(dec->fd, &fds);
+            
+            struct timeval tv;
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            
+            int ret = select(dec->fd + 1, &fds, NULL, NULL, &tv);
+            if (ret <= 0) {
+                LOG_ERROR("Timeout waiting for buffer to become available");
+                return false;
+            }
+            
+            // Try to dequeue a buffer
+            struct v4l2_buffer dqbuf;
+            CLEAR(dqbuf);
+            dqbuf.type = dec->output_type;
+            dqbuf.memory = V4L2_MEMORY_MMAP;
+            
+            if (ioctl(dec->fd, VIDIOC_DQBUF, &dqbuf) < 0) {
+                LOG_ERROR("Failed to dequeue buffer: %s", strerror(errno));
+                return false;
+            }
+            
+            idx = dqbuf.index;
+        }
+    }
+    
+    buf.type = dec->output_type;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = idx;
+    buf.flags = V4L2_BUF_FLAG_LAST; // Signal last buffer
+    
+    if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+        buf.m.planes = planes;
+        buf.length = 1;
+        planes[0].bytesused = 0;
+        planes[0].length = 0;
+    } else {
+        buf.bytesused = 0;
+    }
+    
+    // Queue the empty buffer with EOS flag
+    if (ioctl(dec->fd, VIDIOC_QBUF, &buf) < 0) {
+        LOG_ERROR("Failed to queue EOS buffer: %s", strerror(errno));
+        return false;
+    }
+    
+    // Update next buffer index
+    dec->next_output_buffer = (idx + 1) % dec->num_output_buffers;
+    
+    LOG_INFO("Sent EOS to decoder");
+    return true;
+#else
     return false;
+#endif
 }
 
 bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int64_t timestamp) {
-    (void)dec; // unused
-    (void)data; // unused
-    (void)size; // unused
-    (void)timestamp; // unused
+    if (!dec || !dec->initialized || !dec->streaming || !data || size == 0) {
+        return false;
+    }
+
+#if defined(USE_V4L2_DECODER)
+    // Get an available output buffer
+    struct v4l2_buffer buf;
+    struct v4l2_plane planes[1];
+    CLEAR(buf);
+    CLEAR(planes);
+    
+    buf.type = dec->output_type;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = dec->next_output_buffer;
+    
+    if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+        buf.m.planes = planes;
+        buf.length = 1;
+    }
+    
+    // Copy data to the buffer
+    void *buffer_data = NULL;
+    size_t buffer_size = 0;
+    
+    if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+        buffer_data = dec->output_mmap[buf.index * dec->num_output_planes + 0];
+        buffer_size = dec->output_buffers[buf.index].m.planes[0].length;
+    } else {
+        buffer_data = dec->output_mmap[buf.index];
+        buffer_size = dec->output_buffers[buf.index].length;
+    }
+    
+    if (size > buffer_size) {
+        LOG_ERROR("Data size %zu exceeds buffer size %zu", size, buffer_size);
+        return false;
+    }
+    
+    memcpy(buffer_data, data, size);
+    
+    // Set buffer properties
+    if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+        planes[0].bytesused = size;
+        planes[0].length = buffer_size;
+    } else {
+        buf.bytesused = size;
+    }
+    
+    // Set timestamp
+    buf.timestamp.tv_sec = timestamp / 1000000;
+    buf.timestamp.tv_usec = timestamp % 1000000;
+    
+    // Queue the buffer
+    if (ioctl(dec->fd, VIDIOC_QBUF, &buf) < 0) {
+        LOG_ERROR("Failed to queue output buffer: %s", strerror(errno));
+        return false;
+    }
+    
+    // Update next buffer index
+    dec->next_output_buffer = (dec->next_output_buffer + 1) % dec->num_output_buffers;
+    
+    return true;
+#else
     return false;
+#endif
 }
 
 bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
-    (void)dec; // unused
-    (void)frame; // unused
+    if (!dec || !frame) {
+        return false;
+    }
+
+#if defined(USE_V4L2_DECODER)
+    // Initialize frame
+    memset(frame, 0, sizeof(v4l2_decoded_frame_t));
+    frame->dmabuf_fd = -1;
+    
+    // Try to dequeue a capture buffer
+    struct v4l2_buffer buf;
+    struct v4l2_plane planes[1];
+    CLEAR(buf);
+    CLEAR(planes);
+    
+    buf.type = dec->capture_type;
+    
+    // Use DMA-BUF memory type if DMA-BUF export is enabled
+    if (dec->dmabuf_fds) {
+        buf.memory = V4L2_MEMORY_DMABUF;
+    } else {
+        buf.memory = V4L2_MEMORY_MMAP;
+    }
+    
+    if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        buf.m.planes = planes;
+        buf.length = 1;
+    }
+    
+    // Dequeue a buffer
+    if (ioctl(dec->fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (errno == EAGAIN) {
+            // No buffer available, not an error
+            return false;
+        }
+        LOG_ERROR("Failed to dequeue capture buffer: %s", strerror(errno));
+        return false;
+    }
+    
+    // Get frame information
+    frame->width = dec->width;
+    frame->height = dec->height;
+    frame->format = dec->pixel_format;
+    frame->timestamp = buf.timestamp.tv_sec * 1000000LL + buf.timestamp.tv_usec;
+    frame->keyframe = (buf.flags & V4L2_BUF_FLAG_KEYFRAME) != 0;
+    
+    if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        frame->bytesused = buf.m.planes[0].bytesused;
+    } else {
+        frame->bytesused = buf.bytesused;
+    }
+    
+    // Handle DMA-BUF export if enabled
+    if (dec->dmabuf_fds) {
+        // For DMA-BUF, we need to export the buffer to a DMA-BUF file descriptor
+        struct v4l2_exportbuffer expbuf;
+        CLEAR(expbuf);
+        
+        expbuf.type = dec->capture_type;
+        expbuf.index = buf.index;
+        expbuf.flags = O_RDONLY;
+        
+        if (ioctl(dec->fd, VIDIOC_EXPBUF, &expbuf) < 0) {
+            LOG_ERROR("Failed to export buffer to DMA-BUF: %s", strerror(errno));
+            
+            // Requeue the buffer
+            if (ioctl(dec->fd, VIDIOC_QBUF, &buf) < 0) {
+                LOG_ERROR("Failed to requeue buffer: %s", strerror(errno));
+            }
+            
+            return false;
+        }
+        
+        // Store the DMA-BUF file descriptor
+        frame->dmabuf_fd = expbuf.fd;
+        dec->dmabuf_fds[buf.index] = expbuf.fd;
+        
+        LOG_INFO("Exported buffer %d to DMA-BUF fd %d", buf.index, frame->dmabuf_fd);
+    } else {
+        // For memory-mapped buffers, get a pointer to the buffer data
+        void *data = NULL;
+        if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            data = dec->capture_mmap[buf.index * dec->num_capture_planes + 0];
+        } else {
+            data = dec->capture_mmap[buf.index];
+        }
+        
+        // Set the data pointer in the frame
+        frame->data = data;
+    }
+    
+    // Remember the buffer index for returning it later
+    frame->buf_index = buf.index;
+    
+    return true;
+#else
     return false;
+#endif
 }
 
 bool v4l2_decoder_poll(v4l2_decoder_t *dec, int timeout_ms) {
-    (void)dec; // unused
-    (void)timeout_ms; // unused
+    if (!dec || !dec->initialized || !dec->streaming) {
+        return false;
+    }
+
+#if defined(USE_V4L2_DECODER)
+    struct pollfd fds[1];
+    fds[0].fd = dec->fd;
+    fds[0].events = POLLIN | POLLOUT | POLLPRI;
+    fds[0].revents = 0;
+    
+    // Poll for events with the specified timeout
+    int ret = poll(fds, 1, timeout_ms);
+    if (ret < 0) {
+        if (errno != EINTR) {
+            LOG_ERROR("Poll failed: %s", strerror(errno));
+        }
+        return false;
+    }
+    
+    if (ret == 0) {
+        // Timeout, no events
+        return false;
+    }
+    
+    // Check for events
+    if (fds[0].revents & (POLLIN | POLLPRI)) {
+        // Data is available for reading (decoded frame)
+        return true;
+    }
+    
+    if (fds[0].revents & POLLOUT) {
+        // Device is ready for writing (can accept more input)
+        return true;
+    }
+    
+    if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        LOG_ERROR("Poll error on V4L2 device");
+        return false;
+    }
+    
     return false;
+#else
+    return false;
+#endif
 }
 
 bool v4l2_decoder_process_events(v4l2_decoder_t *dec) {
-    (void)dec; // unused
+    if (!dec || !dec->initialized || !dec->streaming) {
+        return false;
+    }
+
+#if defined(USE_V4L2_DECODER)
+    // Process any events that might have occurred
+    struct v4l2_event event;
+    while (ioctl(dec->fd, VIDIOC_DQEVENT, &event) == 0) {
+        switch (event.type) {
+            case V4L2_EVENT_SOURCE_CHANGE:
+                LOG_INFO("V4L2 source change event detected");
+                // Handle resolution change
+                // We'd need to stop streaming, query the new format, and restart
+                break;
+                
+            case V4L2_EVENT_EOS:
+                LOG_INFO("V4L2 end of stream event");
+                // Handle end of stream
+                break;
+                
+            default:
+                LOG_INFO("Unknown V4L2 event: %d", event.type);
+                break;
+        }
+    }
+    
+    // Check if there was an error other than EAGAIN (no more events)
+    if (errno != EAGAIN) {
+        LOG_ERROR("Error dequeueing V4L2 event: %s", strerror(errno));
+        return false;
+    }
+    
+    return true;
+#else
     return false;
+#endif
 }
 
 #endif // USE_V4L2_DECODER

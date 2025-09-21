@@ -210,7 +210,7 @@ bool init_drm(kms_ctx_t *d) {
     if (init_atomic_modesetting(d)) {
         LOG_INFO("Atomic modesetting initialized successfully");
     } else {
-        LOG_INFO("Using legacy modesetting (no atomic support)");
+        LOG_DEBUG("Using legacy modesetting (no atomic support)");
     }
     
     LOG_DRM("Using card with fd=%d connector=%u mode=%s %ux%u@%u", 

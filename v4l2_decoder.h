@@ -34,6 +34,8 @@ typedef struct {
     uint32_t flags;         // Buffer flags
     int64_t timestamp;      // Timestamp in microseconds
     bool keyframe;          // Whether this is a keyframe
+    void *data;             // Pointer to memory-mapped frame data (NULL if using DMA-BUF)
+    int buf_index;          // Buffer index for returning to decoder
 } v4l2_decoded_frame_t;
 
 // Callback for decoded frames

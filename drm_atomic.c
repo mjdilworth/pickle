@@ -105,7 +105,7 @@ bool init_atomic_modesetting(kms_ctx_t *d) {
     // Check if atomic modesetting is supported
     uint64_t cap = 0;
     if (drmGetCap(d->fd, DRM_CAP_ATOMIC, &cap) < 0 || !cap) {
-        LOG_INFO("Atomic modesetting not supported by DRM driver");
+        LOG_ERROR("Atomic modesetting not supported by DRM driver - zero-copy performance will be limited");
         d->atomic_supported = false;
         return false;
     }

@@ -310,7 +310,7 @@ bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
     if (init_dmabuf_extension(e)) {
         LOG_INFO("DMA-BUF zero-copy path initialized successfully");
     } else {
-        LOG_INFO("DMA-BUF support not available, using standard path");
+        LOG_ERROR("DMA-BUF support not available, zero-copy disabled");
     }
         
     return true;

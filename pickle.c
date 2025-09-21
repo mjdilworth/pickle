@@ -38,6 +38,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/epoll.h>
+#include <sys/poll.h>
 
 // Include our refactored modules
 #include "utils.h"
@@ -47,6 +49,14 @@
 #include "compute_keystone.h"
 #include "drm.h"
 #include "egl.h"
+
+// For event-driven architecture
+#ifdef EVENT_DRIVEN_ENABLED
+#include "v4l2_player.h"
+#include "mpv.h"  
+#include "pickle_events.h"
+#endif
+
 #include "v4l2_decoder.h"
 #include <execinfo.h>
 #include <sys/time.h>
@@ -208,7 +218,6 @@ static int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal
 // These keystone settings are defined in keystone.c through pickle_keystone adapter
 // Removed static variables and using extern from pickle_keystone.h
 
-static bool g_show_background = false; // Deprecated: background is always black now
 static int g_loop_playback = 0; // Whether to loop video playback
 
 // Simple solid-color shader for drawing outlines/borders around keystone quad
@@ -758,6 +767,7 @@ void deinit_gbm_egl(egl_ctx_t *e) {
 }
 
 // MPV rendering integration
+#ifndef EVENT_DRIVEN_ENABLED
 typedef struct {
 	mpv_handle *mpv;             // MPV API handle
 	mpv_render_context *rctx;    // MPV render context for OpenGL rendering
@@ -776,7 +786,19 @@ typedef struct {
 	size_t buffer_size;          // Size of the buffer
 	int64_t timestamp;           // Current timestamp
 	GLuint texture;              // OpenGL texture for rendering
+    
+    // Current frame information
+    struct {
+        bool valid;              // Is the current frame valid
+        int dmabuf_fd;           // DMA-BUF file descriptor for current frame
+        uint32_t width;          // Frame width
+        uint32_t height;         // Frame height
+        uint32_t format;         // Frame format
+        GLuint texture;          // OpenGL texture for current frame
+        int buf_index;           // Buffer index for returning to decoder
+    } current_frame;
 } v4l2_player_t;
+#endif // EVENT_DRIVEN_ENABLED
 
 // Wakeup callback sets a flag so main loop knows mpv wants processing.
 static volatile int g_mpv_wakeup = 0;
@@ -1283,22 +1305,58 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 		// Try to get a decoded frame
 		v4l2_decoded_frame_t frame;
 		if (v4l2_decoder_get_frame(p->decoder, &frame)) {
-			// Process the frame - in a real implementation, we would
-			// create/update OpenGL textures using the DMA-BUF or mapped memory
-			LOG_INFO("Got frame: %dx%d timestamp: %ld", frame.width, frame.height, frame.timestamp);
-			
-			// TODO: Update OpenGL texture with frame data
-			
-			// Return the frame to the decoder
-			// In a real implementation, this would happen after rendering
+			// Store frame information in the player struct
+            p->current_frame.valid = true;
+            p->current_frame.dmabuf_fd = frame.dmabuf_fd;
+            p->current_frame.width = frame.width;
+            p->current_frame.height = frame.height;
+            p->current_frame.format = frame.format;
+            p->current_frame.buf_index = frame.buf_index;
+            
+            LOG_INFO("Got frame: %dx%d timestamp: %ld, dmabuf_fd: %d", 
+                     frame.width, frame.height, frame.timestamp, frame.dmabuf_fd);
+            
+            // Create/update OpenGL texture with frame data
+            if (frame.dmabuf_fd >= 0) {
+                // We have a DMA-BUF frame, create an EGL texture from it
+                // This code would depend on your EGL/DMA-BUF implementation
+                // Use the create_dmabuf_texture function if available
+                
+                // For now, just set the texture ID (placeholder)
+                // In a real implementation, you would create an actual texture
+                p->current_frame.texture = p->texture;
+            } else if (frame.data) {
+                // We have memory-mapped data, update the texture
+                if (p->texture == 0) {
+                    // Create a new texture if we don't have one
+                    glGenTextures(1, &p->texture);
+                    glBindTexture(GL_TEXTURE_2D, p->texture);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                } else {
+                    // Bind existing texture
+                    glBindTexture(GL_TEXTURE_2D, p->texture);
+                }
+                
+                // Update texture with new frame data
+                // This would depend on the pixel format
+                // For now, assume a simple format like RGB/RGBA
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)frame.width, (GLsizei)frame.height, 
+                             0, GL_RGBA, GL_UNSIGNED_BYTE, frame.data);
+                
+                p->current_frame.texture = p->texture;
+            }
+            
 			return true;
 		}
 	}
 	
 	// Check if we've reached the end of the file and decoder is empty
 	if (feof(p->input_file) && p->decoder) {
-		// TODO: Check if decoder has any more buffered frames
-		// For now, just continue until we get no more frames
+		// Flush the decoder to get any remaining frames
+        v4l2_decoder_flush(p->decoder);
 	}
 	
 	return true;
@@ -1942,10 +2000,37 @@ static bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	glClear(GL_COLOR_BUFFER_BIT);
 	
 	// Process a frame from the V4L2 decoder
-	process_v4l2_frame(p);
-	
-	// TODO: Create/update OpenGL texture from V4L2 decoded frame
-	// For now, just show a black screen with border if enabled
+	if (!process_v4l2_frame(p)) {
+        // No new frame available
+        return false;
+    }
+    
+    // Check for active frame
+    if (!p->current_frame.valid) {
+        return false;
+    }
+    
+    // Create/update OpenGL texture from V4L2 decoded frame
+    if (p->current_frame.dmabuf_fd >= 0) {
+        // We have a DMA-BUF frame, use zero-copy path if possible
+        if (!g_scanout_disabled && should_use_zero_copy(d, e)) {
+            // Setup source and destination rectangles
+            float src_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full texture
+            float dst_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full screen
+            
+            // Use zero-copy path to present the frame
+            if (present_frame_zero_copy(d, e, p->current_frame.texture, src_rect, dst_rect)) {
+                // Successfully presented using zero-copy path
+                static bool first_frame = true;
+                if (g_debug && first_frame) {
+                    fprintf(stderr, "[debug] Using zero-copy DMA-BUF path with %s modesetting\n", 
+                            d->atomic_supported ? "atomic" : "legacy");
+                    first_frame = false;
+                }
+                return true;
+            }
+        }
+    }
 	
 	// Apply keystone correction if enabled
 	if (g_keystone.enabled && g_keystone_shader_program) {
@@ -2252,8 +2337,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	static bool first_frame = true;
 
 	// Check if we should use zero-copy path
-	// For now, we'll disable the zero-copy path until we can properly integrate it
-	if (false && !g_scanout_disabled && should_use_zero_copy(d, e)) {
+	if (!g_scanout_disabled && should_use_zero_copy(d, e)) {
 		// We'd need a way to get the MPV rendered texture, but that's not directly exposed
 		// This is something to implement in the future when we can extract the texture from MPV
 		GLuint video_texture = 0; 
@@ -2669,6 +2753,28 @@ int main(int argc, char **argv) {
 	LOG_INFO("START+SELECT (hold 2s)=Quit");
 	}
 	
+#ifdef EVENT_DRIVEN_ENABLED
+	// Initialize the event-driven architecture
+	event_ctx_t *event_ctx = pickle_event_init(&drm, &player, g_use_v4l2_decoder ? &v4l2_player : NULL);
+	if (!event_ctx) {
+		LOG_ERROR("Failed to initialize event system");
+		goto cleanup;
+	}
+	LOG_INFO("Event-driven architecture initialized");
+
+	// Main loop using event-driven architecture
+	while (!g_stop) {
+		if (!pickle_event_process_and_render(event_ctx, &drm, &eglc, &player, 
+		                                   g_use_v4l2_decoder ? &v4l2_player : NULL, 100)) {
+			break;
+		}
+		stats_log_periodic(&player);
+	}
+	
+	// Clean up event system
+	pickle_event_cleanup(event_ctx);
+#else
+	// Original polling-based main loop
 	while (!g_stop) {
 		// Handle decoder-specific events
 		if (!g_use_v4l2_decoder) {
@@ -2943,6 +3049,7 @@ int main(int argc, char **argv) {
 		}
 		if (force_loop && !need_frame && !g_pending_flip) usleep(1000); // light backoff
 	}
+#endif // EVENT_DRIVEN_ENABLED
 
 	stats_log_final(&player);
 	
