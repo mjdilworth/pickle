@@ -88,6 +88,14 @@ if [ ! -f "$VIDEO" ]; then
     exit 1
 fi
 
+# Check for required commands
+for cmd in timeout top grep; do
+    if ! command -v $cmd &> /dev/null; then
+        echo "Error: Required command '$cmd' not found"
+        exit 1
+    fi
+done
+
 # Create temp directory for results
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
@@ -99,10 +107,23 @@ echo "=========================" >> $RESULTS_FILE
 echo "Video: $VIDEO" >> $RESULTS_FILE
 echo "Date: $(date)" >> $RESULTS_FILE
 echo "System: $(uname -a)" >> $RESULTS_FILE
-echo "CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d ':' -f 2)" >> $RESULTS_FILE
+echo "CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d ':' -f 2 || echo 'Unknown')" >> $RESULTS_FILE
 echo "RAM: $(free -h | grep Mem | awk '{print $2}')" >> $RESULTS_FILE
 echo "=========================" >> $RESULTS_FILE
 echo "" >> $RESULTS_FILE
+
+# Add top monitoring function
+monitor_process() {
+    local pid=$1
+    local output_file=$2
+    local duration=$3
+    
+    # Sample CPU usage every second
+    for ((i=1; i<=$duration; i++)); do
+        top -b -n 1 -p $pid | grep $pid >> "$output_file" || true
+        sleep 1
+    done
+}
 
 run_test() {
     local test_name="$1"
@@ -117,29 +138,56 @@ run_test() {
     for ((i=1; i<=$TESTS; i++)); do
         echo "  Iteration $i/$TESTS..."
         
-        # Create output file for this test
+        # Create output files for this test
         OUT_FILE="$TEMP_DIR/test_${i}.txt"
+        CPU_FILE="$TEMP_DIR/cpu_${i}.txt"
         
-        # Use timeout to limit test duration
-        # Use time to measure CPU usage
+        # Start pickle in background
         if [ -n "$cmd_prefix" ]; then
-            /usr/bin/time -f "real %e user %U sys %S cpu %P" \
-                timeout $DURATION $cmd_prefix $env_vars ./pickle $VIDEO > $OUT_FILE 2>&1 || true
+            eval "$cmd_prefix $env_vars ./pickle $VIDEO > $OUT_FILE 2>&1 &"
         else
-            /usr/bin/time -f "real %e user %U sys %S cpu %P" \
-                timeout $DURATION $env_vars ./pickle $VIDEO > $OUT_FILE 2>&1 || true
+            eval "$env_vars ./pickle $VIDEO > $OUT_FILE 2>&1 &"
+        fi
+        PICKLE_PID=$!
+        
+        # Monitor CPU usage
+        monitor_process $PICKLE_PID $CPU_FILE $DURATION &
+        MONITOR_PID=$!
+        
+        # Wait for monitoring to complete
+        wait $MONITOR_PID
+        
+        # Kill pickle if still running
+        kill $PICKLE_PID 2>/dev/null || true
+        wait $PICKLE_PID 2>/dev/null || true
+        
+        # Calculate average CPU usage
+        if [ -s "$CPU_FILE" ]; then
+            CPU_SUM=0
+            CPU_COUNT=0
+            while read line; do
+                CPU_USAGE=$(echo $line | awk '{print $9}')
+                CPU_SUM=$(echo "$CPU_SUM + $CPU_USAGE" | bc)
+                CPU_COUNT=$((CPU_COUNT + 1))
+            done < "$CPU_FILE"
+            
+            if [ $CPU_COUNT -gt 0 ]; then
+                AVG_CPU=$(echo "scale=1; $CPU_SUM / $CPU_COUNT" | bc)
+                echo "  Average CPU: ${AVG_CPU}%"
+                echo "Average CPU: ${AVG_CPU}%" >> $RESULTS_FILE
+            fi
         fi
         
-        # Extract CPU usage from time output
-        CPU_USAGE=$(grep "cpu" $OUT_FILE | tail -1)
-        echo "  Iteration $i: $CPU_USAGE"
-        echo "Iteration $i: $CPU_USAGE" >> $RESULTS_FILE
+        # Count frames rendered (if log contains this info)
+        FRAMES=$(grep -c "rendered frame" $OUT_FILE || echo "N/A")
+        echo "  Frames rendered: $FRAMES"
+        echo "Frames rendered: $FRAMES" >> $RESULTS_FILE
         
-        # Extract frame stats if available
-        if grep -q "Average FPS" $OUT_FILE; then
-            FPS=$(grep "Average FPS" $OUT_FILE | tail -1)
-            echo "  $FPS"
-            echo "$FPS" >> $RESULTS_FILE
+        # Calculate approximate FPS
+        if [ "$FRAMES" != "N/A" ] && [ $FRAMES -gt 0 ]; then
+            FPS=$(echo "scale=1; $FRAMES / $DURATION" | bc)
+            echo "  Approximate FPS: $FPS"
+            echo "Approximate FPS: $FPS" >> $RESULTS_FILE
         fi
         
         # Add separator between iterations
@@ -152,33 +200,33 @@ run_test() {
 }
 
 # Run baseline test
-run_test "Baseline" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1" ""
+run_test "Baseline" "PICKLE_DEBUG=1" ""
 
 # Run with frame skip optimization
-run_test "Frame Skip" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1 PICKLE_SKIP_UNCHANGED=1" ""
+run_test "Frame Skip" "PICKLE_DEBUG=1 PICKLE_SKIP_UNCHANGED=1" ""
 
 # Run with direct rendering
-run_test "Direct Rendering" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1 PICKLE_DIRECT_RENDERING=1" ""
+run_test "Direct Rendering" "PICKLE_DEBUG=1 PICKLE_DIRECT_RENDERING=1" ""
 
 # Run with disabled keystone
-run_test "Disabled Keystone" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1 PICKLE_DISABLE_KEYSTONE=1" ""
+run_test "Disabled Keystone" "PICKLE_DEBUG=1 PICKLE_DISABLE_KEYSTONE=1" ""
 
 # Run with all optimizations
-run_test "All Optimizations" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_DISABLE_KEYSTONE=1" ""
+run_test "All Optimizations" "PICKLE_DEBUG=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_DISABLE_KEYSTONE=1" ""
 
 # Run with CPU affinity if requested
 if [ $AFFINITY -eq 1 ]; then
-    run_test "CPU Affinity" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_DISABLE_KEYSTONE=1 PICKLE_CPU_AFFINITY=2,3" ""
+    run_test "CPU Affinity" "PICKLE_DEBUG=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_DISABLE_KEYSTONE=1 PICKLE_CPU_AFFINITY=2,3" ""
 fi
 
 # Run with priority if requested
 if [ $PRIORITY -eq 1 ]; then
-    run_test "Real-time Priority" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_DISABLE_KEYSTONE=1 PICKLE_PRIORITY=10" "sudo"
+    run_test "Real-time Priority" "PICKLE_DEBUG=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_DISABLE_KEYSTONE=1 PICKLE_PRIORITY=10" "sudo"
 fi
 
 # Run with keystone if requested
 if [ $KEYSTONE -eq 1 ]; then
-    run_test "With Keystone" "PICKLE_STATS=1 PICKLE_FRAME_TIMING=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_KEYSTONE=1" ""
+    run_test "With Keystone" "PICKLE_DEBUG=1 PICKLE_SKIP_UNCHANGED=1 PICKLE_DIRECT_RENDERING=1 PICKLE_KEYSTONE=1" ""
 fi
 
 # Display summary
