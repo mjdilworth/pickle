@@ -1,4 +1,4 @@
-pickle.o: pickle.c utils.h shader.h keystone.h drm.h egl.h
+pickle.o: pickle.c utils.h shader.h keystone.h drm.h egl.h v4l2_decoder.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
 keystone.o: keystone.c keystone.h utils.h shader.h
@@ -19,3 +19,5 @@ frame_pacing.o: frame_pacing.c frame_pacing.h error.h utils.h
 render.o: render.c render.h drm.h egl.h error.h frame_pacing.h keystone.h \
  utils.h mpv.h
 mpv.o: mpv.c mpv.h error.h utils.h
+dispmanx.o: dispmanx.c dispmanx.h log.h egl.h drm.h
+v4l2_decoder.o: v4l2_decoder.c v4l2_decoder.h log.h

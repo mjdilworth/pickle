@@ -12,9 +12,9 @@
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c drm.c drm_atomic.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c drm.c drm_atomic.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c dispmanx.c v4l2_decoder.c
 OBJECTS  := $(SOURCES:.c=.o)
-HEADERS  := utils.h shader.h keystone.h drm.h egl.h input.h error.h frame_pacing.h render.h mpv.h
+HEADERS  := utils.h shader.h keystone.h drm.h egl.h input.h error.h frame_pacing.h render.h mpv.h dispmanx.h v4l2_decoder.h
 
 # Toolchain / standards
 CROSS   ?=
@@ -31,7 +31,7 @@ LTO     ?= 0
 NO_MPV  ?= 0   # build with -DPICKLE_NO_MPV_DEFAULT so runtime can skip mpv init
 PERF    ?= 0   # high-performance build tweaks (e.g. make PERF=1)
 
-PKGS       := mpv gbm egl glesv2 libdrm
+PKGS       := mpv gbm egl glesv2 libdrm libv4l2
 
 # Allow overriding pkg-config binary
 PKG_CONFIG ?= pkg-config
@@ -44,7 +44,7 @@ LDFLAGS ?=
 
 # If pkg-config fails, fall back to a reasonable default library set
 ifeq ($(strip $(PKG_LIBS)),)
-LIBS     := -lmpv -lgbm -lEGL -lGLESv2 -ldrm -lpthread -lm
+LIBS     := -lmpv -lgbm -lEGL -lGLESv2 -ldrm -lv4l2 -lpthread -lm
 else
 LIBS     := $(PKG_LIBS) -lpthread -lm
 endif
@@ -79,7 +79,8 @@ ifeq ($(RPI4_OPT),1)
 	# Cortex-A72 specific flags for RPi4
 	CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
-	CFLAGS += -DRPI4_OPTIMIZED=1
+	CFLAGS += -DRPI4_OPTIMIZED=1 -DDISPMANX_ENABLED=1 -DUSE_V4L2_DECODER=1
+	LIBS += -lbcm_host
 endif
 
 # Maximum performance mode (combines all optimizations)
@@ -104,7 +105,7 @@ ifeq ($(RPI4_OPT),1)
 	# Cortex-A72 specific flags for RPi4
 	CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
-	CFLAGS += -DRPI4_OPTIMIZED=1
+	CFLAGS += -DRPI4_OPTIMIZED=1 -DDISPMANX_ENABLED=1 -DUSE_V4L2_DECODER=1
 endif
 
 # Maximum performance mode (combines all optimizations)
@@ -186,7 +187,7 @@ uninstall:
 
 deps:
 	@echo "Debian/RPi OS packages:"; \
-	echo "  sudo apt install libmpv-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev pkg-config build-essential"; \
+	echo "  sudo apt install libmpv-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libv4l-dev pkg-config build-essential"; \
 	echo "Optional: seatd for rootless DRM, clang, mold (linker)"
 
 help:

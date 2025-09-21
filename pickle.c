@@ -45,6 +45,7 @@
 #include "keystone.h"
 #include "drm.h"
 #include "egl.h"
+#include "v4l2_decoder.h"
 #include <execinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -200,6 +201,7 @@ typedef struct fb_ring_entry fb_ring_entry_t;
 // Global state 
 static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
+static int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
 
 // These keystone settings are defined in keystone.c through pickle_keystone adapter
 // Removed static variables and using extern from pickle_keystone.h
@@ -760,6 +762,20 @@ typedef struct {
 	int using_libmpv;            // Flag indicating fallback to vo=libmpv occurred
 } mpv_player_t;
 
+// V4L2 decoder integration
+typedef struct {
+	v4l2_decoder_t *decoder;     // V4L2 decoder instance
+	v4l2_codec_t codec;          // Codec being used
+	uint32_t width;              // Video width
+	uint32_t height;             // Video height
+	int is_active;               // Flag indicating decoder is active
+	FILE *input_file;            // Input file handle
+	uint8_t *buffer;             // Buffer for reading file data
+	size_t buffer_size;          // Size of the buffer
+	int64_t timestamp;           // Current timestamp
+	GLuint texture;              // OpenGL texture for rendering
+} v4l2_player_t;
+
 // Wakeup callback sets a flag so main loop knows mpv wants processing.
 static volatile int g_mpv_wakeup = 0;
 static int g_mpv_pipe[2] = {-1,-1}; // pipe to integrate mpv wakeups into poll loop
@@ -1115,6 +1131,175 @@ static void destroy_mpv(mpv_player_t *p) {
 		mpv_terminate_destroy(p->mpv);
 		p->mpv = NULL;
 	}
+}
+
+/**
+ * Initialize the V4L2 decoder
+ * 
+ * @param p Pointer to V4L2 player structure
+ * @param file Path to the video file to play
+ * @return true if initialization succeeded, false otherwise
+ */
+static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
+	if (!p) return false;
+	
+	// Check if V4L2 decoder is supported
+	if (!v4l2_decoder_is_supported()) {
+		LOG_ERROR("V4L2 decoder is not supported on this platform");
+		return false;
+	}
+	
+	// Allocate the decoder
+	p->decoder = malloc(sizeof(v4l2_decoder_t));
+	if (!p->decoder) {
+		LOG_ERROR("Failed to allocate V4L2 decoder");
+		return false;
+	}
+	
+	// Open the input file
+	p->input_file = fopen(file, "rb");
+	if (!p->input_file) {
+		LOG_ERROR("Failed to open input file: %s", file);
+		free(p->decoder);
+		p->decoder = NULL;
+		return false;
+	}
+	
+	// For now, assume H.264 codec - we would need to parse the file header to determine this
+	p->codec = V4L2_CODEC_H264;
+	p->width = 1920;  // Default values, will be updated after parsing
+	p->height = 1080;
+	
+	// Initialize the decoder
+	if (!v4l2_decoder_init(p->decoder, p->codec, p->width, p->height)) {
+		LOG_ERROR("Failed to initialize V4L2 decoder");
+		fclose(p->input_file);
+		free(p->decoder);
+		p->decoder = NULL;
+		return false;
+	}
+	
+	// Set up DMA-BUF for zero-copy
+	if (!v4l2_decoder_use_dmabuf(p->decoder)) {
+		LOG_WARN("DMA-BUF not supported, falling back to memory copy");
+	}
+	
+	// Allocate buffers
+	if (!v4l2_decoder_allocate_buffers(p->decoder, 8, 8)) {
+		LOG_ERROR("Failed to allocate V4L2 decoder buffers");
+		v4l2_decoder_destroy(p->decoder);
+		fclose(p->input_file);
+		free(p->decoder);
+		p->decoder = NULL;
+		return false;
+	}
+	
+	// Start the decoder
+	if (!v4l2_decoder_start(p->decoder)) {
+		LOG_ERROR("Failed to start V4L2 decoder");
+		v4l2_decoder_destroy(p->decoder);
+		fclose(p->input_file);
+		free(p->decoder);
+		p->decoder = NULL;
+		return false;
+	}
+	
+	// Allocate read buffer
+	p->buffer_size = 64 * 1024;  // 64KB buffer
+	p->buffer = malloc(p->buffer_size);
+	if (!p->buffer) {
+		LOG_ERROR("Failed to allocate read buffer");
+		v4l2_decoder_destroy(p->decoder);
+		fclose(p->input_file);
+		free(p->decoder);
+		p->decoder = NULL;
+		return false;
+	}
+	
+	p->timestamp = 0;
+	p->is_active = 1;
+	LOG_INFO("V4L2 decoder initialized successfully");
+	
+	return true;
+}
+
+/**
+ * Clean up V4L2 decoder resources
+ * 
+ * @param p Pointer to V4L2 player structure to clean up
+ */
+static void destroy_v4l2_decoder(v4l2_player_t *p) {
+	if (!p) return;
+	
+	if (p->buffer) {
+		free(p->buffer);
+		p->buffer = NULL;
+	}
+	
+	if (p->input_file) {
+		fclose(p->input_file);
+		p->input_file = NULL;
+	}
+	
+	if (p->decoder) {
+		v4l2_decoder_stop(p->decoder);
+		v4l2_decoder_destroy(p->decoder);
+		free(p->decoder);
+		p->decoder = NULL;
+	}
+	
+	p->is_active = 0;
+}
+
+/**
+ * Process one frame from the V4L2 decoder
+ * 
+ * @param p Pointer to V4L2 player structure
+ * @return true if processing should continue, false to stop playback
+ */
+static bool process_v4l2_frame(v4l2_player_t *p) {
+	if (!p || !p->is_active) return false;
+	
+	// Feed data to the decoder if needed
+	if (p->input_file && !feof(p->input_file)) {
+		// Read a chunk of data
+		size_t bytes_read = fread(p->buffer, 1, p->buffer_size, p->input_file);
+		if (bytes_read > 0) {
+			// Send to decoder
+			if (!v4l2_decoder_decode(p->decoder, p->buffer, bytes_read, p->timestamp)) {
+				LOG_ERROR("V4L2 decoder decode failed");
+			}
+			p->timestamp += 40000;  // Increment by 40ms (25fps)
+		}
+	}
+	
+	// Poll for decoded frames
+	if (v4l2_decoder_poll(p->decoder, 0)) {
+		// Process events
+		v4l2_decoder_process_events(p->decoder);
+		
+		// Try to get a decoded frame
+		v4l2_decoded_frame_t frame;
+		if (v4l2_decoder_get_frame(p->decoder, &frame)) {
+			// Process the frame - in a real implementation, we would
+			// create/update OpenGL textures using the DMA-BUF or mapped memory
+			LOG_INFO("Got frame: %dx%d timestamp: %ld", frame.width, frame.height, frame.timestamp);
+			
+			// TODO: Update OpenGL texture with frame data
+			
+			// Return the frame to the decoder
+			// In a real implementation, this would happen after rendering
+			return true;
+		}
+	}
+	
+	// Check if we've reached the end of the file and decoder is empty
+	if (feof(p->input_file) && p->decoder) {
+		// TODO: Check if decoder has any more buffered frames
+		// For now, just continue until we get no more frames
+	}
+	
+	return true;
 }
 
 static void drain_mpv_events(mpv_handle *h) {
@@ -1722,6 +1907,102 @@ void bo_destroy_handler(struct gbm_bo *bo, void *data) {
 	}
 }
 
+/**
+ * Render a frame using the V4L2 decoder
+ * 
+ * @param d Pointer to KMS context
+ * @param e Pointer to EGL context
+ * @param p Pointer to V4L2 player structure
+ * @return true if rendering succeeded, false otherwise
+ */
+static bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
+	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
+		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
+	}
+	
+	// Initialize keystone shader if needed and enabled
+	if (g_keystone.enabled && g_keystone_shader_program == 0) {
+		if (!init_keystone_shader()) {
+			LOG_ERROR("Failed to initialize keystone shader, disabling keystone correction");
+			g_keystone.enabled = false;
+		}
+	}
+	// Initialize border shader lazily if needed for border rendering
+	if (g_show_border && g_border_shader_program == 0) {
+		if (!init_border_shader()) {
+			LOG_WARN("Failed to initialize border shader; border will be disabled");
+			g_show_border = false;
+		}
+	}
+	
+	// Background is always black
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	
+	// Process a frame from the V4L2 decoder
+	process_v4l2_frame(p);
+	
+	// TODO: Create/update OpenGL texture from V4L2 decoded frame
+	// For now, just show a black screen with border if enabled
+	
+	// Apply keystone correction if enabled
+	if (g_keystone.enabled && g_keystone_shader_program) {
+		// Render keystone-corrected quad (similar to render_frame_fixed)
+		// For now, just rendering a black screen with keystone shape
+		glUseProgram(g_keystone_shader_program);
+		// Set keystone uniforms...
+	}
+	
+	// Swap buffers
+	if (!eglSwapBuffers(e->dpy, e->surf)) {
+		int err = eglGetError();
+		fprintf(stderr, "eglSwapBuffers failed (0x%x)\n", err); 
+		return false;
+	}
+	
+	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
+	if (!bo) {
+		fprintf(stderr, "gbm_surface_lock_front_buffer failed\n");
+		return false;
+	}
+	
+	// Get framebuffer ID associated with the buffer object
+	uint32_t fb_id = 0;
+	for (int i = 0; i < g_fb_ring.count; i++) {
+		if (g_fb_ring.entries[i].bo == bo) {
+			fb_id = g_fb_ring.entries[i].fb_id;
+			break;
+		}
+	}
+	
+	if (fb_id == 0) {
+		fprintf(stderr, "Failed to find framebuffer for BO\n");
+		gbm_surface_release_buffer(e->gbm_surf, bo);
+		return false;
+	}
+	
+	// Present the framebuffer using KMS
+	bool ret = true;
+	if (d->atomic_supported) {
+		ret = atomic_present_framebuffer(d, fb_id, g_vsync_enabled);
+	} else {
+		drmModePageFlip(d->fd, d->crtc_id, fb_id, g_vsync_enabled ? DRM_MODE_PAGE_FLIP_EVENT : 0, d);
+	}
+	
+	// Wait for page flip to complete if using vsync
+	if (g_vsync_enabled) {
+		wait_for_flip(d->fd);
+	}
+	
+	// Release the buffer
+	gbm_surface_release_buffer(e->gbm_surf, bo);
+	
+	// Release the buffer
+	gbm_surface_release_buffer(e->gbm_surf, bo);
+	
+	return ret;
+}
+
 static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
@@ -2164,19 +2445,24 @@ int main(int argc, char **argv) {
 	static struct option long_options[] = {
 		{"loop", no_argument, NULL, 'l'},
 		{"help", no_argument, NULL, 'h'},
+		{"v4l2", no_argument, NULL, 'v'},
 		{0, 0, 0, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "lh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "lhv", long_options, NULL)) != -1) {
 		switch (opt) {
 			case 'l':
 				g_loop_playback = 1;
+				break;
+			case 'v':
+				g_use_v4l2_decoder = 1;
 				break;
 			case 'h':
 				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
+				fprintf(stderr, "  -v, --v4l2            Use V4L2 hardware decoder (RPi4 only)\n");
 				fprintf(stderr, "  -h, --help            Show this help message\n");
 				return 0;
 			default:
@@ -2243,6 +2529,7 @@ int main(int argc, char **argv) {
 	struct kms_ctx drm = {0};
 	struct egl_ctx eglc = {0};
 	mpv_player_t player = {0};
+	v4l2_player_t v4l2_player = {0};
 
 	// Parse stats env
 	const char *stats_env = getenv("PICKLE_STATS");
@@ -2284,12 +2571,26 @@ int main(int argc, char **argv) {
         }
     }
 	
-	if (!init_mpv(&player, file)) RET("init_mpv");
-	// Prime event processing in case mpv already queued wakeups before pipe creation.
-	g_mpv_wakeup = 1;
+	// Initialize either MPV or V4L2 decoder based on flag
+	if (g_use_v4l2_decoder) {
+		// Check if V4L2 decoder is supported
+		if (!v4l2_decoder_is_supported()) {
+			LOG_ERROR("V4L2 decoder not supported on this platform. Falling back to MPV.");
+			g_use_v4l2_decoder = 0;
+			if (!init_mpv(&player, file)) RET("init_mpv");
+			g_mpv_wakeup = 1;
+		} else {
+			if (!init_v4l2_decoder(&v4l2_player, file)) RET("init_v4l2_decoder");
+		}
+	} else {
+		if (!init_mpv(&player, file)) RET("init_mpv");
+		// Prime event processing in case mpv already queued wakeups before pipe creation.
+		g_mpv_wakeup = 1;
+	}
 
-	fprintf(stderr, "Playing %s at %dx%d %.2f Hz\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
-			(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal))); 
+	fprintf(stderr, "Playing %s at %dx%d %.2f Hz using %s\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
+			(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal)),
+			g_use_v4l2_decoder ? "V4L2 decoder" : "MPV");
 	
 	// Print keystone control instructions
 	if (g_keystone.enabled) {
@@ -2346,13 +2647,30 @@ int main(int argc, char **argv) {
 	}
 	
 	while (!g_stop) {
-		// Drain any pending mpv events BEFORE potentially blocking in poll to avoid startup deadlock
-		if (g_mpv_wakeup) {
-			g_mpv_wakeup = 0;
-			drain_mpv_events(player.mpv);
-			if (player.rctx) {
-				uint64_t flags = mpv_render_context_update(player.rctx);
-				g_mpv_update_flags |= flags;
+		// Handle decoder-specific events
+		if (!g_use_v4l2_decoder) {
+			// MPV-specific event handling
+			if (g_mpv_wakeup) {
+				g_mpv_wakeup = 0;
+				drain_mpv_events(player.mpv);
+				if (player.rctx) {
+					uint64_t flags = mpv_render_context_update(player.rctx);
+					g_mpv_update_flags |= flags;
+				}
+			}
+		} else {
+			// V4L2 decoder specific handling
+			// Periodically force a frame update for V4L2 decoder
+			struct timeval now;
+			gettimeofday(&now, NULL);
+			static struct timeval last_v4l2_update = {0, 0};
+			if (last_v4l2_update.tv_sec == 0) {
+				last_v4l2_update = now;
+			}
+			double elapsed = tv_diff(&now, &last_v4l2_update) * 1000.0; // ms
+			if (elapsed > 40.0) { // ~25fps
+				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+				last_v4l2_update = now;
 			}
 		}
 		// Check controller quit combo (START+SELECT 2s)
@@ -2575,7 +2893,15 @@ int main(int argc, char **argv) {
 		}
 		if (need_frame) {
 			if (g_debug && frames < 10) fprintf(stderr, "[debug] rendering frame #%d flags=0x%llx pending_flip=%d\n", frames, (unsigned long long)g_mpv_update_flags, g_pending_flip);
-			if (!render_frame_fixed(&drm, &eglc, &player)) { 
+			
+			bool render_success = false;
+			if (g_use_v4l2_decoder) {
+				render_success = render_v4l2_frame(&drm, &eglc, &v4l2_player);
+			} else {
+				render_success = render_frame_fixed(&drm, &eglc, &player);
+			}
+			
+			if (!render_success) { 
 				fprintf(stderr, "Render failed, exiting\n"); 
 				break; 
 			}
@@ -2628,7 +2954,11 @@ int main(int argc, char **argv) {
 		cleanup_joystick();
 	}
 	
-	destroy_mpv(&player);
+	if (g_use_v4l2_decoder) {
+		destroy_v4l2_decoder(&v4l2_player);
+	} else {
+		destroy_mpv(&player);
+	}
 	deinit_gbm_egl(&eglc);
 	deinit_drm(&drm);
 	return 0;
@@ -2641,7 +2971,11 @@ fail:
 		cleanup_joystick();
 	}
 	
-	destroy_mpv(&player);
+	if (g_use_v4l2_decoder) {
+		destroy_v4l2_decoder(&v4l2_player);
+	} else {
+		destroy_mpv(&player);
+	}
 	deinit_gbm_egl(&eglc);
 	deinit_drm(&drm);
 	return 1;

@@ -1,0 +1,353 @@
+#include "dispmanx.h"
+#include "log.h"
+#include "egl.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+#if defined(DISPMANX_ENABLED)
+#include <bcm_host.h>
+#endif
+
+// Check if running on RPi with DispmanX support
+bool is_dispmanx_supported(void) {
+#if defined(DISPMANX_ENABLED)
+    // Simple check for BCM host library availability
+    static bool checked = false;
+    static bool supported = false;
+    
+    if (!checked) {
+        checked = true;
+        
+        // Try to initialize BCM host
+        bcm_host_init();
+        
+        // Check if we can open the default display
+        DISPMANX_DISPLAY_HANDLE_T display = vc_dispmanx_display_open(0);
+        if (display != DISPMANX_NO_HANDLE) {
+            supported = true;
+            vc_dispmanx_display_close(display);
+            LOG_INFO("DISPMANX", "DispmanX hardware acceleration available");
+        }
+#else
+    return false;
+#endif
+} else {
+            LOG_INFO("DISPMANX", "DispmanX not available on this system");
+        }
+    }
+    
+    return supported;
+}
+
+// Initialize DispmanX for hardware-accelerated display
+bool init_dispmanx(dispmanx_ctx_t *ctx) {
+    if (!ctx) {
+        LOG_ERROR("DISPMANX", "Invalid context pointer");
+        return false;
+    }
+    
+    // Clear the context
+    memset(ctx, 0, sizeof(dispmanx_ctx_t));
+    
+    // Initialize BCM host libraries
+    bcm_host_init();
+    
+    // Get display information
+    if (graphics_get_display_size(0, &ctx->screen_width, &ctx->screen_height) < 0) {
+        LOG_ERROR("DISPMANX", "Failed to get display size");
+        return false;
+    }
+    
+    LOG_INFO("DISPMANX", "Display size: %dx%d", ctx->screen_width, ctx->screen_height);
+    
+    // Open the display
+    ctx->display = vc_dispmanx_display_open(0);
+    if (ctx->display == DISPMANX_NO_HANDLE) {
+        LOG_ERROR("DISPMANX", "Failed to open display");
+        return false;
+    }
+    
+    // Initialize source and destination rectangles (full screen by default)
+    vc_dispmanx_rect_set(&ctx->src_rect, 0, 0, ctx->screen_width << 16, ctx->screen_height << 16);
+    vc_dispmanx_rect_set(&ctx->dst_rect, 0, 0, ctx->screen_width, ctx->screen_height);
+    
+    // Mark as initialized
+    ctx->initialized = true;
+    
+    return true;
+}
+
+// Clean up DispmanX resources
+void deinit_dispmanx(dispmanx_ctx_t *ctx) {
+    if (!ctx || !ctx->initialized) {
+        return;
+    }
+    
+    // Remove element if it exists
+    if (ctx->element != DISPMANX_NO_HANDLE) {
+        DISPMANX_UPDATE_HANDLE_T update = vc_dispmanx_update_start(0);
+        vc_dispmanx_element_remove(update, ctx->element);
+        vc_dispmanx_update_submit_sync(update);
+        ctx->element = DISPMANX_NO_HANDLE;
+    }
+    
+    // Free resource if it exists
+    if (ctx->resource != DISPMANX_NO_HANDLE) {
+        vc_dispmanx_resource_delete(ctx->resource);
+        ctx->resource = DISPMANX_NO_HANDLE;
+    }
+    
+    // Close display
+    if (ctx->display != DISPMANX_NO_HANDLE) {
+        vc_dispmanx_display_close(ctx->display);
+        ctx->display = DISPMANX_NO_HANDLE;
+    }
+    
+    // Mark as not initialized
+    ctx->initialized = false;
+}
+
+// Display a buffer directly using DispmanX (bypassing EGL)
+bool dispmanx_direct_display(dispmanx_ctx_t *ctx, void *buffer, uint32_t width, uint32_t height, uint32_t pitch) {
+    if (!ctx || !ctx->initialized || !buffer) {
+        LOG_ERROR("DISPMANX", "Invalid parameters for direct display");
+        return false;
+    }
+    
+    // Create or update resource
+    if (ctx->resource == DISPMANX_NO_HANDLE) {
+        // Create a new resource
+        ctx->resource = vc_dispmanx_resource_create(VC_IMAGE_RGBA32, width, height, 0);
+        if (ctx->resource == DISPMANX_NO_HANDLE) {
+            LOG_ERROR("DISPMANX", "Failed to create resource");
+            return false;
+        }
+    }
+    
+    // Update source rectangle based on current image dimensions
+    vc_dispmanx_rect_set(&ctx->src_rect, 0, 0, width << 16, height << 16);
+    
+    // Define the region to update (full buffer)
+    VC_RECT_T rect;
+    vc_dispmanx_rect_set(&rect, 0, 0, width, height);
+    
+    // Copy buffer to resource
+    vc_dispmanx_resource_write_data(ctx->resource, VC_IMAGE_RGBA32, pitch, buffer, &rect);
+    
+    // Create or update display element
+    DISPMANX_UPDATE_HANDLE_T update = vc_dispmanx_update_start(0);
+    
+    if (ctx->element == DISPMANX_NO_HANDLE) {
+        // Set up alpha blending for opaque display
+        VC_DISPMANX_ALPHA_T alpha = {
+            DISPMANX_FLAGS_ALPHA_FIXED_ALL_PIXELS,
+            255, // Fully opaque
+            0
+        };
+        
+        // Create element for displaying the resource
+        ctx->element = vc_dispmanx_element_add(
+            update,
+            ctx->display,
+            1, // Layer (higher numbers on top)
+            &ctx->dst_rect,
+            ctx->resource,
+            &ctx->src_rect,
+            DISPMANX_PROTECTION_NONE,
+            &alpha,
+            NULL, // Clamp
+            ctx->keystone_enabled ? ctx->transform : DISPMANX_NO_ROTATE
+        );
+        
+        if (ctx->element == DISPMANX_NO_HANDLE) {
+            LOG_ERROR("DISPMANX", "Failed to create element");
+            vc_dispmanx_update_submit_sync(update);
+            return false;
+        }
+    } else {
+        // Update existing element
+        vc_dispmanx_element_change_source(update, ctx->element, ctx->resource);
+        
+        // Update destination if needed
+        vc_dispmanx_element_change_attributes(
+            update,
+            ctx->element,
+            ELEMENT_CHANGE_DEST_RECT | (ctx->keystone_enabled ? ELEMENT_CHANGE_TRANSFORM : 0),
+            0, // Layer
+            0, // Opacity
+            &ctx->dst_rect,
+            NULL, // Source rect
+            0, // Mask resource
+            ctx->keystone_enabled ? ctx->transform : DISPMANX_NO_ROTATE
+        );
+    }
+    
+    // Apply the update
+    vc_dispmanx_update_submit_sync(update);
+    
+    return true;
+}
+
+// Create an EGL window from DispmanX for OpenGL rendering
+#else
+
+bool dispmanx_display_frame(dispmanx_ctx_t *ctx, uint32_t *buffer, uint32_t width, uint32_t height, uint32_t stride) {
+    (void)ctx; // unused
+    (void)buffer; // unused
+    (void)width; // unused
+    (void)height; // unused
+    (void)stride; // unused
+    return false;
+}
+
+#endif
+
+#if defined(DISPMANX_ENABLED)
+bool dispmanx_create_egl_window(dispmanx_ctx_t *ctx, egl_ctx_t *egl) {
+    if (!ctx || !ctx->initialized || !egl) {
+        LOG_ERROR("DISPMANX", "Invalid parameters for EGL window creation");
+        return false;
+    }
+    
+    // Create update handle
+    DISPMANX_UPDATE_HANDLE_T update = vc_dispmanx_update_start(0);
+    
+    // Set up alpha blending for opaque display
+    VC_DISPMANX_ALPHA_T alpha = {
+        DISPMANX_FLAGS_ALPHA_FIXED_ALL_PIXELS,
+        255, // Fully opaque
+        0
+    };
+    
+    // Create element for EGL window
+    ctx->element = vc_dispmanx_element_add(
+        update,
+        ctx->display,
+        1, // Layer (higher numbers on top)
+        &ctx->dst_rect,
+        0, // No source for EGL window
+        &ctx->src_rect,
+        DISPMANX_PROTECTION_NONE,
+        &alpha,
+        NULL, // Clamp
+        ctx->keystone_enabled ? ctx->transform : DISPMANX_NO_ROTATE
+    );
+    
+    if (ctx->element == DISPMANX_NO_HANDLE) {
+        LOG_ERROR("DISPMANX", "Failed to create element for EGL window");
+        vc_dispmanx_update_submit_sync(update);
+        return false;
+    }
+    
+    // Apply the update
+    vc_dispmanx_update_submit_sync(update);
+    
+    // Set up the EGL window structure
+    ctx->egl_window.element = ctx->element;
+    ctx->egl_window.width = ctx->screen_width;
+    ctx->egl_window.height = ctx->screen_height;
+    
+    // Initialize EGL with the window
+    // Note: This assumes init_gbm_egl is modified to accept a native window
+    // The implementation below is just a placeholder
+    /*
+    egl->dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(egl->dpy, NULL, NULL);
+    
+    egl->surf = eglCreateWindowSurface(egl->dpy, egl->config, &ctx->egl_window, NULL);
+    if (egl->surf == EGL_NO_SURFACE) {
+        LOG_ERROR("DISPMANX", "Failed to create EGL surface: %x", eglGetError());
+        return false;
+    }
+    */
+    
+    return true;
+}
+
+// Set keystone correction coordinates using hardware transform
+bool dispmanx_set_keystone(dispmanx_ctx_t *ctx, float *coords) {
+    if (!ctx || !ctx->initialized || !coords) {
+        LOG_ERROR("DISPMANX", "Invalid parameters for keystone transformation");
+        return false;
+    }
+    
+    // Copy the keystone coordinates
+    memcpy(ctx->keystone_coords, coords, 8 * sizeof(float));
+    
+    // Convert normalized coordinates to screen coordinates
+    for (int i = 0; i < 4; i++) {
+        // Convert x coordinates (0-1) to screen coordinates
+        ctx->keystone_coords[i*2] = ctx->keystone_coords[i*2] * ctx->screen_width;
+        // Convert y coordinates (0-1) to screen coordinates
+        ctx->keystone_coords[i*2+1] = ctx->keystone_coords[i*2+1] * ctx->screen_height;
+    }
+    
+    // Enable keystone correction
+    ctx->keystone_enabled = true;
+    
+    return dispmanx_apply_transform(ctx);
+}
+
+// Apply the current keystone transformation to the display
+bool dispmanx_apply_transform(dispmanx_ctx_t *ctx) {
+    if (!ctx || !ctx->initialized || !ctx->keystone_enabled) {
+        return false;
+    }
+    
+    // Set up transformation matrix based on keystone coordinates
+    // Note: The HVS hardware in RPi supports limited transformations
+    // This is a simplified approach and may not handle all cases
+    
+    // TODO: Implement proper transformation matrix calculation
+    // For now, we'll use a simple rotation as a placeholder
+    ctx->transform = DISPMANX_NO_ROTATE;
+    
+    // If element already exists, update it
+    if (ctx->element != DISPMANX_NO_HANDLE) {
+        DISPMANX_UPDATE_HANDLE_T update = vc_dispmanx_update_start(0);
+        
+        vc_dispmanx_element_change_attributes(
+            update,
+            ctx->element,
+            ELEMENT_CHANGE_TRANSFORM,
+            0, // Layer
+            0, // Opacity
+            NULL, // Dest rect
+            NULL, // Source rect
+            0, // Mask
+            ctx->transform
+        );
+        
+        vc_dispmanx_update_submit_sync(update);
+    }
+    
+    return true;
+}
+
+// Display a DMA-BUF directly using DispmanX for zero-copy
+bool dispmanx_display_dmabuf(dispmanx_ctx_t *ctx, int dmabuf_fd, uint32_t width, uint32_t height, uint32_t format) {
+    if (!ctx || !ctx->initialized || dmabuf_fd < 0) {
+        LOG_ERROR("DISPMANX", "Invalid parameters for DMA-BUF display");
+        return false;
+    }
+    
+    // Note: Direct DMA-BUF import in DispmanX requires additional implementation
+    // that is hardware-specific. This is a placeholder for that functionality.
+    LOG_WARN("DISPMANX", "DMA-BUF direct display not yet implemented");
+    
+    // TODO: Implement DMA-BUF import for DispmanX
+    // This would require using MMAL or other low-level interfaces
+    
+    return false;
+}
+#else
+
+bool dispmanx_apply_keystone(dispmanx_ctx_t *ctx, float *corners) {
+    (void)ctx; // unused
+    (void)corners; // unused
+    return false;
+}
+
+#endif
