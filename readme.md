@@ -8,6 +8,7 @@ Minimal fullscreen Raspberry Pi 4 DRM/KMS + GBM + EGL + libmpv hardware accelera
 * Auto-selects first connected monitor and preferred mode.
 * Keystone correction for projector use.
 * Plays one file then exits (Ctrl+C to stop early).
+* Optional continuous playback looping.
 
 ## Dependencies (Raspberry Pi OS / Debian)
 Install development headers:
@@ -40,9 +41,21 @@ make try-run VIDEO=vid.mp4   # attempt non-root run on a free TTY
 make run VIDEO=vid.mp4       # uses sudo for root run
 ```
 
+Command line options:
+```
+./pickle [options] video_file
+  -l, --loop            Loop playback continuously
+  -h, --help            Show this help message
+```
+
 Manual run (root):
 ```
 sudo ./pickle /path/to/video.mp4
+```
+Or with looping:
+```
+sudo ./pickle -l /path/to/video.mp4
+sudo ./pickle --loop /path/to/video.mp4
 ```
 
 To avoid sudo:
@@ -130,6 +143,7 @@ If you need to measure CPU usage differences, compare with and without `PERF=1` 
 
 Environment variables summary (performance-related):
 * `PICKLE_FORCE_RENDER_LOOP=1`  Force legacy continuous rendering loop.
+* `PICKLE_LOOP=1`               Loop playback continuously (can also use -l/--loop flag).
 * `PICKLE_LOG_MPV=1`           Verbose mpv logs (costs some performance when very chatty).
 * `PICKLE_STATS=1`             Enable periodic and final playback stats.
 * `PICKLE_STATS_INTERVAL=1.0`  Stats logging interval in seconds (default 2.0; min 0.05 accepted).

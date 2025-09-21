@@ -45,6 +45,7 @@
 #include <poll.h>
 #include <termios.h>
 #include <linux/joystick.h>
+#include <getopt.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -260,6 +261,7 @@ static bool g_show_border = false; // Whether to show border around the video
 static int g_border_width = 5; // Border width in pixels
 static bool g_show_background = false; // Deprecated: background is always black now
 static bool g_show_corner_markers = true; // Show keystone corner highlights
+static int g_loop_playback = 0; // Whether to loop video playback
 static GLuint g_keystone_shader_program = 0; // Shader program for keystone correction
 static GLuint g_keystone_vertex_shader = 0;
 static GLuint g_keystone_fragment_shader = 0;
@@ -1205,7 +1207,23 @@ static void drain_mpv_events(mpv_handle *h) {
 				const char *err = mpv_error_string(ef->error);
 				fprintf(stderr, "[mpv] end-file error detail: %s (%d)\n", err, ef->error);
 			}
-			g_stop = 1;
+			
+			// Implement looping if enabled and normal EOF
+			if (g_loop_playback && ef->reason == MPV_END_FILE_REASON_EOF) {
+				// Reset playback position to beginning
+				int64_t pos = 0;
+				mpv_set_property(h, "time-pos", MPV_FORMAT_INT64, &pos);
+				
+				// Ensure playback is not paused
+				int flag = 0;
+				mpv_set_property(h, "pause", MPV_FORMAT_FLAG, &flag);
+				
+				fprintf(stderr, "Looping playback...\n");
+				// Continue event processing, don't set g_stop flag
+			} else {
+				// Normal end-of-file behavior: exit
+				g_stop = 1;
+			}
 		}
 	}
 }
@@ -1425,7 +1443,8 @@ static void keystone_init(void) {
         LOG_INFO("Keystone correction enabled via PICKLE_KEYSTONE");
         
         // Parse custom corner positions if provided in format "x1,y1,x2,y2,x3,y3,x4,y4"
-        if (strlen(keystone_env) > 10) { // Arbitrary minimum length for valid data
+        if (strlen(keystone_env) > 10) // Arbitrary minimum length for valid data
+        {
             float values[8];
             int count = 0;
             char* copy = strdup(keystone_env);
@@ -2949,7 +2968,6 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 				// Timeout or error occurred, force reset pending flip state
 				if (g_debug) fprintf(stderr, "[buffer] Page flip wait timeout, resetting state\n");
 				g_pending_flip = 0;
-				g_pending_flips = 0;
 			} else if (FD_ISSET(d->fd, &fds)) {
 				// Handle the page flip event
 				drmEventContext ev = { .version = DRM_EVENT_CONTEXT_VERSION, .page_flip_handler = page_flip_handler };
@@ -2958,7 +2976,6 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		}
 		
 		if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
-			fprintf(stderr, "drmModePageFlip failed (%s)\n", strerror(errno));
 			gbm_surface_release_buffer(e->gbm_surf, bo);
 			return false;
 		}
@@ -3032,10 +3049,51 @@ static void preallocate_fb_ring(kms_ctx_t *d, egl_ctx_t *e, int ring_size) {
 }
 
 int main(int argc, char **argv) {
-	if (argc < 2) { fprintf(stderr, "Usage: %s <video-file>\n", argv[0]); return 1; }
+	// Parse command line options
+	static struct option long_options[] = {
+		{"loop", no_argument, NULL, 'l'},
+		{"help", no_argument, NULL, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	int opt;
+	while ((opt = getopt_long(argc, argv, "lh", long_options, NULL)) != -1) {
+		switch (opt) {
+			case 'l':
+				g_loop_playback = 1;
+				break;
+			case 'h':
+				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
+				fprintf(stderr, "Options:\n");
+				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
+				fprintf(stderr, "  -h, --help            Show this help message\n");
+				return 0;
+			default:
+				fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+				return 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: No input file specified\n");
+		fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
+		return 1;
+	}
+
+	const char *file = argv[optind];
+	
+	// Environment variable override
+	const char *loop_env = getenv("PICKLE_LOOP");
+	if (loop_env && *loop_env) {
+		g_loop_playback = atoi(loop_env);
+	}
+
+	if (g_loop_playback) {
+		fprintf(stderr, "Looping playback enabled\n");
+	}
+
 	signal(SIGINT, handle_sigint);
-    signal(SIGSEGV, handle_sigsegv);
-	const char *file = argv[1];
+	signal(SIGSEGV, handle_sigsegv);
 
 	if (getenv("PICKLE_DEBUG")) g_debug = 1;
 	gettimeofday(&g_prog_start, NULL);
