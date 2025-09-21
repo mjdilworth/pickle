@@ -43,6 +43,7 @@
 #include "utils.h"
 #include "shader.h"
 #include "keystone.h"
+#include "hvs_keystone.h"
 #include "drm.h"
 #include "egl.h"
 #include "v4l2_decoder.h"
@@ -2555,9 +2556,19 @@ int main(int argc, char **argv) {
 	}
 	preallocate_fb_ring(&drm, &eglc, fb_ring_n);
 	
-	// Initialize keystone correction (using the adapter during transition)
 	// Initialize keystone correction
 	keystone_init();
+	
+	// Initialize hardware HVS keystone if supported
+	if (hvs_keystone_is_supported()) {
+		if (hvs_keystone_init()) {
+			LOG_INFO("Hardware HVS keystone initialized successfully");
+		} else {
+			LOG_WARN("Failed to initialize hardware HVS keystone, falling back to software implementation");
+		}
+	} else {
+		LOG_INFO("Hardware HVS keystone not supported on this platform, using software implementation");
+	}
 	
 	// Load keystone configuration from file if available
 	bool config_loaded = keystone_load_config("./keystone.conf");
@@ -2954,6 +2965,12 @@ int main(int argc, char **argv) {
 		cleanup_joystick();
 	}
 	
+	// Clean up HVS keystone if initialized
+	hvs_keystone_cleanup();
+	
+	// Clean up keystone resources
+	keystone_cleanup();
+	
 	if (g_use_v4l2_decoder) {
 		destroy_v4l2_decoder(&v4l2_player);
 	} else {
@@ -2970,6 +2987,12 @@ fail:
 	if (g_joystick_enabled) {
 		cleanup_joystick();
 	}
+	
+	// Clean up HVS keystone if initialized
+	hvs_keystone_cleanup();
+	
+	// Clean up keystone resources
+	keystone_cleanup();
 	
 	if (g_use_v4l2_decoder) {
 		destroy_v4l2_decoder(&v4l2_player);

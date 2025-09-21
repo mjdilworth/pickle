@@ -1,6 +1,7 @@
 #include "keystone.h"
 #include "utils.h"
 #include "shader.h"
+#include "hvs_keystone.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -412,6 +413,11 @@ void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
 void keystone_update_matrix(void) {
     // This is a placeholder for the matrix update function
     // In the real implementation, this would update any matrices needed for rendering
+    
+    // Update HVS keystone if enabled and supported
+    if (g_keystone.enabled && hvs_keystone_is_supported()) {
+        hvs_keystone_update(&g_keystone);
+    }
 }
 
 bool keystone_save_config(const char* path) {
@@ -553,6 +559,19 @@ bool keystone_load_config(const char* path) {
 // Toggle functions
 void keystone_toggle_enabled(void) {
     g_keystone.enabled = !g_keystone.enabled;
+    
+    // If keystone is enabled and HVS is supported, apply HVS keystone
+    if (g_keystone.enabled && hvs_keystone_is_supported()) {
+        if (!hvs_keystone_update(&g_keystone)) {
+            LOG_WARN("Failed to apply HVS keystone, falling back to software implementation");
+        } else {
+            LOG_INFO("Applied HVS keystone transformation");
+        }
+    } else if (!g_keystone.enabled && hvs_keystone_is_supported()) {
+        // Clean up HVS keystone when disabled
+        hvs_keystone_cleanup();
+    }
+    
     LOG_INFO("Keystone %s", g_keystone.enabled ? "enabled" : "disabled");
 }
 
@@ -573,6 +592,12 @@ void keystone_reset(void) {
     g_keystone.points[3][0] = 1.0f; g_keystone.points[3][1] = 1.0f; // Bottom-right
     
     keystone_update_matrix();
+    
+    // Update HVS keystone if active
+    if (g_keystone.enabled && hvs_keystone_is_supported()) {
+        hvs_keystone_update(&g_keystone);
+    }
+    
     LOG_INFO("Keystone reset to default");
 }
 

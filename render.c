@@ -1,5 +1,6 @@
 #include "render.h"
 #include "keystone.h"
+#include "hvs_keystone.h"
 #include "utils.h"
 #include "mpv.h"
 #include <stdlib.h>
@@ -266,14 +267,155 @@ void render_get_stats(render_context_t *ctx, char *buffer, size_t buffer_size) {
 
 // Render a texture with keystone correction
 void render_with_keystone(GLuint texture, int width, int height) {
-    // This is a stub implementation that will be replaced with the actual keystone rendering
-    // For now, just render the texture as-is
-    (void)texture; // Unused parameter
-    (void)width;   // Unused parameter
-    (void)height;  // Unused parameter
+    // Check if hardware HVS keystone is supported and enabled
+    if (hvs_keystone_is_supported() && g_keystone.enabled) {
+        // Apply hardware HVS keystone transformation
+        keystone_t *keystone = get_keystone_data();
+        if (hvs_keystone_apply(keystone, width, height)) {
+            // When using HVS keystone, we still need to render the texture to the screen,
+            // but without OpenGL keystone correction since HVS will handle it
+            LOG_DEBUG("Using HVS keystone transformation");
+            
+            // Simple full-screen texture rendering
+            glDisable(GL_BLEND);
+            glViewport(0, 0, width, height);
+            
+            // Render the texture to the screen
+            glClear(GL_COLOR_BUFFER_BIT);
+            
+            // Set up basic texture drawing
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            
+            // Use default shader program for simple texture rendering
+            // (This assumes a basic shader is available in the shader module)
+            GLuint prog = get_basic_shader_program();
+            glUseProgram(prog);
+            
+            // Draw a full-screen quad
+            GLfloat vertices[] = {
+                -1.0f, -1.0f,  // Bottom left
+                 1.0f, -1.0f,  // Bottom right
+                 1.0f,  1.0f,  // Top right
+                -1.0f,  1.0f   // Top left
+            };
+            
+            GLfloat texcoords[] = {
+                0.0f, 0.0f,  // Bottom left
+                1.0f, 0.0f,  // Bottom right
+                1.0f, 1.0f,  // Top right
+                0.0f, 1.0f   // Top left
+            };
+            
+            GLuint indices[] = {
+                0, 1, 2,  // First triangle
+                0, 2, 3   // Second triangle
+            };
+            
+            GLint pos_attrib = glGetAttribLocation(prog, "position");
+            GLint tex_attrib = glGetAttribLocation(prog, "texcoord");
+            GLint tex_uniform = glGetUniformLocation(prog, "texture");
+            
+            glUniform1i(tex_uniform, 0);  // Texture unit 0
+            
+            // Set up vertex attributes
+            glEnableVertexAttribArray(pos_attrib);
+            glVertexAttribPointer(pos_attrib, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+            
+            glEnableVertexAttribArray(tex_attrib);
+            glVertexAttribPointer(tex_attrib, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
+            
+            // Draw the quad
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, indices);
+            
+            // Clean up
+            glDisableVertexAttribArray(pos_attrib);
+            glDisableVertexAttribArray(tex_attrib);
+            
+            return;
+        }
+    }
     
-    LOG_DEBUG("Keystone rendering not fully implemented yet");
+    // Fallback to software keystone if hardware HVS is not available or failed
+    LOG_DEBUG("Using software keystone transformation");
     
-    // In a real implementation, this would apply the keystone correction
-    // and render the texture to the screen
+    // Ensure keystone shader is initialized
+    if (!g_keystone_shader_program && !init_keystone_shader()) {
+        LOG_ERROR("Failed to initialize keystone shader");
+        return;
+    }
+    
+    // Set up viewport and clear screen
+    glViewport(0, 0, width, height);
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    // Bind the texture
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    
+    // Use keystone shader program
+    glUseProgram(g_keystone_shader_program);
+    
+    // Set texture uniform
+    glUniform1i(g_keystone_u_texture_loc, 0);  // Texture unit 0
+    
+    // Create quad vertices and texture coordinates
+    GLfloat vertices[] = {
+        -1.0f, -1.0f,  // Bottom left
+         1.0f, -1.0f,  // Bottom right
+         1.0f,  1.0f,  // Top right
+        -1.0f,  1.0f   // Top left
+    };
+    
+    GLfloat texcoords[] = {
+        0.0f, 1.0f,  // Bottom left
+        1.0f, 1.0f,  // Bottom right
+        1.0f, 0.0f,  // Top right
+        0.0f, 0.0f   // Top left
+    };
+    
+    // Apply keystone matrix to vertex positions
+    for (int i = 0; i < 4; i++) {
+        float x = vertices[i*2];
+        float y = vertices[i*2+1];
+        
+        // Map from GL coordinates (-1,1) to keystone coordinates (0,1)
+        float kx = (x + 1.0f) * 0.5f;
+        float ky = (y + 1.0f) * 0.5f;
+        
+        // Apply keystone transformation
+        float nx = g_keystone.points[i][0];
+        float ny = g_keystone.points[i][1];
+        
+        // Map back to GL coordinates
+        vertices[i*2] = nx * 2.0f - 1.0f;
+        vertices[i*2+1] = ny * 2.0f - 1.0f;
+    }
+    
+    // Set up vertex attributes
+    glEnableVertexAttribArray(g_keystone_a_position_loc);
+    glVertexAttribPointer(g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    
+    glEnableVertexAttribArray(g_keystone_a_texcoord_loc);
+    glVertexAttribPointer(g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
+    
+    // Draw the quad
+    GLuint indices[] = {
+        0, 1, 2,  // First triangle
+        0, 2, 3   // Second triangle
+    };
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, indices);
+    
+    // Clean up
+    glDisableVertexAttribArray(g_keystone_a_position_loc);
+    glDisableVertexAttribArray(g_keystone_a_texcoord_loc);
+    
+    // Draw border and corner markers if enabled
+    if (g_keystone.border_visible) {
+        draw_keystone_border();
+    }
+    
+    if (g_keystone.corner_markers) {
+        draw_keystone_corner_markers();
+    }
 }

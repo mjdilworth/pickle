@@ -9,6 +9,8 @@ Minimal fullscreen Raspberry Pi 4 DRM/KMS + GBM + EGL + libmpv hardware accelera
 * Atomic modesetting for tear-free video updates.
 * Auto-selects first connected monitor and preferred mode.
 * Keystone correction for projector use.
+* Hardware-accelerated keystone using RPi4 HVS (Hardware Video Scaler).
+* V4L2 direct decoder path for bypassing MPV for better performance.
 * Plays one file then exits (Ctrl+C to stop early).
 * Optional continuous playback looping.
 * Optimized performance for Raspberry Pi 4 with CPU and memory reduction strategies.
@@ -173,6 +175,29 @@ Atomic modesetting provides tear-free display updates:
 
 These features are automatically enabled when supported by your hardware and drivers, with no additional configuration required.
 
+## V4L2 Direct Decoder Path
+
+Pickle can utilize the V4L2 Media Memory-to-Memory (M2M) API for direct hardware video decoding on Raspberry Pi 4, bypassing MPV for improved performance:
+
+- Directly accesses the V4L2 decoder hardware without going through MPV
+- Reduces CPU usage and memory overhead
+- Improves playback performance for high-resolution content
+- Automatically falls back to MPV on unsupported platforms
+
+To use the V4L2 decoder:
+```
+./pickle --v4l2 video.mp4
+```
+
+Requirements:
+- Raspberry Pi 4 or newer with V4L2 codec driver support
+- Linux kernel with V4L2 M2M support
+
+The V4L2 decoder path is optimized for:
+- H.264 and H.265 content
+- Proper synchronization with display refresh
+- Direct integration with the HVS keystone implementation
+
 ## Keystone Correction
 
 Pickle supports keystone correction for projector use, allowing you to adjust the image geometry when projecting onto non-perpendicular surfaces:
@@ -195,6 +220,26 @@ Pickle supports keystone correction for projector use, allowing you to adjust th
 Environment variables for keystone:
    - `PICKLE_KEYSTONE=1` - Enable keystone correction
    - `PICKLE_KEYSTONE_STEP=n` - Set keystone adjustment step size (1-100)
+
+### Hardware-Accelerated HVS Keystone
+
+On Raspberry Pi 4, Pickle can use the Hardware Video Scaler (HVS) for hardware-accelerated keystone correction:
+
+- Automatically detected and enabled on Raspberry Pi 4 hardware
+- Significantly reduces CPU/GPU load during keystone correction
+- Uses the same keystone settings and controls as the software implementation
+- Seamlessly falls back to software implementation on non-RPi platforms
+
+The HVS keystone feature requires:
+- Raspberry Pi 4 or newer
+- Proper DispmanX support enabled in the firmware
+- Running with `dtoverlay=vc4-kms-v3d` in config.txt
+
+To get the best performance with HVS keystone:
+```
+make RELEASE=1 MAXPERF=1 RPI4_OPT=1
+PICKLE_KEYSTONE=1 ./pickle video.mp4
+```
 
 ## Visual Aids
 
