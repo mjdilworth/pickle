@@ -8,7 +8,7 @@
 #include <GLES2/gl2.h>
 
 // Global keystone state
-static keystone_t g_keystone = {
+keystone_t g_keystone = {
     .points = {
         {0.0f, 0.0f},  // Top-left
         {1.0f, 0.0f},  // Top-right
@@ -17,31 +17,46 @@ static keystone_t g_keystone = {
     },
     .selected_corner = -1,
     .enabled = false,
+    .matrix = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    },
+    .mesh_enabled = false,
     .mesh_size = 4,    // 4x4 mesh by default
     .mesh_points = NULL,
+    .active_mesh_point = {-1, -1},
     .initialized = false,
     .border_visible = false,
     .border_width = 5,
-    .corner_markers = true
+    .corner_markers = true,
+    .perspective_pins = {false, false, false, false},
+    .active_corner = -1
 };
 
 // Keystone adjustment step size (in 1/1000 units)
-static int g_keystone_adjust_step = 1;
+int g_keystone_adjust_step = 1;
+
+// UI visibility flags
+int g_show_border = 0;
+int g_border_width = 5;
+int g_show_corner_markers = 1;
 
 // OpenGL shader resources
-static GLuint g_keystone_shader_program = 0;
-static GLuint g_keystone_vertex_shader = 0;
-static GLuint g_keystone_fragment_shader = 0;
-static GLuint g_keystone_vertex_buffer = 0;
-static GLuint g_keystone_texcoord_buffer = 0;
-static GLuint g_keystone_index_buffer = 0;
-static GLuint g_keystone_fbo = 0;
-static GLuint g_keystone_fbo_texture = 0;
-static int g_keystone_fbo_w = 0;
-static int g_keystone_fbo_h = 0;
-static GLint g_keystone_a_position_loc = -1;
-static GLint g_keystone_a_texcoord_loc = -1;
-static GLint g_keystone_u_texture_loc = -1;
+GLuint g_keystone_shader_program = 0;
+GLuint g_keystone_vertex_shader = 0;
+GLuint g_keystone_fragment_shader = 0;
+GLuint g_keystone_vertex_buffer = 0;
+GLuint g_keystone_texcoord_buffer = 0;
+GLuint g_keystone_index_buffer = 0;
+GLuint g_keystone_fbo = 0;
+GLuint g_keystone_fbo_texture = 0;
+int g_keystone_fbo_w = 0;
+int g_keystone_fbo_h = 0;
+GLint g_keystone_a_position_loc = -1;
+GLint g_keystone_a_texcoord_loc = -1;
+GLint g_keystone_u_texture_loc = -1;
 
 // Border shader resources
 static GLuint g_border_shader_program = 0;
@@ -49,6 +64,99 @@ static GLuint g_border_vertex_shader = 0;
 static GLuint g_border_fragment_shader = 0;
 static GLint g_border_a_position_loc = -1;
 static GLint g_border_u_color_loc = -1;
+
+// Accessor functions for the adapter layer
+keystone_t *get_keystone_data(void) {
+    return &g_keystone;
+}
+
+int *get_keystone_adjust_step(void) {
+    return &g_keystone_adjust_step;
+}
+
+bool *get_keystone_border_visible_ptr(void) {
+    return &g_keystone.border_visible;
+}
+
+int *get_keystone_border_width_ptr(void) {
+    return &g_keystone.border_width;
+}
+
+bool *get_keystone_corner_markers_ptr(void) {
+    return &g_keystone.corner_markers;
+}
+
+GLuint *get_keystone_shader_program_ptr(void) {
+    return &g_keystone_shader_program;
+}
+
+GLuint *get_keystone_vertex_shader_ptr(void) {
+    return &g_keystone_vertex_shader;
+}
+
+GLuint *get_keystone_fragment_shader_ptr(void) {
+    return &g_keystone_fragment_shader;
+}
+
+GLuint *get_keystone_vertex_buffer_ptr(void) {
+    return &g_keystone_vertex_buffer;
+}
+
+GLuint *get_keystone_texcoord_buffer_ptr(void) {
+    return &g_keystone_texcoord_buffer;
+}
+
+GLuint *get_keystone_index_buffer_ptr(void) {
+    return &g_keystone_index_buffer;
+}
+
+GLuint *get_keystone_fbo_ptr(void) {
+    return &g_keystone_fbo;
+}
+
+GLuint *get_keystone_fbo_texture_ptr(void) {
+    return &g_keystone_fbo_texture;
+}
+
+int *get_keystone_fbo_w_ptr(void) {
+    return &g_keystone_fbo_w;
+}
+
+int *get_keystone_fbo_h_ptr(void) {
+    return &g_keystone_fbo_h;
+}
+
+GLint *get_keystone_a_position_loc_ptr(void) {
+    return &g_keystone_a_position_loc;
+}
+
+GLint *get_keystone_a_texcoord_loc_ptr(void) {
+    return &g_keystone_a_texcoord_loc;
+}
+
+GLint *get_keystone_u_texture_loc_ptr(void) {
+    return &g_keystone_u_texture_loc;
+}
+
+bool *get_keystone_mesh_enabled_ptr(void) {
+    return &g_keystone.mesh_enabled;
+}
+
+bool (*get_keystone_perspective_pins_ptr(void))[4] {
+    return &g_keystone.perspective_pins;
+}
+
+int *get_keystone_active_corner_ptr(void) {
+    return &g_keystone.active_corner;
+}
+
+int (*get_keystone_active_mesh_point_ptr(void))[2] {
+    return &g_keystone.active_mesh_point;
+}
+
+float (*get_keystone_matrix_ptr(void))[16] {
+    return &g_keystone.matrix;
+}
 
 void keystone_init(void) {
     // Initialize with default values (rectangle at full screen)
@@ -59,11 +167,25 @@ void keystone_init(void) {
     
     g_keystone.selected_corner = -1;
     g_keystone.enabled = false;
+    g_keystone.mesh_enabled = false;
     g_keystone.mesh_size = 4;
     g_keystone.mesh_points = NULL;
+    g_keystone.active_mesh_point[0] = -1;
+    g_keystone.active_mesh_point[1] = -1;
     g_keystone.border_visible = false;
     g_keystone.border_width = 5;
     g_keystone.corner_markers = true;
+    g_keystone.active_corner = -1;
+    
+    for (int i = 0; i < 4; i++) {
+        g_keystone.perspective_pins[i] = false;
+    }
+    
+    // Initialize identity matrix
+    for (int i = 0; i < 16; i++) {
+        g_keystone.matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    }
+    
     g_keystone.initialized = true;
     
     // Check environment variable for adjustment step size

@@ -1,13 +1,20 @@
-# Simple Makefile for pickle DRM+EGL+libmpv player
-# Targets:
-#   make        (default) build binary
-#   make run VIDEO=path/to/file.mp4   run video (uses sudo by default)
-#   make clean  remove build artifacts
-# Variables can be overridden: CC, CFLAGS, LDFLAGS, PREFIX
+# Modular Makefile for pickle DRM+EGL+libmpv player
+
+# Modularization Todo:
+# ✅ Create keystone module (keystone.c/keystone.h)
+# ✅ Create utils module (utils.c/utils.h)
+# ✅ Create shader module (shader.c/shader.h)
+# ✅ Clean up redundant adapter files and scripts
+# 🔄 Create DRM module (drm.c/drm.h)
+# 🔄 Create EGL module (egl.c/egl.h)
+# 🔄 Create input module (input.c/input.h)
 
 APP      := pickle
-SRC      := pickle.c
-OBJ      := $(SRC:.c=.o)
+
+# Source files - add new modules here
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c
+OBJECTS  := $(SOURCES:.c=.o)
+HEADERS  := utils.h shader.h keystone.h
 
 # Toolchain / standards
 CROSS   ?=
@@ -32,7 +39,7 @@ PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS) 2>/dev/null)
 PKG_LIBS   := $(shell $(PKG_CONFIG) --libs $(PKGS) 2>/dev/null)
 
 # Basic flags
-CFLAGS  ?= $(OPT) $(DEBUG) $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
+CFLAGS  ?= $(OPT) $(DEBUG) $(WARN) -std=$(CSTD) $(PKG_CFLAGS) -DPICKLE_KEYSTONE_MODULAR
 LDFLAGS ?=
 
 # If pkg-config fails, fall back to a reasonable default library set
@@ -71,12 +78,19 @@ BINDIR ?= $(PREFIX)/bin
 
 all: $(APP)
 
-$(APP): $(OBJ)
+$(APP): $(OBJECTS)
 	@ if [ -z "$(PKG_LIBS)" ]; then echo "[warn] pkg-config not found or missing pc files; using fallback libs."; fi
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-%.o: %.c
+# Compile each source file
+%.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# Dependency tracking
+deps.mk: $(SOURCES)
+	$(CC) -MM $(CFLAGS) $^ > $@
+
+-include deps.mk
 
 run: $(APP)
 	@if [ -z "$(VIDEO)" ]; then \
