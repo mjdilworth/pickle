@@ -1,0 +1,58 @@
+--- a/pickle.c
++++ b/pickle.c
+@@ -51,11 +51,13 @@
+ #include <limits.h>
+ #include <stdbool.h>
+ #include <linux/joystick.h>
++#include <sys/epoll.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <sys/ioctl.h>
+ #include <poll.h>
+ #include <math.h>
++#include <signal.h>
+ 
+ #include <mpv/client.h>
+ #include <mpv/render.h>
+@@ -83,6 +85,7 @@
+ #include "hvs_keystone.h"
+ #include "compute_keystone.h"
+ #include "v4l2_decoder.h"
++#include "pickle_events.h"
+ 
+ // Additional logging macros not included in utils.h
+ #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
+@@ -2658,6 +2661,19 @@ int main(int argc, char **argv) {
+ 	LOG_INFO("START+SELECT (hold 2s)=Quit");
+ 	}
+ 	
++	// Initialize the event-driven architecture
++	event_ctx_t *event_ctx = pickle_event_init(&drm, &player, g_use_v4l2_decoder ? &v4l2_player : NULL);
++	if (!event_ctx) {
++		LOG_ERROR("Failed to initialize event system");
++		goto cleanup;
++	}
++	LOG_INFO("Event-driven architecture initialized");
++	
++	// Main loop using event-driven architecture
++	while (!g_stop) {
++		if (!pickle_event_process_and_render(event_ctx, &drm, &egl, &player, 
++		                                    g_use_v4l2_decoder ? &v4l2_player : NULL, 100)) {
++			break;
++		}
++	}
++	
++	/*
+ 	while (!g_stop) {
+ 		// Handle decoder-specific events
+ 		if (!g_use_v4l2_decoder) {
+@@ -2849,7 +2865,9 @@ int main(int argc, char **argv) {
+ 		}
+ 		stats_log_periodic(&player);
+ 	}
++	*/
+ 	
++	pickle_event_cleanup(event_ctx);
+ 	LOG_INFO("Playback completed");
+ 	stats_log_final(&player);
+ 	

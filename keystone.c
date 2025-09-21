@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "shader.h"
 #include "hvs_keystone.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

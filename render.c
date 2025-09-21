@@ -1,6 +1,7 @@
 #include "render.h"
 #include "keystone.h"
 #include "hvs_keystone.h"
+#include "compute_keystone.h"
 #include "utils.h"
 #include "mpv.h"
 #include <stdlib.h>
@@ -335,8 +336,18 @@ void render_with_keystone(GLuint texture, int width, int height) {
             return;
         }
     }
+
+    // Try compute shader-based keystone if available and enabled
+    if (compute_keystone_is_supported() && g_keystone.enabled) {
+        // Apply compute shader-based keystone transformation
+        keystone_t *keystone = get_keystone_data();
+        if (compute_keystone_apply(keystone, texture, width, height)) {
+            LOG_DEBUG("Using compute shader keystone transformation");
+            return;
+        }
+    }
     
-    // Fallback to software keystone if hardware HVS is not available or failed
+    // Fallback to software keystone if hardware HVS or compute shader is not available or failed
     LOG_DEBUG("Using software keystone transformation");
     
     // Ensure keystone shader is initialized

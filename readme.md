@@ -10,6 +10,7 @@ Minimal fullscreen Raspberry Pi 4 DRM/KMS + GBM + EGL + libmpv hardware accelera
 * Auto-selects first connected monitor and preferred mode.
 * Keystone correction for projector use.
 * Hardware-accelerated keystone using RPi4 HVS (Hardware Video Scaler).
+* Compute shader-based keystone for efficient GPU acceleration.
 * V4L2 direct decoder path for bypassing MPV for better performance.
 * Plays one file then exits (Ctrl+C to stop early).
 * Optional continuous playback looping.
@@ -334,11 +335,26 @@ The player supports several environment variables for production deployment:
 3. **Headless deployment:** `PICKLE_NO_AUDIO=1 PICKLE_VO=gpu PICKLE_FORCE_HEADLESS=1`
 4. **Debug failing playback:** `PICKLE_LOG_MPV=1 PICKLE_STATS=1`
 
-Future potential enhancements (not yet implemented):
+Future potential enhancements:
 * Use `drmModeAtomicCommit` with retained planes for overlay/subtitle blending.
 * Switch to `drmModeAddFB2` with modifiers for direct scanout of more formats.
 * Explicit FPS pacing (clock vs. display refresh) to reduce latency jitter.
-* Batch event polling (epoll on DRM fd + signalfd) instead of select per frame.
+* ✅ Batch event polling (epoll on DRM fd + signalfd) instead of select per frame.
+* Add lock-free ring buffer for frame queue.
+* Create Vulkan video decoder abstraction.
+
+## Event-Driven Architecture
+
+Pickle now uses an epoll-based event-driven architecture to efficiently handle events from various sources:
+
+- **Efficient I/O Multiplexing**: Uses `epoll` instead of `poll` for better performance with multiple file descriptors
+- **Callback-Based Design**: Event handlers are registered for each event source
+- **Signal Integration**: Proper signal handling via `signalfd` for clean shutdown
+- **Timer Support**: Precise timers using `timerfd` for regular operations like frame updates
+- **Modular Structure**: Clean separation of event handling from application logic
+- **Extensibility**: Easy to add new event sources and handlers
+
+This implementation provides a more scalable and maintainable approach to event handling, particularly important for embedded systems like the Raspberry Pi.
 
 Contributions or further tuning ideas welcome.
 

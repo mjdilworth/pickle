@@ -44,6 +44,7 @@
 #include "shader.h"
 #include "keystone.h"
 #include "hvs_keystone.h"
+#include "compute_keystone.h"
 #include "drm.h"
 #include "egl.h"
 #include "v4l2_decoder.h"
@@ -2570,6 +2571,17 @@ int main(int argc, char **argv) {
 		LOG_INFO("Hardware HVS keystone not supported on this platform, using software implementation");
 	}
 	
+	// Initialize compute shader keystone if supported
+	if (compute_keystone_is_supported()) {
+		if (compute_keystone_init()) {
+			LOG_INFO("Compute shader keystone initialized successfully");
+		} else {
+			LOG_WARN("Failed to initialize compute shader keystone, falling back to fragment shader implementation");
+		}
+	} else {
+		LOG_INFO("Compute shader keystone not supported on this platform, using fragment shader implementation");
+	}
+	
 	// Load keystone configuration from file if available
 	bool config_loaded = keystone_load_config("./keystone.conf");
     if (!config_loaded) {
@@ -2968,6 +2980,9 @@ int main(int argc, char **argv) {
 	// Clean up HVS keystone if initialized
 	hvs_keystone_cleanup();
 	
+	// Clean up compute shader keystone if initialized
+	compute_keystone_cleanup();
+	
 	// Clean up keystone resources
 	keystone_cleanup();
 	
@@ -2990,6 +3005,9 @@ fail:
 	
 	// Clean up HVS keystone if initialized
 	hvs_keystone_cleanup();
+	
+	// Clean up compute shader keystone if initialized
+	compute_keystone_cleanup();
 	
 	// Clean up keystone resources
 	keystone_cleanup();
