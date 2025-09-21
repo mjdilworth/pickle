@@ -865,6 +865,9 @@ static struct timeval g_prog_start = {0};
 static struct timeval g_last_frame_time = {0};
 static int g_stall_reset_count = 0;
 static int g_max_stall_resets = 3; // Maximum stall recovery attempts before giving up
+// Watchdog timeouts
+static int g_wd_first_ms = 1500; // 1.5s
+static int g_wd_ongoing_ms = 3000; // 3s max between frames during playback (adjustable for looping)
 
 // Frame timing/pacing metrics
 static struct timeval g_last_flip_submit = {0};
@@ -1055,6 +1058,13 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	r = mpv_set_option_string(p->mpv, "vo-queue-size", "4");
 	log_opt_result("vo-queue-size", r);
 	
+	// Configure loop behavior if enabled
+	if (g_loop_playback) {
+		r = mpv_set_option_string(p->mpv, "loop-file", "inf");
+		log_opt_result("loop-file", r);
+		r = mpv_set_option_string(p->mpv, "loop-playlist", "inf");
+		log_opt_result("loop-playlist", r);
+	}
 	// Increase demuxer cache for smoother playback
 	r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "64MiB");
 	log_opt_result("demuxer-max-bytes", r);
@@ -1218,7 +1228,20 @@ static void drain_mpv_events(mpv_handle *h) {
 				int flag = 0;
 				mpv_set_property(h, "pause", MPV_FORMAT_FLAG, &flag);
 				
-				fprintf(stderr, "Looping playback...\n");
+				// Reset stall detection counter when looping
+				g_stall_reset_count = 0;
+				
+				// Update last frame time to avoid false stall detection during loop transition
+				gettimeofday(&g_last_frame_time, NULL);
+				
+				// Force a frame update at loop points
+				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+				
+				// Restart playback directly using a command
+				const char *cmd[] = {"loadfile", mpv_get_property_string(h, "path"), "replace", NULL};
+				mpv_command_async(h, 0, cmd);
+				
+				fprintf(stderr, "Looping playback (restarting file)...\n");
 				// Continue event processing, don't set g_stop flag
 			} else {
 				// Normal end-of-file behavior: exit
@@ -3097,9 +3120,15 @@ int main(int argc, char **argv) {
 	if (loop_env && *loop_env) {
 		g_loop_playback = atoi(loop_env);
 	}
-
+	
+	// If looping is enabled, set a longer stall detection threshold
+	// This helps prevent false stalls during loop transitions
 	if (g_loop_playback) {
-		fprintf(stderr, "Looping playback enabled\n");
+		const int LOOP_STALL_MS = 5000; // 5s for loop transitions
+		g_wd_ongoing_ms = LOOP_STALL_MS;
+		fprintf(stderr, "Looping playback enabled (stall threshold: %dms)\n", LOOP_STALL_MS);
+	} else {
+		fprintf(stderr, "Single playback mode (stall threshold: %dms)\n", g_wd_ongoing_ms);
 	}
 
 	signal(SIGINT, handle_sigint);
@@ -3186,13 +3215,9 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "  [/] - Decrease/increase border width\n");
 	fprintf(stderr, "  (border draws around keystone quad; background is always black)\n\n");
 
-	// Event-driven loop: render only when mpv signals a frame update unless override forces continuous loop.
-	// If mpv hasn't yet posted MPV_RENDER_UPDATE_FRAME for the very first frame, we still render once to kick things off.
+	// Watchdog: if no frame submitted within WD_FIRST_MS, force a render attempt even if mpv flags missing.
 	int frames = 0;
 	int force_loop = getenv("PICKLE_FORCE_RENDER_LOOP") ? 1 : 0;
-	// Watchdog: if no frame submitted within WD_FIRST_MS, force a render attempt even if mpv flags missing.
-	const int WD_FIRST_MS = 1500; // 1.5s
-	const int WD_ONGOING_MS = 3000; // 3s max between frames during playback
 	struct timeval wd_last_activity; gettimeofday(&wd_last_activity, NULL);
 	gettimeofday(&g_last_frame_time, NULL); // Initialize last frame time
 	int wd_forced_first = 0;
@@ -3398,7 +3423,7 @@ int main(int argc, char **argv) {
 		if (!frames && !need_frame && !wd_forced_first) {
 			struct timeval now; gettimeofday(&now, NULL);
 			double since = tv_diff(&now, &g_prog_start) * 1000.0; // ms
-			if (since > WD_FIRST_MS) {
+			if (since > g_wd_first_ms) {
 				if (g_debug) fprintf(stderr, "[wd] forcing first frame after %.1f ms inactivity\n", since);
 				need_frame = 1; wd_forced_first = 1;
 			}
@@ -3409,8 +3434,8 @@ int main(int argc, char **argv) {
 			struct timeval now; gettimeofday(&now, NULL);
 			double since_last_frame = tv_diff(&now, &g_last_frame_time) * 1000.0; // ms
 			
-			// If we haven't rendered a frame in WD_ONGOING_MS, try to recover
-			if (since_last_frame > WD_ONGOING_MS && g_stall_reset_count < g_max_stall_resets) {
+			// If we haven't rendered a frame in g_wd_ongoing_ms, try to recover
+			if (since_last_frame > g_wd_ongoing_ms && g_stall_reset_count < g_max_stall_resets) {
 				fprintf(stderr, "[wd] playback stall detected - no frames for %.1f ms, attempting recovery (attempt %d/%d)\n", 
 					since_last_frame, g_stall_reset_count+1, g_max_stall_resets);
 				
@@ -3427,9 +3452,32 @@ int main(int argc, char **argv) {
 					
 					// Reset decoder if needed (for more aggressive recovery)
 					if (g_stall_reset_count > 1) {
-						const char *cmd[] = {"cycle-values", "hwdec", "auto-safe", "no", NULL};
-						mpv_command_async(player.mpv, 0, cmd);
-						fprintf(stderr, "[wd] cycling hwdec as part of recovery\n");
+						// When looping, first check if we're at the end of the file
+						if (g_loop_playback) {
+							// Get current position and duration
+							double pos = 0, duration = 0;
+							mpv_get_property(player.mpv, "time-pos", MPV_FORMAT_DOUBLE, &pos);
+							mpv_get_property(player.mpv, "duration", MPV_FORMAT_DOUBLE, &duration);
+							
+							// If we're near the end, force a restart
+							if (duration > 0 && pos > (duration - 1.0)) {
+								fprintf(stderr, "[wd] near end of file (%.1f/%.1f), forcing restart for loop\n", pos, duration);
+								const char *cmd[] = {"loadfile", mpv_get_property_string(player.mpv, "path"), "replace", NULL};
+								mpv_command_async(player.mpv, 0, cmd);
+							} else {
+								// Just try to step forward
+								const char *cmd[] = {"frame-step", NULL};
+								mpv_command_async(player.mpv, 0, cmd);
+								fprintf(stderr, "[wd] requesting explicit frame-step for recovery\n");
+							}
+						}
+						
+						// If we're still having issues, try cycling the hardware decoder
+						if (g_stall_reset_count > 2) {
+							const char *cmd[] = {"cycle-values", "hwdec", "auto-safe", "no", NULL};
+							mpv_command_async(player.mpv, 0, cmd);
+							fprintf(stderr, "[wd] cycling hwdec as part of recovery\n");
+						}
 					}
 				}
 			}
@@ -3447,7 +3495,8 @@ int main(int argc, char **argv) {
 			gettimeofday(&g_last_frame_time, NULL); // Update last successful frame time
 			
 			// Reset stall counter after successful frames
-			if (g_stall_reset_count > 0 && (frames % 10) == 0) {
+			if (g_stall_reset_count > 0) {
+				// Reset stall counter immediately after successful frame render
 				fprintf(stderr, "[wd] playback resumed normally, resetting stall counter\n");
 				g_stall_reset_count = 0;
 			}
