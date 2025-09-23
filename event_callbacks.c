@@ -87,6 +87,87 @@ void keyboard_event_callback(int fd, uint32_t events, void *user_data) {
         LOG_DEBUG("Key pressed: %d (0x%02x) '%c'", 
                  (int)c, (int)c, (c >= 32 && c < 127) ? c : '?');
         
+        // Debug numeric keys specifically
+        if (c >= '1' && c <= '4') {
+            LOG_INFO("Numeric key %c pressed for keystone corner selection", c);
+        }
+        
+        // Special case for arrow keys (they come as escape sequences)
+        static char seq[5] = {0};
+        static int seq_pos = 0;
+        
+        if (c == 27) { // ESC character starts a sequence
+            seq[0] = c;
+            seq_pos = 1;
+            LOG_DEBUG("Escape sequence started");
+            return; // Wait for more characters
+        } else if (seq_pos == 1 && c == '[') { // Second char in sequence
+            seq[seq_pos++] = c;
+            LOG_DEBUG("Escape sequence continued: ESC [");
+            return; // Wait for final character
+        } else if (seq_pos == 2) { // Third and final char in most sequences
+            seq[seq_pos++] = c;
+            seq[seq_pos] = '\0';
+            LOG_INFO("Complete sequence received: ESC[%c (code: %d)", c, (int)c);
+            
+            // Handle arrow keys
+            char arrow_key = 0;
+            if (c == 'A') {        // Up arrow
+                LOG_INFO("Up arrow detected");
+                arrow_key = 65;
+            } else if (c == 'B') { // Down arrow
+                LOG_INFO("Down arrow detected");
+                arrow_key = 66;
+            } else if (c == 'C') { // Right arrow
+                LOG_INFO("Right arrow detected");
+                arrow_key = 67;
+            } else if (c == 'D') { // Left arrow
+                LOG_INFO("Left arrow detected");
+                arrow_key = 68;
+            }
+            
+            if (arrow_key != 0) {
+                LOG_INFO("Sending arrow key code %d to keystone handler", (int)arrow_key);
+                bool keystone_handled = keystone_handle_key(arrow_key);
+                LOG_INFO("Arrow key handled by keystone: %s", keystone_handled ? "YES" : "NO");
+                if (keystone_handled) {
+                    g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+                }
+                seq_pos = 0; // Reset sequence
+                return;
+            }
+            
+            seq_pos = 0; // Reset sequence for unknown keys
+        }
+        else if (seq_pos > 0) {
+            // Part of a control sequence
+            if (seq_pos < 4) {
+                seq[seq_pos++] = c;
+                seq[seq_pos] = '\0';
+            }
+            
+            // Check for special keys
+            if (seq_pos == 3 && seq[0] == 27 && seq[1] == '[') {
+                // Check for numeric keypad with xterm
+                if (seq[2] >= '1' && seq[2] <= '4' && c == '~') {
+                    // Convert keypad number to regular number
+                    char keypad_num = seq[2];
+                    LOG_INFO("Numeric keypad key %c pressed", keypad_num);
+                    bool keystone_handled = keystone_handle_key(keypad_num);
+                    if (keystone_handled) {
+                        g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+                    }
+                    seq_pos = 0;
+                    return;
+                }
+            }
+            
+            // Reset sequence if not handled
+            if (seq_pos >= 3 || c != '[') {
+                seq_pos = 0;
+            }
+        }
+        
         // Special case: Force keystone mode with 'K'
         if (c == 'K') {
             LOG_INFO("Force enabling keystone mode with capital K");

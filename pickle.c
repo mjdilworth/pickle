@@ -1659,7 +1659,6 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 			
 			// Use RGBA format with proper alpha handling
-			fprintf(stderr, "DEBUG: Creating keystone FBO texture: %dx%d\n", want_w, want_h);
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 			
 			// Set proper blend mode to ensure texture can be displayed
@@ -1736,9 +1735,6 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Force default viewport settings for the FBO rendering
 		glViewport(0, 0, g_keystone_fbo_w, g_keystone_fbo_h);
 		
-		fprintf(stderr, "DEBUG: Rendering to keystone FBO: id=%u, size=%dx%d, border=%d\n", 
-			g_keystone_fbo, g_keystone_fbo_w, g_keystone_fbo_h, g_show_border);
-		
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)g_keystone_fbo, .w = g_keystone_fbo_w, .h = g_keystone_fbo_h, .internal_format = 0 };
 	} else {
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1800,9 +1796,6 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
 		glUniform1i(g_keystone_u_texture_loc, 0);
-		
-		fprintf(stderr, "DEBUG: Drawing keystone texture: id=%u, shaderProgram=%u, border=%d\n", 
-			g_keystone_fbo_texture, g_keystone_shader_program, g_show_border);
 		
 		// Always enable blending for proper rendering regardless of border state
 		glEnable(GL_BLEND);
@@ -1894,8 +1887,6 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			case GL_OUT_OF_MEMORY: fprintf(stderr, "GL_OUT_OF_MEMORY: There is not enough memory left to execute the command\n"); break;
 			default: fprintf(stderr, "Unknown OpenGL error\n");
 		}
-	} else {
-		fprintf(stderr, "DEBUG: Keystone texture drawn successfully\n");
 	}
 		
 		// Clean up
@@ -2371,7 +2362,7 @@ int main(int argc, char **argv) {
 	}
 	fprintf(stderr, "  k - Toggle keystone mode\n");
 	fprintf(stderr, "  1-4 - Select corner to adjust\n");
-	fprintf(stderr, "  w/a/s/d - Move selected corner up/left/down/right\n");
+	fprintf(stderr, "  Arrow keys - Move selected corner up/down/left/right\n");
 	fprintf(stderr, "  +/- - Increase/decrease adjustment step size\n");
 	fprintf(stderr, "  r - Reset keystone to default\n");
 	fprintf(stderr, "  b - Toggle border around video\n");

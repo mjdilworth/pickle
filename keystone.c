@@ -10,36 +10,11 @@
 #include <GLES2/gl2.h>
 #include <linux/limits.h>  // For PATH_MAX
 
-// Global keystone state
-keystone_t g_keystone = {
-    .points = {
-        {0.0f, 0.0f},  // Top-left
-        {1.0f, 0.0f},  // Top-right
-        {0.0f, 1.0f},  // Bottom-left
-        {1.0f, 1.0f}   // Bottom-right
-    },
-    .selected_corner = -1,
-    .enabled = false,
-    .matrix = {
-        1.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 1.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 1.0f
-    },
-    .mesh_enabled = false,
-    .mesh_size = 4,    // 4x4 mesh by default
-    .mesh_points = NULL,
-    .active_mesh_point = {-1, -1},
-    .initialized = false,
-    .border_visible = false,
-    .border_width = 5,
-    .corner_markers = true,
-    .perspective_pins = {false, false, false, false},
-    .active_corner = -1
-};
+// Global state for keystone correction
+keystone_t g_keystone = {0};
 
-// Keystone adjustment step size (in 1/1000 units)
-int g_keystone_adjust_step = 1;
+// Keystone adjustment step size (in 1/100 units - increased from 1/1000)
+int g_keystone_adjust_step = 10;  // Increased from 1 to 10
 
 // UI visibility flags
 int g_show_border = 0;  // Initialize to 0 (disabled) so border is not visible by default
@@ -421,8 +396,8 @@ void cleanup_keystone_resources(void) {
 void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
     if (corner < 0 || corner > 3) return;
     
-    // Apply adjustment scaled by step size
-    float scale = (float)g_keystone_adjust_step / 1000.0f;
+    // Apply adjustment scaled by step size - use larger scale factor
+    float scale = (float)g_keystone_adjust_step / 100.0f; // Changed from 1000.0f to 100.0f
     g_keystone.points[corner][0] += x_delta * scale;
     g_keystone.points[corner][1] += y_delta * scale;
     
@@ -662,6 +637,9 @@ int get_keystone_selected_corner(void) {
 
 // Simple key handler to be called from the main program
 bool keystone_handle_key(char key) {
+    LOG_INFO("Keystone handler received key: %d (0x%02x) '%c'", 
+             (int)key, (int)key, (key >= 32 && key < 127) ? key : '?');
+             
     if (!g_keystone.enabled) {
         // Special case to enable keystone mode with 'k'
         if (key == 'k') {
@@ -681,35 +659,47 @@ bool keystone_handle_key(char key) {
     // Process keystone keys only when keystone mode is enabled
     switch (key) {
         // Corner selection
-        case '1': // Top-left
+        case '1': // Top-left (ASCII 49)
+        case 1:   // Alternative keycode that might be sent
             g_keystone.active_corner = 0;
+            LOG_INFO("Selected corner 1 (top-left)");
             fprintf(stderr, "\rAdjusting corner %d (top-left)\n", g_keystone.active_corner + 1);
             return true;
-        case '2': // Top-right
+        case '2': // Top-right (ASCII 50)
+        case 2:   // Alternative keycode that might be sent
             g_keystone.active_corner = 1;
+            LOG_INFO("Selected corner 2 (top-right)");
             fprintf(stderr, "\rAdjusting corner %d (top-right)\n", g_keystone.active_corner + 1);
             return true;
-        case '3': // Bottom-left
+        case '3': // Bottom-left (ASCII 51)
+        case 3:   // Alternative keycode that might be sent
             g_keystone.active_corner = 2;
+            LOG_INFO("Selected corner 3 (bottom-left)");
             fprintf(stderr, "\rAdjusting corner %d (bottom-left)\n", g_keystone.active_corner + 1);
             return true;
-        case '4': // Bottom-right
+        case '4': // Bottom-right (ASCII 52)
+        case 4:   // Alternative keycode that might be sent
             g_keystone.active_corner = 3;
+            LOG_INFO("Selected corner 4 (bottom-right)");
             fprintf(stderr, "\rAdjusting corner %d (bottom-right)\n", g_keystone.active_corner + 1);
             return true;
             
         // Movement keys - arrow keys only
         case 65: // Up arrow
-            keystone_adjust_corner(g_keystone.active_corner, 0, -0.01f);
+            LOG_INFO("Keystone: Processing Up arrow key for corner %d", g_keystone.active_corner + 1);
+            keystone_adjust_corner(g_keystone.active_corner, 0, -0.05f);  // Increased from -0.01f
             return true;
         case 66: // Down arrow
-            keystone_adjust_corner(g_keystone.active_corner, 0, 0.01f);
+            LOG_INFO("Keystone: Processing Down arrow key for corner %d", g_keystone.active_corner + 1);
+            keystone_adjust_corner(g_keystone.active_corner, 0, 0.05f);  // Increased from 0.01f
             return true;
         case 68: // Left arrow
-            keystone_adjust_corner(g_keystone.active_corner, -0.01f, 0);
+            LOG_INFO("Keystone: Processing Left arrow key for corner %d", g_keystone.active_corner + 1);
+            keystone_adjust_corner(g_keystone.active_corner, -0.05f, 0);  // Increased from -0.01f
             return true;
         case 67: // Right arrow
-            keystone_adjust_corner(g_keystone.active_corner, 0.01f, 0);
+            LOG_INFO("Keystone: Processing Right arrow key for corner %d", g_keystone.active_corner + 1);
+            keystone_adjust_corner(g_keystone.active_corner, 0.05f, 0);  // Increased from 0.01f
             return true;
             
         // Toggle features
@@ -749,10 +739,8 @@ bool keystone_handle_key(char key) {
             g_keystone.enabled = !g_keystone.enabled;
             fprintf(stderr, "\rKeystone correction %s\n", g_keystone.enabled ? "enabled" : "disabled");
             return true;
-        case 27: // ESC - Exit keystone mode
-            g_keystone.enabled = false;
-            fprintf(stderr, "\rKeystone correction disabled\n");
-            return true;
+        // Remove handling of raw ESC key here since it's part of arrow key sequences
+        // and is already properly handled in event_callbacks.c
     }
     
     return false; // Key not handled
