@@ -109,4 +109,7 @@ void keystone_adjust_mesh_point(int row, int col, float x_delta, float y_delta);
 void keystone_toggle_pin(int corner);
 void cleanup_mesh_resources(void);
 
+// Get the current keystone configuration
+keystone_t *keystone_get_config(void);
+
 #endif // PICKLE_KEYSTONE_H

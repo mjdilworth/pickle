@@ -1,0 +1,21 @@
+--- Makefile.orig2023-11-15 10:00:00.000000000 -0000
++++ Makefile 2023-11-15 10:00:00.000000000 -0000
+@@ -30,6 +30,13 @@
+ SOURCES := $(COMMON_SOURCES) vulkan.c
+ else
+ SOURCES := $(COMMON_SOURCES)
++endif
++
++OBJECTS  := $(SOURCES:.c=.o)
++
++# Header files - including all common headers
++COMMON_HEADERS := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h render_backend.h
++
++ifeq ($(VULKAN),1)
++HEADERS := $(COMMON_HEADERS) vulkan.h
++else
++HEADERS := $(COMMON_HEADERS)
+ endif
+-
+-OBJECTS  := $(SOURCES:.c=.o)
+-HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h vulkan.h render_backend.h

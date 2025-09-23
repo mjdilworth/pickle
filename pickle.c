@@ -54,6 +54,7 @@
 #include "compute_keystone.h"
 #include "drm.h"
 #include "egl.h"
+#include "render_backend.h"
 
 // For event-driven architecture
 #ifdef EVENT_DRIVEN_ENABLED
@@ -2187,11 +2188,16 @@ int main(int argc, char **argv) {
 		{"loop", no_argument, NULL, 'l'},
 		{"help", no_argument, NULL, 'h'},
 		{"v4l2", no_argument, NULL, 'v'},
+		{"vulkan", no_argument, NULL, 'k'},
+		{"gles", no_argument, NULL, 'g'},
+		{"render-backend", required_argument, NULL, 'r'},
 		{0, 0, 0, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "lhv", long_options, NULL)) != -1) {
+	render_backend_type_t preferred_backend = RENDER_BACKEND_AUTO;
+	
+	while ((opt = getopt_long(argc, argv, "lhvkgr:", long_options, NULL)) != -1) {
 		switch (opt) {
 			case 'l':
 				g_loop_playback = 1;
@@ -2199,11 +2205,43 @@ int main(int argc, char **argv) {
 			case 'v':
 				g_use_v4l2_decoder = 1;
 				break;
+			case 'k':
+#ifdef VULKAN_ENABLED
+				preferred_backend = RENDER_BACKEND_VULKAN;
+#else
+				fprintf(stderr, "Warning: Vulkan support is not enabled in this build\n");
+#endif
+				break;
+			case 'g':
+				preferred_backend = RENDER_BACKEND_GLES;
+				break;
+			case 'r':
+				if (strcasecmp(optarg, "vulkan") == 0) {
+#ifdef VULKAN_ENABLED
+					preferred_backend = RENDER_BACKEND_VULKAN;
+#else
+					fprintf(stderr, "Warning: Vulkan support is not enabled in this build\n");
+#endif
+				} else if (strcasecmp(optarg, "gles") == 0 || 
+				           strcasecmp(optarg, "opengl") == 0 ||
+				           strcasecmp(optarg, "opengles") == 0) {
+					preferred_backend = RENDER_BACKEND_GLES;
+				} else if (strcasecmp(optarg, "auto") == 0) {
+					preferred_backend = RENDER_BACKEND_AUTO;
+				} else {
+					fprintf(stderr, "Warning: Unknown render backend '%s', using auto\n", optarg);
+				}
+				break;
 			case 'h':
 				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
 				fprintf(stderr, "  -v, --v4l2            Use V4L2 hardware decoder (RPi4 only)\n");
+#ifdef VULKAN_ENABLED
+				fprintf(stderr, "  -k, --vulkan          Use Vulkan renderer\n");
+#endif
+				fprintf(stderr, "  -g, --gles            Use OpenGL ES renderer\n");
+				fprintf(stderr, "  -r, --render-backend=<backend> Select renderer (auto, gles, vulkan)\n");
 				fprintf(stderr, "  -h, --help            Show this help message\n");
 				return 0;
 			default:
@@ -2217,6 +2255,10 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 		return 1;
 	}
+	
+	// Set the preferred render backend
+	render_backend_set_preferred(preferred_backend);
+	LOG_INFO("Preferred render backend: %s", render_backend_name(preferred_backend));
 
 	const char *file = argv[optind];
 	

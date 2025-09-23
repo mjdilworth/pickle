@@ -7,6 +7,11 @@
 #include "egl.h"
 #include "error.h"
 #include "frame_pacing.h"
+#include "render_backend.h"
+
+#ifdef VULKAN_ENABLED
+#include "vulkan.h"
+#endif
 
 // Forward declarations
 typedef struct mpv_handle mpv_handle;
@@ -14,7 +19,10 @@ typedef struct mpv_render_context mpv_render_context;
 
 // Render context
 typedef struct {
-    // OpenGL resources
+    // Render backend
+    render_backend_type_t backend_type;
+    
+    // OpenGL ES resources
     GLuint fbo;
     GLuint texture;
     int texture_width;
@@ -41,6 +49,11 @@ typedef struct {
     unsigned long frames_skipped;
     double render_time_ms;
     double max_render_time_ms;
+    
+#ifdef VULKAN_ENABLED
+    // Vulkan context
+    vulkan_ctx_t vulkan;
+#endif
 } render_context_t;
 
 // Initialize the render context
@@ -70,5 +83,11 @@ void render_set_keystone_disabled(render_context_t *ctx, bool disabled);
 
 // Get render statistics
 void render_get_stats(render_context_t *ctx, char *buffer, size_t buffer_size);
+
+// Set render backend
+pickle_result_t render_set_backend(render_context_t *ctx, render_backend_type_t backend);
+
+// Get current render backend name
+const char* render_get_backend_name(render_context_t *ctx);
 
 #endif // PICKLE_RENDER_H

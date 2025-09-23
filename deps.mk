@@ -1,11 +1,12 @@
 pickle.o: pickle.c drm_keystone.h keystone.h drm.h pickle_globals.h egl.h \
  v4l2_player.h v4l2_decoder.h utils.h shader.h input.h hvs_keystone.h \
- compute_keystone.h
+ compute_keystone.h render_backend.h error.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
 keystone.o: keystone.c keystone.h utils.h shader.h hvs_keystone.h \
  drm_keystone.h drm.h log.h
 keystone_funcs.o: keystone_funcs.c keystone.h utils.h
+keystone_get_config.o: keystone_get_config.c keystone.h
 drm.o: drm.c drm.h utils.h
 drm_atomic.o: drm_atomic.c drm.h log.h
 drm_keystone.o: drm_keystone.c drm_keystone.h keystone.h drm.h log.h \
@@ -21,7 +22,8 @@ zero_copy.o: zero_copy.c /usr/include/libdrm/drm_fourcc.h \
 input.o: input.c input.h utils.h keystone.h
 error.o: error.c error.h
 frame_pacing.o: frame_pacing.c frame_pacing.h error.h utils.h
-render.o: render.c
+render.o: render.c render.h drm.h egl.h error.h frame_pacing.h \
+ render_backend.h
 mpv.o: mpv.c mpv.h error.h utils.h
 dispmanx.o: dispmanx.c dispmanx.h log.h egl.h drm.h
 v4l2_decoder.o: v4l2_decoder.c v4l2_decoder.h log.h
@@ -39,3 +41,4 @@ pickle_globals.o: pickle_globals.c pickle_globals.h drm.h egl.h \
  v4l2_player.h v4l2_decoder.h
 mpv_render.o: mpv_render.c pickle_globals.h drm.h egl.h v4l2_player.h \
  v4l2_decoder.h mpv.h error.h
+render_backend.o: render_backend.c render_backend.h error.h log.h
