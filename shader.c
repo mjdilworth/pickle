@@ -21,7 +21,9 @@ const char* g_fragment_shader_src =
     "varying vec2 v_texCoord;\n"
     "uniform sampler2D u_texture;\n"
     "void main() {\n"
-    "    gl_FragColor = texture2D(u_texture, v_texCoord);\n"
+    "    vec4 color = texture2D(u_texture, v_texCoord);\n"
+    "    // We always want to see the video content, regardless of alpha\n"
+    "    gl_FragColor = vec4(color.rgb, 1.0);\n"
     "}\n";
 
 // Border shader: positions only, uniform color

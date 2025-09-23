@@ -314,6 +314,24 @@ bool init_keystone_shader(void) {
     g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
     g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
     
+    // Validate that all required attributes were found
+    if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
+        LOG_ERROR("Failed to get keystone shader attributes: pos=%d tex=%d u_tex=%d", 
+                  g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
+        
+        // Clean up on failure
+        glDeleteProgram(g_keystone_shader_program);
+        glDeleteShader(g_keystone_vertex_shader);
+        glDeleteShader(g_keystone_fragment_shader);
+        g_keystone_shader_program = 0;
+        g_keystone_vertex_shader = 0;
+        g_keystone_fragment_shader = 0;
+        return false;
+    }
+    
+    LOG_INFO("Keystone shader initialized: program=%u, pos=%d, tex=%d, u_tex=%d", 
+             g_keystone_shader_program, g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
+    
     return true;
 }
 

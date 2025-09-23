@@ -1650,22 +1650,68 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 				glDeleteTextures(1, &g_keystone_fbo_texture);
 				g_keystone_fbo_texture = 0;
 			}
-			// Create texture
+			// Create texture with proper configuration for video
 			glGenTextures(1, &g_keystone_fbo_texture);
 			glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-			// Use RGBA format to ensure proper alpha blending for video
+			
+			// Use RGBA format with proper alpha handling
+			fprintf(stderr, "DEBUG: Creating keystone FBO texture: %dx%d\n", want_w, want_h);
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			
+			// Set proper blend mode to ensure texture can be displayed
+			glBindTexture(GL_TEXTURE_2D, 0);
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			
+			// Check for errors in texture creation
+			GLenum tex_error = glGetError();
+			if (tex_error != GL_NO_ERROR) {
+				LOG_ERROR("Failed to create keystone texture: GL error %d", tex_error);
+				glBindTexture(GL_TEXTURE_2D, 0);
+				glDeleteTextures(1, &g_keystone_fbo_texture);
+				g_keystone_fbo_texture = 0;
+				return false;
+			}
 			// Create FBO
 			glGenFramebuffers(1, &g_keystone_fbo);
 			glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_keystone_fbo_texture, 0);
+			
+			// Check for errors during FBO configuration
+			GLenum fbo_error = glGetError();
+			if (fbo_error != GL_NO_ERROR) {
+				LOG_ERROR("Error configuring FBO: GL error %d", fbo_error);
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+				glDeleteFramebuffers(1, &g_keystone_fbo);
+				glDeleteTextures(1, &g_keystone_fbo_texture);
+				g_keystone_fbo = 0;
+				g_keystone_fbo_texture = 0;
+				return false;
+			}
+			
+			// Verify FBO is complete
 			GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
 			if (status != GL_FRAMEBUFFER_COMPLETE) {
-				LOG_ERROR("FBO setup failed, status: %d", status);
+				LOG_ERROR("FBO is incomplete, status: %d", status);
+				// Provide more detailed error information
+				switch (status) {
+					case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT:
+						LOG_ERROR("GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT - attachment point incomplete");
+						break;
+					case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:
+						LOG_ERROR("GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT - no attachments");
+						break;
+					case GL_FRAMEBUFFER_UNSUPPORTED:
+						LOG_ERROR("GL_FRAMEBUFFER_UNSUPPORTED - combination of formats not supported");
+						break;
+					default:
+						LOG_ERROR("Unknown framebuffer error");
+				}
+				
 				glBindFramebuffer(GL_FRAMEBUFFER, 0);
 				glDeleteFramebuffers(1, &g_keystone_fbo);
 				glDeleteTextures(1, &g_keystone_fbo_texture);
@@ -1684,8 +1730,14 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	if (g_keystone.enabled && g_keystone_fbo) {
 		// Clear the FBO first to ensure proper rendering
 		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
-		glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Clear with opaque black
 		glClear(GL_COLOR_BUFFER_BIT);
+		
+		// Force default viewport settings for the FBO rendering
+		glViewport(0, 0, g_keystone_fbo_w, g_keystone_fbo_h);
+		
+		fprintf(stderr, "DEBUG: Rendering to keystone FBO: id=%u, size=%dx%d, border=%d\n", 
+			g_keystone_fbo, g_keystone_fbo_w, g_keystone_fbo_h, g_show_border);
 		
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)g_keystone_fbo, .w = g_keystone_fbo_w, .h = g_keystone_fbo_h, .internal_format = 0 };
 	} else {
@@ -1706,6 +1758,14 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		return false;
 	}
 	
+	// Ensure proper OpenGL state before rendering
+	if (g_keystone.enabled) {
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_CULL_FACE);
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	}
+	
 	// Render the mpv frame
 	mpv_render_context_render(p->rctx, r_params);
 	
@@ -1714,13 +1774,35 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Switch back to default framebuffer
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		
+		// Reset viewport to match screen size
+		glViewport(0, 0, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
+		
 		// Use our shader program
 		glUseProgram(g_keystone_shader_program);
+		
+		// Check for shader attribute locations before using them
+		if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
+			// Re-acquire attribute locations
+			g_keystone_a_position_loc = glGetAttribLocation(g_keystone_shader_program, "a_position");
+			g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
+			g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
+			
+			fprintf(stderr, "DEBUG: Reacquired shader attributes: pos=%d tex=%d u_tex=%d\n", 
+				g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
+				
+			if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
+				fprintf(stderr, "ERROR: Failed to get shader attributes\n");
+				return false; // Can't continue with invalid attributes
+			}
+		}
 		
 		// Set up texture
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
 		glUniform1i(g_keystone_u_texture_loc, 0);
+		
+		fprintf(stderr, "DEBUG: Drawing keystone texture: id=%u, shaderProgram=%u, border=%d\n", 
+			g_keystone_fbo_texture, g_keystone_shader_program, g_show_border);
 		
 		// Always enable blending for proper rendering regardless of border state
 		glEnable(GL_BLEND);
@@ -1728,6 +1810,9 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		// Ensure alpha blending is properly handled for video content
 		glDisable(GL_DEPTH_TEST);
+		
+		// Clear any previous OpenGL errors
+		while (glGetError() != GL_NO_ERROR);
 		
 		// Correct warping approach: Draw a warped quad where vertices match the keystone corners
 		// Convert keystone points from normalized [0,1] space to clip space [-1,1]
@@ -1752,21 +1837,24 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		// Enable vertex arrays
 		glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+		glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+		
+		// Initialize buffers if needed
+		if (g_keystone_vertex_buffer == 0) {
+			glGenBuffers(1, &g_keystone_vertex_buffer);
+		}
+		if (g_keystone_texcoord_buffer == 0) {
+			glGenBuffers(1, &g_keystone_texcoord_buffer);
+		}
 		
 		// Bind and set vertex positions
 		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
 		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
 		glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
 		
-		// We need another VBO for texture coordinates
-		if (g_keystone_texcoord_buffer == 0) {
-			glGenBuffers(1, &g_keystone_texcoord_buffer);
-		}
-		
 		// Bind and set texture coordinates
 		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_texcoord_buffer);
 		glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_DYNAMIC_DRAW);
-		glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
 		glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
 		
 		// Prepare a cached index buffer for two triangles
@@ -1781,7 +1869,34 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 	// Draw using indexed triangles
 	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+	
+	// Unbind buffers
 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	
+	// Disable attribute arrays
+	glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+	glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+	
+	// Reset texture binding
+	glBindTexture(GL_TEXTURE_2D, 0);
+	
+	// Output debug info after drawing
+	GLenum error = glGetError();
+	if (error != GL_NO_ERROR) {
+		fprintf(stderr, "DEBUG: OpenGL error after drawing keystone texture: %d\n", error);
+		// Print more details about the error
+		switch (error) {
+			case GL_INVALID_ENUM: fprintf(stderr, "GL_INVALID_ENUM: An unacceptable value is specified for an enumerated argument\n"); break;
+			case GL_INVALID_VALUE: fprintf(stderr, "GL_INVALID_VALUE: A numeric argument is out of range\n"); break;
+			case GL_INVALID_OPERATION: fprintf(stderr, "GL_INVALID_OPERATION: The specified operation is not allowed in the current state\n"); break;
+			case GL_INVALID_FRAMEBUFFER_OPERATION: fprintf(stderr, "GL_INVALID_FRAMEBUFFER_OPERATION: The framebuffer object is not complete\n"); break;
+			case GL_OUT_OF_MEMORY: fprintf(stderr, "GL_OUT_OF_MEMORY: There is not enough memory left to execute the command\n"); break;
+			default: fprintf(stderr, "Unknown OpenGL error\n");
+		}
+	} else {
+		fprintf(stderr, "DEBUG: Keystone texture drawn successfully\n");
+	}
 		
 		// Clean up
 		glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
@@ -2218,7 +2333,12 @@ int main(int argc, char **argv) {
         
         // Make sure shader will be initialized on first render
         if (g_keystone_shader_program == 0) {
-            LOG_INFO("Keystone enabled at startup, shader will be initialized on first render");
+            LOG_INFO("Keystone enabled at startup, initializing shader");
+            if (!init_keystone_shader()) {
+                LOG_ERROR("Failed to initialize keystone shader at startup");
+            } else {
+                LOG_INFO("Keystone shader initialized successfully");
+            }
         }
     }
 	
