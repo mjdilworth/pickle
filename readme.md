@@ -396,3 +396,7 @@ Device E4:17:D8:6B:3B:35 8BitDo Zero 2 gamepad
 pair <MAC_ADDRESS>
 trust <MAC_ADDRESS>
 connect <MAC_ADDRESS>
+
+
+
+sudo ddrescue -b 32M -v /dev/sda /home/dilly/Projects/pickle/images/rpi4_backup.img /home/dilly/Projects/pickle/images/rpi4_backup.log

@@ -1,6 +1,7 @@
 #include "egl.h"
 #include "utils.h"
 #include "keystone.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -206,12 +207,15 @@ bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
 
     // We must pick an EGLConfig compatible with the GBM surface format (XRGB8888)
     EGLint cfg_attrs[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,  // Request OpenGL ES 3.x
+        EGL_CONFORMANT, EGL_OPENGL_ES3_BIT,       // Ensure conformant implementation
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
         EGL_ALPHA_SIZE, 0,
+        EGL_DEPTH_SIZE, 0,  // No depth buffer needed for 2D video
+        EGL_STENCIL_SIZE, 0, // No stencil buffer needed
         EGL_NONE
     };
     
@@ -254,10 +258,24 @@ bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
     free(cfgs);
     
     // Create EGL context
-    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    // Request OpenGL ES 3.1 for compute shader support
+    EGLint ctx_attr[] = { 
+        EGL_CONTEXT_CLIENT_VERSION, 3,  // Request OpenGL ES 3.x
+        EGL_CONTEXT_MINOR_VERSION_KHR, 1, // Request OpenGL ES 3.1 specifically
+        EGL_NONE 
+    };
     e->ctx = eglCreateContext(e->dpy, e->config, EGL_NO_CONTEXT, ctx_attr);
     if (e->ctx == EGL_NO_CONTEXT) {
-        RETURN_ERROR_EGL("eglCreateContext failed");
+        LOG_WARN("Failed to create OpenGL ES 3.1 context, falling back to OpenGL ES 2.0");
+        
+        // Fallback to OpenGL ES 2.0 if 3.1 is not supported
+        EGLint fallback_ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+        e->ctx = eglCreateContext(e->dpy, e->config, EGL_NO_CONTEXT, fallback_ctx_attr);
+        if (e->ctx == EGL_NO_CONTEXT) {
+            RETURN_ERROR_EGL("eglCreateContext failed even with fallback");
+        }
+    } else {
+        LOG_INFO("Successfully created OpenGL ES 3.1 context with compute shader support");
     }
     
     // Create window surface
@@ -269,7 +287,8 @@ bool init_gbm_egl(const kms_ctx_t *d, egl_ctx_t *e) {
         
         // Retry with alpha-enabled config if original lacked alpha
         EGLint retry_attrs[] = {
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,  // Try to maintain ES3 support
+            EGL_CONFORMANT, EGL_OPENGL_ES3_BIT,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
             EGL_RED_SIZE, 8,
             EGL_GREEN_SIZE, 8,

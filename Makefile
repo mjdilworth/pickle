@@ -24,9 +24,9 @@
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c drm.c drm_atomic.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c
 OBJECTS  := $(SOURCES:.c=.o)
-HEADERS  := utils.h shader.h keystone.h drm.h egl.h input.h error.h frame_pacing.h render.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h
+HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h
 
 # Toolchain / standards
 CROSS   ?=
@@ -44,8 +44,14 @@ ZEROCOPY ?= 1  # Enable zero-copy by default
 NO_MPV  ?= 0   # build with -DPICKLE_NO_MPV_DEFAULT so runtime can skip mpv init
 PERF    ?= 0   # high-performance build tweaks (e.g. make PERF=1)
 EVENT   ?= 1   # Enable event-driven architecture
+DISPMANX ?= 1  # Enable DispmanX support for RPi (e.g. make DISPMANX=1)
 
 PKGS       := mpv gbm egl glesv2 libdrm libv4l2
+
+# Add bcm_host package for Raspberry Pi with DispmanX
+ifeq ($(DISPMANX),1)
+	PKGS += bcm_host
+endif
 
 # Allow overriding pkg-config binary
 PKG_CONFIG ?= pkg-config
@@ -95,6 +101,11 @@ endif
 # Check for event-driven architecture enable
 ifeq ($(EVENT),1)
 	CFLAGS += -DEVENT_DRIVEN_ENABLED=1
+endif
+
+# Check for DispmanX support
+ifeq ($(DISPMANX),1)
+	CFLAGS += -DDISPMANX_ENABLED=1
 endif
 
 # RPi4-specific optimizations

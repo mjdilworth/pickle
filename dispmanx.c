@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <dlfcn.h>
 
 #if defined(DISPMANX_ENABLED)
 #include <bcm_host.h>
@@ -18,11 +19,55 @@ bool is_dispmanx_supported(void) {
     if (!checked) {
         checked = true;
         
+        // Try to load bcm_host library directly using dlopen
+        void *bcm_handle = dlopen("libbcm_host.so", RTLD_LAZY);
+        if (!bcm_handle) {
+            LOG_ERROR("Could not load libbcm_host.so: %s", dlerror());
+            // Try to find it in specific locations
+            bcm_handle = dlopen("/usr/lib/aarch64-linux-gnu/libbcm_host.so", RTLD_LAZY);
+            if (!bcm_handle) {
+                LOG_ERROR("Could not load libbcm_host.so from specific path: %s", dlerror());
+                // Fall back to system path searching
+                bcm_handle = dlopen("libbcm_host.so.0", RTLD_LAZY);
+                if (!bcm_handle) {
+                    LOG_ERROR("Could not load libbcm_host.so.0 either: %s", dlerror());
+                    return false;
+                }
+            }
+        }
+        
+        // If we got here, we loaded the library
+        LOG_INFO("Successfully loaded bcm_host library");
+        dlclose(bcm_handle);
+        
         // Try to initialize BCM host
         bcm_host_init();
         
-        // TODO: Add more specific checks for RPi hardware
-        supported = true;
+        // Check for Raspberry Pi hardware
+        char hardware[256] = {0};
+        FILE *fp = fopen("/proc/device-tree/model", "r");
+        if (fp) {
+            fread(hardware, 1, sizeof(hardware) - 1, fp);
+            fclose(fp);
+            
+            // Look for "Raspberry Pi" in the hardware string
+            LOG_INFO("Hardware detected: %s", hardware);
+            if (strstr(hardware, "Raspberry Pi") != NULL) {
+                // We're on a Raspberry Pi, now check for model 4
+                if (strstr(hardware, "Raspberry Pi 4") != NULL) {
+                    LOG_INFO("Raspberry Pi 4 detected, DispmanX supported");
+                    supported = true;
+                } else {
+                    LOG_INFO("Non-RPi4 hardware detected, HVS keystone may not be fully supported");
+                    // Still allow DispmanX for other Pi models
+                    supported = true;
+                }
+            } else {
+                LOG_INFO("Not running on Raspberry Pi hardware");
+            }
+        } else {
+            LOG_INFO("Could not detect hardware model, assuming DispmanX is not supported");
+        }
     }
     
     return supported;
@@ -46,10 +91,22 @@ bool dispmanx_init(dispmanx_ctx_t *ctx) {
     
     LOG_INFO("Display size: %dx%d", ctx->screen_width, ctx->screen_height);
     
-    // Open display
-    ctx->display = vc_dispmanx_display_open(0);
+    // Try multiple display IDs (0 for main LCD, 2 for HDMI)
+    // Display ID might be different depending on the Raspberry Pi configuration
+    ctx->display = DISPMANX_NO_HANDLE;
+    for (int display_id = 0; display_id <= 5; display_id++) {
+        LOG_INFO("Trying to open DispmanX display with ID: %d", display_id);
+        ctx->display = vc_dispmanx_display_open(display_id);
+        if (ctx->display != DISPMANX_NO_HANDLE) {
+            LOG_INFO("DispmanX display opened successfully (ID: %d)", display_id);
+            break;
+        } else {
+            LOG_INFO("Failed to open DispmanX display with ID: %d", display_id);
+        }
+    }
+    
     if (ctx->display == DISPMANX_NO_HANDLE) {
-        LOG_ERROR("Failed to open display");
+        LOG_ERROR("Failed to open display with any ID");
         return false;
     }
     
@@ -169,7 +226,7 @@ bool dispmanx_display_frame(dispmanx_ctx_t *ctx, uint32_t *buffer, uint32_t widt
                 0, // opacity
                 &ctx->dst_rect,
                 &ctx->src_rect,
-                NULL, // mask
+                0, // mask (DISPMANX_RESOURCE_HANDLE_T expects an unsigned int, not a pointer)
                 ctx->transform
             );
         }

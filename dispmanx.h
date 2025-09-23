@@ -4,9 +4,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// Forward declarations
+typedef struct dispmanx_ctx dispmanx_ctx_t;
+typedef struct egl_ctx egl_ctx_t;
+
 // Include bcm_host.h only when DISPMANX_ENABLED is defined
 #if defined(DISPMANX_ENABLED)
 #include <bcm_host.h>
+// Define these constants as they're not in the standard headers
+#define ELEMENT_CHANGE_LAYER         (1<<0)
+#define ELEMENT_CHANGE_OPACITY       (1<<1)
+#define ELEMENT_CHANGE_DEST_RECT     (1<<2)
+#define ELEMENT_CHANGE_SRC_RECT      (1<<3)
+#define ELEMENT_CHANGE_MASK_RESOURCE (1<<4)
+#define ELEMENT_CHANGE_TRANSFORM     (1<<5)
 #else
 // Provide stub typedefs for non-RPi platforms
 typedef uint32_t DISPMANX_DISPLAY_HANDLE_T;
@@ -21,19 +32,20 @@ typedef struct {
 } VC_RECT_T;
 typedef uint32_t VC_IMAGE_TYPE_T;
 typedef uint32_t VC_IMAGE_TRANSFORM_T;
+typedef uint32_t DISPMANX_TRANSFORM_T;
+#define DISPMANX_NO_HANDLE 0
+#define ELEMENT_CHANGE_DEST_RECT 1
+#define ELEMENT_CHANGE_TRANSFORM 4
+#endif
+
+// EGL_DISPMANX_WINDOW_T definition needed for both cases
 typedef struct {
     int32_t width;
     int32_t height;
     uint32_t handle;
 } EGL_DISPMANX_WINDOW_T;
-#define DISPMANX_NO_HANDLE 0
-#endif
 
 #include "log.h"
-
-// Forward declarations
-typedef struct dispmanx_ctx dispmanx_ctx_t;
-typedef struct egl_ctx egl_ctx_t;
 
 /**
  * DispmanX context structure for RPi-specific hardware acceleration
@@ -48,6 +60,8 @@ struct dispmanx_ctx {
     // Display dimensions and configuration
     uint32_t screen_width;
     uint32_t screen_height;
+    uint32_t frame_width;  // Current frame width
+    uint32_t frame_height; // Current frame height
     VC_RECT_T src_rect;
     VC_RECT_T dst_rect;
     

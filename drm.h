@@ -63,6 +63,7 @@ void deinit_atomic_modesetting(kms_ctx_t *d);
 // Status accessors
 bool is_drm_master(void);
 bool is_atomic_supported(void);
+kms_ctx_t* kms_get_ctx(void);
 
 // Zero-copy support functions
 bool should_use_zero_copy(kms_ctx_t *d, egl_ctx_t *egl_ctx);

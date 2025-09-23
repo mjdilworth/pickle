@@ -1,7 +1,8 @@
 #include "keystone.h"
 #include "utils.h"
 #include "shader.h"
-#include "hvs_keystone.h"
+#include "hvs_keystone.h"  // Legacy DispmanX implementation (deprecated)
+#include "drm_keystone.h"  // New DRM/KMS implementation
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,6 +197,31 @@ void keystone_init(void) {
             }
         }
     }
+    
+    // Initialize hardware keystone (DRM first, then DispmanX as fallback)
+    if (drm_keystone_is_supported()) {
+        if (!drm_keystone_init()) {
+            LOG_WARN("Failed to initialize DRM keystone, will try DispmanX or fall back to software");
+            
+            // Try DispmanX as fallback (deprecated)
+            if (hvs_keystone_is_supported()) {
+                if (!hvs_keystone_init()) {
+                    LOG_WARN("Failed to initialize HVS keystone, will use software implementation");
+                } else {
+                    LOG_INFO("Initialized HVS keystone (DispmanX - deprecated)");
+                }
+            }
+        } else {
+            LOG_INFO("Initialized DRM keystone");
+        }
+    } else if (hvs_keystone_is_supported()) {
+        // Legacy fallback to DispmanX (deprecated)
+        if (!hvs_keystone_init()) {
+            LOG_WARN("Failed to initialize HVS keystone, will use software implementation");
+        } else {
+            LOG_INFO("Initialized HVS keystone (DispmanX - deprecated)");
+        }
+    }
 }
 
 void keystone_cleanup(void) {
@@ -203,6 +229,16 @@ void keystone_cleanup(void) {
     cleanup_keystone_fbo();
     cleanup_mesh_resources();
     cleanup_keystone_resources();
+    
+    // Clean up hardware keystone resources
+    if (drm_keystone_is_active()) {
+        drm_keystone_cleanup();
+    }
+    
+    // Also clean up legacy DispmanX if needed
+    if (hvs_keystone_is_supported()) {
+        hvs_keystone_cleanup();
+    }
 }
 
 bool init_border_shader(void) {
@@ -412,9 +448,14 @@ void keystone_update_matrix(void) {
     // This is a placeholder for the matrix update function
     // In the real implementation, this would update any matrices needed for rendering
     
-    // Update HVS keystone if enabled and supported
-    if (g_keystone.enabled && hvs_keystone_is_supported()) {
-        hvs_keystone_update(&g_keystone);
+    // Update hardware keystone if enabled and supported (DRM preferred over DispmanX)
+    if (g_keystone.enabled) {
+        if (drm_keystone_is_supported()) {
+            drm_keystone_update(&g_keystone);
+        } else if (hvs_keystone_is_supported()) {
+            // Legacy fallback to DispmanX (deprecated)
+            hvs_keystone_update(&g_keystone);
+        }
     }
 }
 
@@ -562,16 +603,41 @@ bool keystone_load_config(const char* path) {
 void keystone_toggle_enabled(void) {
     g_keystone.enabled = !g_keystone.enabled;
     
-    // If keystone is enabled and HVS is supported, apply HVS keystone
-    if (g_keystone.enabled && hvs_keystone_is_supported()) {
-        if (!hvs_keystone_update(&g_keystone)) {
-            LOG_WARN("Failed to apply HVS keystone, falling back to software implementation");
-        } else {
-            LOG_INFO("Applied HVS keystone transformation");
+    // Apply hardware keystone if enabled (DRM preferred over DispmanX)
+    if (g_keystone.enabled) {
+        if (drm_keystone_is_supported()) {
+            if (!drm_keystone_update(&g_keystone)) {
+                LOG_WARN("Failed to apply DRM keystone, trying DispmanX or falling back to software");
+                
+                // Try DispmanX as fallback (deprecated)
+                if (hvs_keystone_is_supported()) {
+                    if (!hvs_keystone_update(&g_keystone)) {
+                        LOG_WARN("Failed to apply HVS keystone, falling back to software implementation");
+                    } else {
+                        LOG_INFO("Applied HVS keystone transformation (DispmanX - deprecated)");
+                    }
+                }
+            } else {
+                LOG_INFO("Applied DRM keystone transformation");
+            }
+        } else if (hvs_keystone_is_supported()) {
+            // Legacy fallback to DispmanX (deprecated)
+            if (!hvs_keystone_update(&g_keystone)) {
+                LOG_WARN("Failed to apply HVS keystone, falling back to software implementation");
+            } else {
+                LOG_INFO("Applied HVS keystone transformation (DispmanX - deprecated)");
+            }
         }
-    } else if (!g_keystone.enabled && hvs_keystone_is_supported()) {
-        // Clean up HVS keystone when disabled
-        hvs_keystone_cleanup();
+    } else {
+        // Clean up hardware keystone when disabled
+        if (drm_keystone_is_active()) {
+            drm_keystone_cleanup();
+        }
+        
+        // Also clean up legacy DispmanX if active
+        if (hvs_keystone_is_supported()) {
+            hvs_keystone_cleanup();
+        }
     }
     
     LOG_INFO("Keystone %s", g_keystone.enabled ? "enabled" : "disabled");

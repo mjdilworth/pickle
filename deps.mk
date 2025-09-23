@@ -1,13 +1,16 @@
-pickle.o: pickle.c pickle_globals.h drm.h egl.h v4l2_player.h \
- v4l2_decoder.h utils.h shader.h keystone.h input.h hvs_keystone.h \
+pickle.o: pickle.c drm_keystone.h keystone.h drm.h pickle_globals.h egl.h \
+ v4l2_player.h v4l2_decoder.h utils.h shader.h input.h hvs_keystone.h \
  compute_keystone.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
-keystone.o: keystone.c keystone.h utils.h shader.h hvs_keystone.h log.h
+keystone.o: keystone.c keystone.h utils.h shader.h hvs_keystone.h \
+ drm_keystone.h drm.h log.h
 keystone_funcs.o: keystone_funcs.c keystone.h utils.h
 drm.o: drm.c drm.h utils.h
 drm_atomic.o: drm_atomic.c drm.h log.h
-egl.o: egl.c egl.h drm.h utils.h keystone.h
+drm_keystone.o: drm_keystone.c drm_keystone.h keystone.h drm.h log.h \
+ drm_atomic.h /usr/include/libdrm/drm_fourcc.h
+egl.o: egl.c egl.h drm.h utils.h keystone.h log.h
 egl_dmabuf.o: egl_dmabuf.c /usr/include/libdrm/drm_fourcc.h \
  /usr/include/libdrm/drm.h /usr/include/libdrm/drm_mode.h drm.h egl.h \
  log.h

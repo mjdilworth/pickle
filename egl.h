@@ -40,6 +40,7 @@ typedef struct egl_ctx {
     EGLConfig config;
     EGLContext ctx;
     EGLSurface surf;
+    void *native_window;     // For DispmanX integration
     
     // DMA-BUF support
     bool dmabuf_supported;

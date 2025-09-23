@@ -30,6 +30,7 @@
 
 // Global state
 static int g_have_master = 0; // set if we successfully become DRM master
+static kms_ctx_t *g_kms_ctx = NULL; // global reference to active KMS context
 
 /**
  * Attempt to become DRM master
@@ -59,6 +60,25 @@ bool is_drm_master(void) {
 }
 
 /**
+ * Check if atomic modesetting is supported
+ * 
+ * @return true if atomic modesetting is supported, false otherwise
+ */
+bool is_atomic_supported(void) {
+    if (!g_kms_ctx) return false;
+    return g_kms_ctx->atomic_supported;
+}
+
+/**
+ * Get the global KMS context
+ * 
+ * @return Pointer to the global KMS context or NULL if not initialized
+ */
+kms_ctx_t* kms_get_ctx(void) {
+    return g_kms_ctx;
+}
+
+/**
  * Initialize DRM by scanning available cards and finding one with a connected display
  * 
  * @param d Pointer to kms_ctx structure to initialize
@@ -67,6 +87,9 @@ bool is_drm_master(void) {
 bool init_drm(kms_ctx_t *d) {
     memset(d, 0, sizeof(*d));
     d->fd = -1; // Initialize to invalid
+    
+    // Store global reference
+    g_kms_ctx = d;
 
     // Enumerate potential /dev/dri/card* nodes (0-15) to find one with resources + connected connector.
     // On Raspberry Pi 4 with full KMS (dtoverlay=vc4-kms-v3d), the primary render/display node
@@ -231,6 +254,11 @@ void deinit_drm(kms_ctx_t *d) {
     // Clean up atomic modesetting resources
     if (d->atomic_supported) {
         deinit_atomic_modesetting(d);
+    }
+    
+    // Clear global reference if it points to this context
+    if (g_kms_ctx == d) {
+        g_kms_ctx = NULL;
     }
     
     // Destroy mode blob if created

@@ -38,6 +38,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include "drm_keystone.h" // Include the DRM keystone header
 #include <sys/epoll.h>
 #include <sys/poll.h>
 
@@ -1616,8 +1617,11 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
 	}
 	
-	// Initialize keystone shader if needed and enabled
-	if (g_keystone.enabled && g_keystone_shader_program == 0) {
+	// Check if we should use hardware-accelerated DRM keystone instead of software keystone
+	bool use_drm_keystone = g_keystone.enabled && drm_keystone_is_supported() && drm_keystone_is_active();
+	
+	// Initialize keystone shader if needed and enabled (only for software keystone)
+	if (g_keystone.enabled && !use_drm_keystone && g_keystone_shader_program == 0) {
 		if (!init_keystone_shader()) {
 			LOG_ERROR("Failed to initialize keystone shader, disabling keystone correction");
 			g_keystone.enabled = false;
@@ -1635,8 +1639,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 	
-	// Ensure reusable FBO exists when keystone is enabled, sized to current mode
-	if (g_keystone.enabled) {
+	// Ensure reusable FBO exists when software keystone is enabled, sized to current mode
+	if (g_keystone.enabled && !use_drm_keystone) {
 		int want_w = (int)d->mode.hdisplay;
 		int want_h = (int)d->mode.vdisplay;
 		bool need_recreate = (g_keystone_fbo == 0) || (g_keystone_fbo_w != want_w) || (g_keystone_fbo_h != want_h);
@@ -1726,7 +1730,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	// Render MPV frame either to our FBO or directly to screen
 	mpv_opengl_fbo mpv_fbo;
 	int mpv_flip_y = 0; // default: no flip (handled in final pass if needed)
-	if (g_keystone.enabled && g_keystone_fbo) {
+	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo) {
 		// Clear the FBO first to ensure proper rendering
 		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Clear with opaque black
@@ -1755,7 +1759,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	}
 	
 	// Ensure proper OpenGL state before rendering
-	if (g_keystone.enabled) {
+	if (g_keystone.enabled && !use_drm_keystone) {
 		glDisable(GL_DEPTH_TEST);
 		glDisable(GL_CULL_FACE);
 		glEnable(GL_BLEND);
@@ -1765,8 +1769,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	// Render the mpv frame
 	mpv_render_context_render(p->rctx, r_params);
 	
-	// If keystone is enabled, render the FBO texture with our shader
-	if (g_keystone.enabled && g_keystone_fbo && g_keystone_fbo_texture) {
+	// If software keystone is enabled, render the FBO texture with our shader
+	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo && g_keystone_fbo_texture) {
 		// Switch back to default framebuffer
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		
@@ -1897,8 +1901,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glUseProgram(0);
 	}
 	
-	// Draw border around the keystone quad if enabled
-	if (g_show_border) {
+	// Draw border around the keystone quad if enabled (software keystone only)
+	if (g_show_border && !use_drm_keystone) {
 		// Determine quad positions in clip space matching the keystone corners
 		float vx = g_keystone.points[0][0]*2.0f-1.0f;
 		float vy = 1.0f-(g_keystone.points[0][1]*2.0f);
@@ -1931,9 +1935,9 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glUseProgram(0);
 	}
 	
-	// Draw corner markers for keystone adjustment if enabled
+	// Draw corner markers for keystone adjustment if enabled (software keystone only)
 	// This is simplistic and would need a shader-based approach for proper GLES2 implementation
-	if (g_keystone.enabled && g_show_corner_markers) {
+	if (g_keystone.enabled && !use_drm_keystone && g_show_corner_markers) {
 		// Draw colored markers at each corner position to show their current locations
 		int corner_size = 10;
 		glEnable(GL_BLEND);
@@ -1972,6 +1976,18 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	
 	// Swap buffers to display the rendered frame
 	eglSwapBuffers(e->dpy, e->surf);
+
+	// If we're using DRM keystone, apply the transformation after the OpenGL rendering is done
+	if (use_drm_keystone) {
+		// Get the current DRM framebuffer ID
+		GLint current_fb;
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fb);
+		
+		// Update the DRM keystone transformation for this frame
+		if (!drm_keystone_display_frame(NULL, 0, 0, 0, 0)) {
+			LOG_WARN("Failed to apply DRM keystone transformation for this frame");
+		}
+	}
 
 	static bool first_frame = true;
 
