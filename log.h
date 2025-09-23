@@ -7,8 +7,15 @@
 // Simple logging macros
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
+
+// Only define these if they're not already defined (avoid conflict with utils.h)
+#ifndef LOG_INFO
 #define LOG_INFO(fmt, ...)  fprintf(stderr, "[INFO]  " fmt "\n", ##__VA_ARGS__)
+#endif
+
+#ifndef LOG_DEBUG
 #define LOG_DEBUG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#endif
 
 // Domain-specific logging
 #define LOG_DRM(fmt, ...)   fprintf(stderr, "[DRM]   " fmt "\n", ##__VA_ARGS__)

@@ -58,8 +58,6 @@ bool init_keystone_shader(void);
 void cleanup_keystone_shader(void);
 void update_keystone_mesh(void);
 void render_with_keystone(GLuint source_texture, int width, int height);
-void draw_keystone_border(void);
-void draw_keystone_corner_markers(void);
 
 // Toggle functions
 void keystone_toggle_enabled(void);
@@ -84,9 +82,9 @@ int get_keystone_selected_corner(void);
 // Accessor functions for adapter layer (transition)
 keystone_t *get_keystone_data(void);
 int *get_keystone_adjust_step(void);
-bool *get_keystone_border_visible_ptr(void);
+int *get_keystone_border_visible_ptr(void);
 int *get_keystone_border_width_ptr(void);
-bool *get_keystone_corner_markers_ptr(void);
+int *get_keystone_corner_markers_ptr(void);
 GLuint *get_keystone_shader_program_ptr(void);
 GLuint *get_keystone_vertex_shader_ptr(void);
 GLuint *get_keystone_fragment_shader_ptr(void);

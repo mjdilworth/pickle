@@ -76,7 +76,7 @@ int *get_keystone_adjust_step(void) {
     return &g_keystone_adjust_step;
 }
 
-bool *get_keystone_border_visible_ptr(void) {
+int *get_keystone_border_visible_ptr(void) {
     return &g_keystone.border_visible;
 }
 
@@ -84,7 +84,7 @@ int *get_keystone_border_width_ptr(void) {
     return &g_keystone.border_width;
 }
 
-bool *get_keystone_corner_markers_ptr(void) {
+int *get_keystone_corner_markers_ptr(void) {
     return &g_keystone.corner_markers;
 }
 

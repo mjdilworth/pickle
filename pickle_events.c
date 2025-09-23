@@ -1,6 +1,7 @@
 #include "pickle_events.h"
 #include "event_callbacks.h"
 #include "v4l2_player.h"
+#include "pickle_globals.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -10,14 +11,6 @@
 #include <signal.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
-
-// External globals from pickle.c
-extern int g_debug;
-extern int g_stop;
-extern volatile int g_mpv_wakeup;
-extern volatile uint64_t g_mpv_update_flags;
-extern int g_joystick_fd;
-extern int g_mpv_pipe[2];
 extern int g_pending_flip;
 extern int g_use_v4l2_decoder;
 extern int g_scanout_disabled;
@@ -30,7 +23,8 @@ extern uint64_t g_frames;
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
 
 // External render function declarations
-extern bool render_frame_mpv(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p);
+// External render function declarations
+extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ctx_t *drm, egl_ctx_t *eglc);
 extern bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p);
 
 // Initialize the event system for Pickle
@@ -167,7 +161,7 @@ bool pickle_event_process_and_render(event_ctx_t *ctx, kms_ctx_t *drm, egl_ctx_t
     // Check if MPV wants to render a frame
     if (g_mpv_update_flags & MPV_RENDER_UPDATE_FRAME) {
         need_frame = 1;
-        g_mpv_update_flags &= ~MPV_RENDER_UPDATE_FRAME;
+        g_mpv_update_flags &= ~((uint64_t)MPV_RENDER_UPDATE_FRAME);
     }
     
     // Render a frame if needed
@@ -178,7 +172,7 @@ bool pickle_event_process_and_render(event_ctx_t *ctx, kms_ctx_t *drm, egl_ctx_t
         if (g_use_v4l2_decoder && v4l2_player) {
             render_ok = render_v4l2_frame(drm, egl, v4l2_player);
         } else if (player && player->handle) {
-            render_ok = render_frame_mpv(drm, egl, player);
+            render_ok = render_frame_mpv(player->handle, player->render_ctx, drm, egl);
         }
         
         if (!render_ok) {

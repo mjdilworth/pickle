@@ -300,10 +300,11 @@ bool handle_joystick_event(struct js_event *event) {
         // Toggle keystone correction with L1/R1 simultaneously
         if (event->value == 1 && (event->number == JS_BUTTON_L1 || event->number == JS_BUTTON_R1)) {
             static struct timeval last_shoulder = {0};
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            long ms = (now.tv_sec - last_shoulder.tv_sec) * 1000 + (now.tv_usec - last_shoulder.tv_usec) / 1000;
-            last_shoulder = now;
+            struct timeval shoulder_now;
+            gettimeofday(&shoulder_now, NULL);
+            long ms = (shoulder_now.tv_sec - last_shoulder.tv_sec) * 1000 + 
+                     (shoulder_now.tv_usec - last_shoulder.tv_usec) / 1000;
+            last_shoulder = shoulder_now;
             
             if (ms < 500) { // Both shoulders pressed within 500ms
                 keystone_toggle_enabled();

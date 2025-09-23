@@ -6,12 +6,12 @@
 #include <mpv/client.h>
 
 // Global debug flag (defined here)
-int g_debug = 0;
+// g_debug is now defined in pickle_globals.c
 static volatile sig_atomic_t g_interrupted = 0;
 
 double tv_diff(const struct timeval *tv1, const struct timeval *tv2) {
-    return (tv2->tv_sec - tv1->tv_sec) + 
-           (tv2->tv_usec - tv1->tv_usec) / 1000000.0;
+    return (double)(tv2->tv_sec - tv1->tv_sec) + 
+           (double)(tv2->tv_usec - tv1->tv_usec) / 1000000.0;
 }
 
 static void signal_handler(int sig) {

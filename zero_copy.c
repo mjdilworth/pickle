@@ -142,12 +142,6 @@ bool present_frame_zero_copy(kms_ctx_t *d, egl_ctx_t *e, unsigned int video_text
     // shader program for rendering textures
     
     // For now, we'll just use a very basic draw to render the texture
-    GLfloat vertices[] = {
-        -1.0f,  1.0f, 0.0f, 0.0f, 1.0f,  // Top left
-        -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,  // Bottom left
-         1.0f,  1.0f, 0.0f, 1.0f, 1.0f,  // Top right
-         1.0f, -1.0f, 0.0f, 1.0f, 0.0f   // Bottom right
-    };
     
     // This is a placeholder - in a real implementation you would use
     // your existing rendering code to draw the texture to the FBO

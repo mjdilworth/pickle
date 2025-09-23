@@ -37,7 +37,7 @@ event_ctx_t *event_init(int max_sources) {
     }
     
     // Allocate memory for event sources
-    ctx->sources = (event_source_t *)calloc(max_sources, sizeof(event_source_t));
+    ctx->sources = (event_source_t *)calloc((size_t)max_sources, sizeof(event_source_t));
     if (!ctx->sources) {
         LOG_ERROR("Failed to allocate memory for event sources");
         close(ctx->epoll_fd);

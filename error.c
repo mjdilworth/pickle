@@ -21,7 +21,7 @@ void pickle_log_error(const char *file, int line, const char *func, pickle_resul
     // Add the specific error message
     va_list args;
     va_start(args, fmt);
-    vsnprintf(g_error_ctx.last_error_msg + offset, MAX_ERROR_MSG_LEN - offset, fmt, args);
+    vsnprintf(g_error_ctx.last_error_msg + offset, (size_t)(MAX_ERROR_MSG_LEN - offset), fmt, args);
     va_end(args);
     
     // Store the error code

@@ -6,6 +6,7 @@
 #include "keystone.h"
 #include "drm.h"
 #include "v4l2_player.h"
+#include "pickle_globals.h"
 #include <linux/input.h>
 
 /**

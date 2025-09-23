@@ -118,8 +118,8 @@ void frame_pacing_frame_presented(frame_pacing_context_t *ctx) {
     double frame_time_abs = fabs((double)frame_time_ns);
     
     // Update running average
-    ctx->avg_frame_time = (ctx->avg_frame_time * (ctx->frames_rendered - 1) + 
-                           frame_time_abs) / ctx->frames_rendered;
+    ctx->avg_frame_time = (ctx->avg_frame_time * (double)(ctx->frames_rendered - 1) + 
+                           frame_time_abs) / (double)ctx->frames_rendered;
     
     // Update min/max
     if (frame_time_abs > ctx->max_frame_time) {

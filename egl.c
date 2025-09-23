@@ -111,12 +111,12 @@ bool create_dmabuf_from_bo(egl_ctx_t *e, struct gbm_bo *bo, dmabuf_info_t *dmabu
     
     // Create EGL image from DMA-BUF
     EGLint attribs[] = {
-        EGL_WIDTH, dmabuf->width,
-        EGL_HEIGHT, dmabuf->height,
-        EGL_LINUX_DRM_FOURCC_EXT, dmabuf->format,
+        EGL_WIDTH, (EGLint)dmabuf->width,
+        EGL_HEIGHT, (EGLint)dmabuf->height,
+        EGL_LINUX_DRM_FOURCC_EXT, (EGLint)dmabuf->format,
         EGL_DMA_BUF_PLANE0_FD_EXT, dmabuf->fd,
         EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, dmabuf->stride,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)dmabuf->stride,
         EGL_NONE
     };
     
@@ -434,7 +434,6 @@ uint32_t get_framebuffer_for_bo(int fd, struct gbm_bo *bo) {
     uint32_t height = gbm_bo_get_height(bo);
     uint32_t format = gbm_bo_get_format(bo);
     uint32_t handles[4] = {0}, strides[4] = {0}, offsets[4] = {0};
-    uint64_t modifiers[4] = {0};
     
     handles[0] = gbm_bo_get_handle(bo).u32;
     strides[0] = gbm_bo_get_stride(bo);

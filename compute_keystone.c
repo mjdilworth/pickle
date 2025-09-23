@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <GLES3/gl31.h>
+#include <GLES3/gl32.h>  // Using GLES 3.2 for glCopyImageSubData
 
 // Define the compute shader source
 const char *g_compute_shader_src = 
@@ -352,8 +352,8 @@ bool compute_keystone_apply(keystone_t *keystone, GLuint source_texture, int wid
     }
     
     // Dispatch compute shader
-    int group_x = (width + 15) / 16;
-    int group_y = (height + 15) / 16;
+    unsigned int group_x = ((unsigned int)width + 15U) / 16U;
+    unsigned int group_y = ((unsigned int)height + 15U) / 16U;
     glDispatchCompute(group_x, group_y, 1);
     
     // Wait for compute shader to finish
@@ -398,26 +398,41 @@ bool compute_keystone_apply(keystone_t *keystone, GLuint source_texture, int wid
     glUniform1i(tex_uniform, 0);  // Texture unit 0
     
     // Set up vertex attributes
-    glEnableVertexAttribArray(pos_attrib);
-    glVertexAttribPointer(pos_attrib, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    if (pos_attrib >= 0) {
+        glEnableVertexAttribArray((GLuint)pos_attrib);
+        glVertexAttribPointer((GLuint)pos_attrib, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    }
     
-    glEnableVertexAttribArray(tex_attrib);
-    glVertexAttribPointer(tex_attrib, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
+    if (tex_attrib >= 0) {
+        glEnableVertexAttribArray((GLuint)tex_attrib);
+        glVertexAttribPointer((GLuint)tex_attrib, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
+    }
     
     // Draw the quad
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, indices);
     
     // Clean up
-    glDisableVertexAttribArray(pos_attrib);
-    glDisableVertexAttribArray(tex_attrib);
+    if (pos_attrib >= 0) {
+        glDisableVertexAttribArray((GLuint)pos_attrib);
+    }
+    if (tex_attrib >= 0) {
+        glDisableVertexAttribArray((GLuint)tex_attrib);
+    }
+    
+    // Convert keystone points to corners array
+    float corners[8];
+    for (int i = 0; i < 4; i++) {
+        corners[i*2] = keystone->points[i][0];
+        corners[i*2+1] = keystone->points[i][1];
+    }
     
     // Draw border and corner markers if enabled
     if (keystone->border_visible) {
-        draw_keystone_border();
+        draw_keystone_border(corners);
     }
     
     if (keystone->corner_markers) {
-        draw_keystone_corner_markers();
+        draw_keystone_corner_markers(corners, keystone->selected_corner);
     }
     
     return true;

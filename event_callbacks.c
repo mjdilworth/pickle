@@ -12,26 +12,14 @@
 #include <drm/drm_fourcc.h>
 #include <linux/joystick.h>
 
-// Declaration of the page_flip_handler from pickle.c
-static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data);
-
-// External globals from pickle.c
+// External globals declared in pickle_globals.h
 extern int g_debug;
-extern int g_stop;
+extern volatile int g_stop;
 extern volatile int g_mpv_wakeup;
 extern volatile uint64_t g_mpv_update_flags;
 extern int g_joystick_enabled;
-extern int g_show_border; // Changed from bool to int to match keystone.h
-extern int g_selected_corner;
 extern int g_help_visible;
 extern int g_help_toggle_request;
-
-// Declaration of functions from pickle.c
-extern void drain_mpv_events(mpv_handle *mpv);
-extern bool keystone_handle_key(char key);
-extern bool handle_joystick_event(struct js_event *event);
-extern void show_help_overlay(mpv_handle *mpv);
-extern void hide_help_overlay(mpv_handle *mpv);
 
 // Define logging macros similar to other Pickle components
 #define LOG_EVENT(fmt, ...) fprintf(stderr, "[EVENT] " fmt "\n", ##__VA_ARGS__)

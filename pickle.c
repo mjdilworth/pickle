@@ -42,6 +42,9 @@
 #include <sys/poll.h>
 
 // Include our refactored modules
+#include "pickle_globals.h"
+
+// Include our refactored modules
 #include "utils.h"
 #include "shader.h"
 #include "keystone.h"
@@ -134,7 +137,8 @@ static const char *mpv_end_reason_str(int r) {
 #define RETURN_ERROR_EGL(msg) do { LOG_ERROR("%s (eglError=0x%04x)", msg, eglGetError()); return false; } while (0)
 #define RETURN_ERROR_IF(cond, msg) do { if (cond) { RETURN_ERROR(msg); } } while (0)
 
-static volatile sig_atomic_t g_stop = 0;
+// Exported globals for use in other modules
+volatile sig_atomic_t g_stop = 0;
 static void handle_sigint(int s){ (void)s; g_stop = 1; }
 static void handle_sigsegv(int s){
 	(void)s;
@@ -213,7 +217,7 @@ typedef struct fb_ring_entry fb_ring_entry_t;
 // Global state 
 static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
-static int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
+int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
 
 // These keystone settings are defined in keystone.c through pickle_keystone adapter
 // Removed static variables and using extern from pickle_keystone.h
@@ -228,11 +232,11 @@ static GLint  g_border_a_position_loc = -1;
 static GLint  g_border_u_color_loc = -1;
 
 // Joystick/gamepad support
-static int g_joystick_fd = -1;        // File descriptor for joystick
-static bool g_joystick_enabled = false; // Whether joystick support is enabled
+int g_joystick_fd = -1;        // File descriptor for joystick
+int g_joystick_enabled = 0; // Whether joystick support is enabled
 static char g_joystick_name[128];     // Name of the connected joystick
 static int g_selected_corner = 0;     // Currently selected corner (0-3)
-static struct timeval g_last_js_event_time = {0}; // For debouncing joystick events
+// Removed g_last_js_event_time - now handled in input.c
 
 // Gamepad layout for ABXY (xbox vs nintendo)
 typedef enum { GP_LAYOUT_AUTO = 0, GP_LAYOUT_XBOX, GP_LAYOUT_NINTENDO } gp_layout_t;
@@ -289,7 +293,7 @@ static bool g_use_label_mapping = false;
 static int g_x_cycle_enabled = 1; // default: X cycles corners TL->TR->BR->BL
 static int g_cycle_button_code = JS_BUTTON_X; // which button number cycles corners
 static int g_help_button_code = JS_BUTTON_B;  // which button number toggles help
-static int g_help_toggle_request = 0;         // raised by joystick, handled in main loop
+// g_help_toggle_request is now defined in pickle_globals.c
 
 static int parse_corner_token(const char *t) {
 	if (!t) return -1;
@@ -410,7 +414,8 @@ static void configure_special_buttons(void) {
 
 // Forward declarations
 static bool init_joystick(void);
-static bool handle_joystick_event(struct js_event *event);
+// Function is defined in input.c, don't need declaration here
+// bool handle_joystick_event(struct js_event *event);
 
 bool ensure_drm_master(int fd) __attribute__((weak)); 
 bool ensure_drm_master(int fd) {
@@ -774,35 +779,13 @@ typedef struct {
 	int using_libmpv;            // Flag indicating fallback to vo=libmpv occurred
 } mpv_player_t;
 
-// V4L2 decoder integration
-typedef struct {
-	v4l2_decoder_t *decoder;     // V4L2 decoder instance
-	v4l2_codec_t codec;          // Codec being used
-	uint32_t width;              // Video width
-	uint32_t height;             // Video height
-	int is_active;               // Flag indicating decoder is active
-	FILE *input_file;            // Input file handle
-	uint8_t *buffer;             // Buffer for reading file data
-	size_t buffer_size;          // Size of the buffer
-	int64_t timestamp;           // Current timestamp
-	GLuint texture;              // OpenGL texture for rendering
-    
-    // Current frame information
-    struct {
-        bool valid;              // Is the current frame valid
-        int dmabuf_fd;           // DMA-BUF file descriptor for current frame
-        uint32_t width;          // Frame width
-        uint32_t height;         // Frame height
-        uint32_t format;         // Frame format
-        GLuint texture;          // OpenGL texture for current frame
-        int buf_index;           // Buffer index for returning to decoder
-    } current_frame;
-} v4l2_player_t;
+// V4L2 decoder integration is defined in v4l2_player.h
+#include "v4l2_player.h"
 #endif // EVENT_DRIVEN_ENABLED
 
 // Wakeup callback sets a flag so main loop knows mpv wants processing.
-static volatile int g_mpv_wakeup = 0;
-static int g_mpv_pipe[2] = {-1,-1}; // pipe to integrate mpv wakeups into poll loop
+volatile int g_mpv_wakeup = 0;
+int g_mpv_pipe[2] = {-1,-1}; // pipe to integrate mpv wakeups into poll loop
 static void mpv_wakeup_cb(void *ctx) {
 	(void)ctx;
 	g_mpv_wakeup = 1;
@@ -811,7 +794,7 @@ static void mpv_wakeup_cb(void *ctx) {
 		if (write(g_mpv_pipe[1], &b, 1) < 0) { /* ignore EAGAIN */ }
 	}
 }
-static volatile uint64_t g_mpv_update_flags = 0; // bitmask from mpv_render_context_update
+volatile uint64_t g_mpv_update_flags = 0; // bitmask from mpv_render_context_update
 static void on_mpv_events(void *data) { (void)data; g_mpv_wakeup = 1; }
 
 // Performance controls
@@ -822,7 +805,7 @@ static int g_frame_timing_enabled = 0;  // Detailed frame timing metrics (when P
 // Texture orientation controls (used in keystone pass only)
 static int g_tex_flip_x = 0; // 1 = mirror horizontally (left/right)
 static int g_tex_flip_y = 0; // 1 = flip vertically (top/bottom)
-static int g_help_visible = 0; // toggle state for help overlay
+int g_help_visible = 0; // toggle state for help overlay
 
 // --- Statistics ---
 static int g_stats_enabled = 0;
@@ -907,7 +890,7 @@ static void stats_log_final(mpv_player_t *p) {
 }
 
 // Display a help overlay using mpv's built-in OSD
-static void show_help_overlay(mpv_handle *mpv) {
+void show_help_overlay(mpv_handle *mpv) {
 	if (!mpv) return;
 	const char *text =
 		"Pickle controls:\n"
@@ -963,7 +946,7 @@ static void show_help_overlay(mpv_handle *mpv) {
 	mpv_command(mpv, cmd);
 }
 
-static void hide_help_overlay(mpv_handle *mpv) {
+void hide_help_overlay(mpv_handle *mpv) {
 	if (!mpv) return;
 	// Clear by showing empty text for 1ms
 	const char *cmd[] = { "show-text", "", "1", NULL };
@@ -1362,7 +1345,7 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	return true;
 }
 
-static void drain_mpv_events(mpv_handle *h) {
+void drain_mpv_events(mpv_handle *h) {
 	while (1) {
 		mpv_event *ev = mpv_wait_event(h, 0);
 		if (ev->event_id == MPV_EVENT_NONE) break;
@@ -1433,8 +1416,8 @@ static void drain_mpv_events(mpv_handle *h) {
 static struct egl_ctx *g_egl_for_handler;
 // Forward state needed by page flip handler (must appear before handler definition)
 static struct gbm_bo *g_first_frame_bo = NULL; // BO used for initial modeset, released after second frame
-static int g_pending_flip = 0; // set after scheduling page flip until event handler fires
-static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data) {
+int g_pending_flip = 0; // set after scheduling page flip until event handler fires
+void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data) {
 	(void)fd; (void)frame;
 	struct gbm_bo *old = data;
 	if (g_egl_for_handler && old) gbm_surface_release_buffer(g_egl_for_handler->gbm_surf, old);
@@ -1683,279 +1666,12 @@ static void cleanup_joystick(void) {
     g_joystick_enabled = false;
 }
 
-/**
- * Process a joystick event for keystone control
- * Maps 8BitDo controller buttons to keystone adjustment actions
- * 
- * @param event The joystick event to process
- * @return true if the event was handled and resulted in a keystone adjustment
- */
-static bool handle_joystick_event(struct js_event *event) {
-    // Debounce to prevent too many events
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    long time_diff_ms = (now.tv_sec - g_last_js_event_time.tv_sec) * 1000 + 
-                       (now.tv_usec - g_last_js_event_time.tv_usec) / 1000;
-    
-    // Require 100ms between events for buttons, 250ms for analog sticks
-    int min_ms = (event->type == JS_EVENT_BUTTON) ? 100 : 250;
-    if (time_diff_ms < min_ms) {
-        return false;
-    }
-    
-    // Track timestamp for debouncing
-    g_last_js_event_time = now;
-    
-    // Skip initial state events sent when joystick is first opened
-    if (event->type & JS_EVENT_INIT) {
-        return false;
-    }
-    
-	// Handle button events
-	if (event->type == JS_EVENT_BUTTON) {
-		// Track Start/Select state for quit combo
-		if (event->number == JS_BUTTON_START) {
-			if (event->value == 1) { g_js_start_down = true; gettimeofday(&g_js_start_time, NULL); }
-			else if (event->value == 0) { g_js_start_down = false; }
-		} else if (event->number == JS_BUTTON_SELECT) {
-			if (event->value == 1) { g_js_select_down = true; gettimeofday(&g_js_select_time, NULL); }
-			else if (event->value == 0) { g_js_select_down = false; }
-		}
-
-		// If keystone enabled and cycle button is pressed, optionally cycle corners TL->TR->BR->BL
-		if (event->value == 1 && g_keystone.enabled && g_x_cycle_enabled && event->number == g_cycle_button_code) {
-			int order[4] = {0,1,2,3}; // TL,TR,BL,BR -> next
-			int cur = g_keystone.active_corner;
-			if (cur < 0) cur = g_selected_corner >= 0 ? g_selected_corner : 0;
-			int idx = 0;
-			for (int i=0;i<4;i++) if (order[i] == cur) { idx = i; break; }
-			int next = order[(idx+1)&3];
-			g_keystone.active_corner = next;
-			g_selected_corner = next;
-			static const char *names[4] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
-			LOG_INFO("Cycling to corner %d (%s) via button %d", next+1, names[next], event->number);
-			return true;
-		}
-
-		// Help button: toggle help overlay via main-loop request (safe access to player.mpv)
-		if (event->value == 1 && event->number == g_help_button_code) {
-			g_help_toggle_request = 1;
-			LOG_INFO("Help toggle requested via button %d", event->number);
-			return true;
-		}
-
-		// Y button toggles border (layout/env adapt)
-		if (event->value == 1) {
-			int y_code = g_use_label_mapping ? g_btn_code_Y : (g_gamepad_layout == GP_LAYOUT_NINTENDO ? 2 : JS_BUTTON_Y);
-			if (event->number == y_code) {
-				if (g_keystone.enabled) {
-					g_show_border = !g_show_border;
-					LOG_INFO("Border %s (via Y)", g_show_border ? "enabled" : "disabled");
-					return true;
-				}
-			}
-		}
-
-		// If using explicit label mapping from environment, handle ABXY selection first
-		if (event->value == 1 && g_keystone.enabled && g_use_label_mapping) {
-			int corner = -1;
-			if (event->number == g_btn_code_X) corner = g_corner_for_X;
-			else if (event->number == g_btn_code_A) corner = g_corner_for_A;
-			else if (event->number == g_btn_code_B) corner = g_corner_for_B;
-			else if (event->number == g_btn_code_Y) corner = g_corner_for_Y;
-			if (corner >= 0 && corner <= 3) {
-				g_keystone.active_corner = corner;
-				g_selected_corner = corner;
-				static const char *names[4] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
-				LOG_INFO("Adjusting corner %d (%s) [env mapping]", g_keystone.active_corner + 1, names[corner]);
-				return true;
-			}
-		}
-
-		if (event->value == 1) {  // Button pressed
-		switch (event->number) {
-            case JS_BUTTON_START:  // Toggle keystone mode
-                if (!g_keystone.enabled) {
-                    g_keystone.enabled = true;
-                    g_keystone.active_corner = g_selected_corner;
-                    keystone_update_matrix();
-                    LOG_INFO("Keystone correction enabled, adjusting corner %d", g_keystone.active_corner + 1);
-                } else {
-                    g_keystone.enabled = false;
-                    g_keystone.active_corner = -1;
-                    LOG_INFO("Keystone correction disabled");
-                }
-                return true;
-                
-			case JS_BUTTON_X:  // Select top-left (Nintendo layout puts X at top)
-				if (g_keystone.enabled) {
-					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 0 : 2; // Xbox X is left -> BL
-					g_keystone.active_corner = corner;
-					g_selected_corner = corner;
-					LOG_INFO("Adjusting corner %d (Top-left)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-
-			case JS_BUTTON_A:  // Select top-right (Nintendo A is right)
-				if (g_keystone.enabled) {
-					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 1 : 0; // Xbox A is bottom -> TL
-					g_keystone.active_corner = corner;
-					g_selected_corner = corner;
-					LOG_INFO("Adjusting corner %d (Top-right)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-
-			case JS_BUTTON_B:  // Select bottom-right (Nintendo B is bottom)
-				if (g_keystone.enabled) {
-					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 3 : 1; // Xbox B is right -> TR
-					g_keystone.active_corner = corner;
-					g_selected_corner = corner;
-					LOG_INFO("Adjusting corner %d (Bottom-right)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-
-			case JS_BUTTON_Y:  // Select bottom-left (Nintendo Y is left)
-				if (g_keystone.enabled) {
-					int corner = (g_gamepad_layout == GP_LAYOUT_NINTENDO) ? 2 : 3; // Xbox Y is top -> BR
-					g_keystone.active_corner = corner;
-					g_selected_corner = corner;
-					LOG_INFO("Adjusting corner %d (Bottom-left)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-                
-            case JS_BUTTON_SELECT:  // Reset keystone to default
-                if (g_keystone.enabled) {
-                    // Save the current enabled state
-                    bool was_enabled = g_keystone.enabled;
-                    
-                    // Reset to default corner positions
-                    g_keystone.points[0][0] = 0.0f; g_keystone.points[0][1] = 0.0f; // Top-left
-                    g_keystone.points[1][0] = 1.0f; g_keystone.points[1][1] = 0.0f; // Top-right
-                    g_keystone.points[2][0] = 1.0f; g_keystone.points[2][1] = 1.0f; // Bottom-right
-                    g_keystone.points[3][0] = 0.0f; g_keystone.points[3][1] = 1.0f; // Bottom-left
-                    
-                    // Restore the enabled state
-                    g_keystone.enabled = was_enabled;
-                    
-                    // Update the transformation matrix with the new corner positions
-                    keystone_update_matrix();
-                    
-                    LOG_INFO("Keystone reset to default rectangle");
-                    return true;
-                }
-                break;
-                
-			case JS_BUTTON_L1:  // Decrease adjustment step
-                if (g_keystone.enabled) {
-					g_keystone_adjust_step = (g_keystone_adjust_step / 2 < 1) ? 1 : (g_keystone_adjust_step / 2);
-                    LOG_INFO("Keystone step decreased to %d", g_keystone_adjust_step);
-                    return true;
-                }
-                break;
-                
-			case JS_BUTTON_R1:  // Increase adjustment step
-                if (g_keystone.enabled) {
-					g_keystone_adjust_step = (g_keystone_adjust_step * 2 > 100) ? 100 : (g_keystone_adjust_step * 2);
-                    LOG_INFO("Keystone step increased to %d", g_keystone_adjust_step);
-                    return true;
-                }
-                break;
-                
-            case JS_BUTTON_HOME:  // Toggle border
-                if (g_keystone.enabled) {
-                    g_show_border = !g_show_border;
-                    LOG_INFO("Border %s", g_show_border ? "enabled" : "disabled");
-                    return true;
-                }
-                break;
-
-			// D-Pad as buttons: move selected corner. Useful for 8BitDo Zero 2.
-			case JS_BUTTON_DPAD_LEFT:
-				if (g_keystone.enabled) {
-					float step = (float)g_keystone_adjust_step / 1000.0f;
-					keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
-					LOG_INFO("Moving corner %d left (dpad button)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-			case JS_BUTTON_DPAD_RIGHT:
-				if (g_keystone.enabled) {
-					float step = (float)g_keystone_adjust_step / 1000.0f;
-					keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
-					LOG_INFO("Moving corner %d right (dpad button)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-			case JS_BUTTON_DPAD_UP:
-				if (g_keystone.enabled) {
-					float step = (float)g_keystone_adjust_step / 1000.0f;
-					keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
-					LOG_INFO("Moving corner %d up (dpad button)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-			case JS_BUTTON_DPAD_DOWN:
-				if (g_keystone.enabled) {
-					float step = (float)g_keystone_adjust_step / 1000.0f;
-					keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
-					LOG_INFO("Moving corner %d down (dpad button)", g_keystone.active_corner + 1);
-					return true;
-				}
-				break;
-
-			default:
-				if (g_debug) {
-					LOG_DEBUG("Joystick button %u pressed (unmapped)", (unsigned)event->number);
-				}
-				break;
-		}}
-    }
-    
-    // Handle axis events (D-pad and analog sticks)
-    else if (event->type == JS_EVENT_AXIS) {
-        // Only process if keystone is enabled
-        if (!g_keystone.enabled) {
-            return false;
-        }
-        
-        float step = (float)g_keystone_adjust_step / 1000.0f; // Convert to 0-1 range
-        
-        // D-pad or left analog stick
-        if ((event->number == JS_AXIS_DPAD_X || event->number == JS_AXIS_LEFT_X) && abs(event->value) > 16384) {
-            if (event->value < 0) {  // Left
-                keystone_adjust_corner(g_keystone.active_corner, -step, 0.0f);
-                LOG_INFO("Moving corner %d left", g_keystone.active_corner + 1);
-                return true;
-            } else {  // Right
-                keystone_adjust_corner(g_keystone.active_corner, step, 0.0f);
-                LOG_INFO("Moving corner %d right", g_keystone.active_corner + 1);
-                return true;
-            }
-        }
-        else if ((event->number == JS_AXIS_DPAD_Y || event->number == JS_AXIS_LEFT_Y) && abs(event->value) > 16384) {
-            if (event->value < 0) {  // Up
-                keystone_adjust_corner(g_keystone.active_corner, 0.0f, -step);
-                LOG_INFO("Moving corner %d up", g_keystone.active_corner + 1);
-                return true;
-            } else {  // Down
-                keystone_adjust_corner(g_keystone.active_corner, 0.0f, step);
-                LOG_INFO("Moving corner %d down", g_keystone.active_corner + 1);
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
+// We now use the implementation of handle_joystick_event from input.c
 
 // Removed const from drm_ctx parameter because drmModeSetCrtc expects a non-const drmModeModeInfoPtr.
 // We cache framebuffer IDs per gbm_bo to avoid per-frame AddFB/RmFB churn.
 // user data holds a small struct with fb id + drm fd and a destroy handler.
-static int g_scanout_disabled = 0; // when set, we skip page flips/modeset and just let mpv decode & render offscreen
+int g_scanout_disabled = 0; // when set, we skip page flips/modeset and just let mpv decode & render offscreen
 struct fb_holder { uint32_t fb; int fd; };
 void bo_destroy_handler(struct gbm_bo *bo, void *data) __attribute__((weak));
 void bo_destroy_handler(struct gbm_bo *bo, void *data) {
@@ -1975,7 +1691,7 @@ void bo_destroy_handler(struct gbm_bo *bo, void *data) {
  * @param p Pointer to V4L2 player structure
  * @return true if rendering succeeded, false otherwise
  */
-static bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
+bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
 	}

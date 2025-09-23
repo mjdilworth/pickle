@@ -120,7 +120,7 @@ bool render_to_dmabuf(egl_ctx_t *e, dmabuf_info_t *dmabuf, GLuint video_texture,
     }
     
     // Set viewport to match the DMA-BUF texture size
-    glViewport(0, 0, dmabuf->width, dmabuf->height);
+    glViewport(0, 0, (GLsizei)dmabuf->width, (GLsizei)dmabuf->height);
     
     // Clear the framebuffer
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);

@@ -2,6 +2,7 @@
 #define PICKLE_COMPUTE_KEYSTONE_H
 
 #include "keystone.h"
+#include "shader.h"
 #include <stdbool.h>
 #include <GLES3/gl31.h>  // GLES 3.1 is required for compute shaders
 

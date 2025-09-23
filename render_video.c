@@ -42,6 +42,8 @@ static GLint g_video_tex_uniform = -1;
  *
  * @return true on success, false on failure
  */
+static bool init_video_shader(void) __attribute__((unused));
+
 static bool init_video_shader(void) {
     if (g_video_shader_program != 0) {
         return true; // Already initialized
@@ -73,7 +75,7 @@ static bool init_video_shader(void) {
         GLint log_length;
         glGetProgramiv(g_video_shader_program, GL_INFO_LOG_LENGTH, &log_length);
         if (log_length > 0) {
-            char *log = malloc(log_length);
+            char *log = malloc((size_t)log_length);
             if (log) {
                 glGetProgramInfoLog(g_video_shader_program, log_length, NULL, log);
                 fprintf(stderr, "Shader link error: %s\n", log);
