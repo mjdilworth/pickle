@@ -1,5 +1,6 @@
 #include "pickle_events.h"
 #include "event_callbacks.h"
+#include "input.h"
 #include "v4l2_player.h"
 #include "pickle_globals.h"
 #include <stdio.h>
@@ -7,7 +8,6 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
@@ -65,8 +65,8 @@ event_ctx_t *pickle_event_init(kms_ctx_t *drm, mpv_player_t *player, v4l2_player
     LOG_EVENT("Registered keyboard events");
     
     // Register joystick events
-    if (g_joystick_fd >= 0) {
-        if (event_register(ctx, g_joystick_fd, EVENT_TYPE_JOYSTICK, EPOLLIN, joystick_event_callback, NULL) < 0) {
+    if (get_joystick_fd() >= 0) {
+        if (event_register(ctx, get_joystick_fd(), EVENT_TYPE_JOYSTICK, EPOLLIN, joystick_event_callback, NULL) < 0) {
             LOG_ERROR("Failed to register joystick events");
             event_cleanup(ctx);
             return NULL;

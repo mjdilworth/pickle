@@ -1,4 +1,5 @@
 #include "event_callbacks.h"
+#include "input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -91,10 +92,11 @@ void keyboard_event_callback(int fd, uint32_t events, void *user_data) {
             LOG_INFO("Force enabling keystone mode with capital K");
             g_keystone.enabled = true;
             g_keystone.active_corner = 0;
+            // Border remains hidden by default
             keystone_update_matrix();
             LOG_INFO("Keystone correction FORCE enabled, adjusting corner %d", 
                     g_keystone.active_corner + 1);
-            fprintf(stderr, "\rKeystone correction FORCE enabled, use arrow keys or WASD to adjust corner %d", 
+            fprintf(stderr, "\rKeystone correction FORCE enabled, use arrow keys to adjust corner %d", 
                    g_keystone.active_corner + 1);
             g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
             return;
@@ -135,7 +137,7 @@ void joystick_event_callback(int fd, uint32_t events, void *user_data) {
     (void)events; // Unused
     (void)user_data; // Unused
     
-    if (!g_joystick_enabled) {
+    if (!is_joystick_enabled()) {
         return;
     }
     

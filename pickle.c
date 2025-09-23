@@ -48,6 +48,7 @@
 #include "utils.h"
 #include "shader.h"
 #include "keystone.h"
+#include "input.h"
 #include "hvs_keystone.h"
 #include "compute_keystone.h"
 #include "drm.h"
@@ -232,15 +233,7 @@ static GLint  g_border_a_position_loc = -1;
 static GLint  g_border_u_color_loc = -1;
 
 // Joystick/gamepad support
-int g_joystick_fd = -1;        // File descriptor for joystick
-int g_joystick_enabled = 0; // Whether joystick support is enabled
-static char g_joystick_name[128];     // Name of the connected joystick
-static int g_selected_corner = 0;     // Currently selected corner (0-3)
-// Removed g_last_js_event_time - now handled in input.c
-
-// Gamepad layout for ABXY (xbox vs nintendo)
-typedef enum { GP_LAYOUT_AUTO = 0, GP_LAYOUT_XBOX, GP_LAYOUT_NINTENDO } gp_layout_t;
-static gp_layout_t g_gamepad_layout = GP_LAYOUT_AUTO;
+// Note: All joystick-related variables and functions are now in input.c
 
 // Track Start+Select hold for safe quit
 static bool g_js_start_down = false;
@@ -249,18 +242,8 @@ static struct timeval g_js_start_time = {0};
 static struct timeval g_js_select_time = {0};
 static bool g_js_quit_fired = false;
 
-// 8BitDo controller button mappings (may vary by model/mode)
-#define JS_BUTTON_A        0
-#define JS_BUTTON_B        1
-#define JS_BUTTON_X        2
-#define JS_BUTTON_Y        3
-#define JS_BUTTON_L1       4
-#define JS_BUTTON_R1       5
-#define JS_BUTTON_SELECT   6
-#define JS_BUTTON_START    7
-#define JS_BUTTON_HOME     8
-#define JS_BUTTON_L3       9
-#define JS_BUTTON_R3       10
+// 8BitDo controller button mappings are now defined in input.h
+// JS_BUTTON_* and JS_AXIS_* definitions are no longer needed here
 
 // Some controllers (incl. certain 8BitDo modes) report D-Pad as buttons.
 // These indices are common but not universal; we handle them opportunistically.
@@ -279,143 +262,16 @@ static bool g_js_quit_fired = false;
 #define JS_AXIS_DPAD_X     6
 #define JS_AXIS_DPAD_Y     7
 
-// Optional explicit ABXY mapping via env (decl after macros to use their defaults)
-static int g_btn_code_X = JS_BUTTON_X;
-static int g_btn_code_A = JS_BUTTON_A;
-static int g_btn_code_B = JS_BUTTON_B;
-static int g_btn_code_Y = JS_BUTTON_Y;
-// Corner indices: 0=TL,1=TR,2=BL,3=BR
-static int g_corner_for_X = 0; // X->TL
-static int g_corner_for_A = 1; // A->TR
-static int g_corner_for_B = 3; // B->BR
-static int g_corner_for_Y = 2; // Y->BL
-static bool g_use_label_mapping = false;
-static int g_x_cycle_enabled = 1; // default: X cycles corners TL->TR->BR->BL
-static int g_cycle_button_code = JS_BUTTON_X; // which button number cycles corners
-static int g_help_button_code = JS_BUTTON_B;  // which button number toggles help
+// Optional explicit ABXY mapping has been moved to input.c
 // g_help_toggle_request is now defined in pickle_globals.c
 
-static int parse_corner_token(const char *t) {
-	if (!t) return -1;
-	if (!strcasecmp(t, "TL")) return 0;
-	if (!strcasecmp(t, "TR")) return 1;
-	if (!strcasecmp(t, "BL")) return 2;
-	if (!strcasecmp(t, "BR")) return 3;
-	return -1;
-}
+// These functions have been moved to input.c
 
-static void parse_btn_code_env(void) {
-	const char *s = getenv("PICKLE_BTN_CODE");
-	if (!s || !*s) return;
-	char buf[128]; strncpy(buf, s, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
-	for (char *p = buf; *p; ++p) if (*p == ';') *p = ',';
-	char *saveptr = NULL; char *tok = strtok_r(buf, ", ", &saveptr);
-	while (tok) {
-		char key[8]={0}; int val=-1;
-		if (sscanf(tok, "%7[^=]=%d", key, &val) == 2) {
-			if (!strcasecmp(key, "X")) g_btn_code_X = val;
-			else if (!strcasecmp(key, "A")) g_btn_code_A = val;
-			else if (!strcasecmp(key, "B")) g_btn_code_B = val;
-			else if (!strcasecmp(key, "Y")) g_btn_code_Y = val;
-		}
-		tok = strtok_r(NULL, ", ", &saveptr);
-	}
-}
+/* setup_label_mapping and label_to_code_default functions have been moved to input.c */
 
-static void parse_corner_map_env(void) {
-	const char *s = getenv("PICKLE_CORNER_MAP");
-	if (!s || !*s) return;
-	char buf[128]; strncpy(buf, s, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
-	for (char *p = buf; *p; ++p) if (*p == ';') *p = ',';
-	char *saveptr = NULL; char *tok = strtok_r(buf, ", ", &saveptr);
-	while (tok) {
-		char key[8]={0}, val[8]={0};
-		if (sscanf(tok, "%7[^=]=%7s", key, val) == 2) {
-			int corner = parse_corner_token(val);
-			if (corner >= 0) {
-				if (!strcasecmp(key, "X")) g_corner_for_X = corner;
-				else if (!strcasecmp(key, "A")) g_corner_for_A = corner;
-				else if (!strcasecmp(key, "B")) g_corner_for_B = corner;
-				else if (!strcasecmp(key, "Y")) g_corner_for_Y = corner;
-			}
-		}
-		tok = strtok_r(NULL, ", ", &saveptr);
-	}
-}
+/* configure_special_buttons function has been moved to input.c */
 
-static void setup_label_mapping(void) {
-	parse_btn_code_env();
-	parse_corner_map_env();
-	const char *use = getenv("PICKLE_USE_LABEL_MAPPING");
-	if (use && *use && atoi(use) != 0) g_use_label_mapping = true;
-	const char *xc = getenv("PICKLE_X_CYCLE");
-	if (xc && *xc) g_x_cycle_enabled = (atoi(xc) != 0);
-	if (g_use_label_mapping) {
-		LOG_INFO("Using explicit ABXY mapping: codes X=%d A=%d B=%d Y=%d; corners X=%d A=%d B=%d Y=%d",
-				 g_btn_code_X, g_btn_code_A, g_btn_code_B, g_btn_code_Y,
-				 g_corner_for_X, g_corner_for_A, g_corner_for_B, g_corner_for_Y);
-	}
-	LOG_INFO("X button cycling: %s (PICKLE_X_CYCLE=%s)", g_x_cycle_enabled ? "enabled" : "disabled", xc && *xc ? xc : "(default)");
-}
-
-static int label_to_code_default(const char *label) {
-	if (!label) return -1;
-	if (!strcasecmp(label, "X")) return JS_BUTTON_X;
-	if (!strcasecmp(label, "A")) return JS_BUTTON_A;
-	if (!strcasecmp(label, "B")) return JS_BUTTON_B;
-	if (!strcasecmp(label, "Y")) return JS_BUTTON_Y;
-	return -1;
-}
-
-static void configure_special_buttons(void) {
-	// Defaults based on layout or explicit label mapping
-	if (g_use_label_mapping) {
-		g_cycle_button_code = g_btn_code_X;
-		g_help_button_code = g_btn_code_B;
-	} else {
-		if (g_gamepad_layout == GP_LAYOUT_NINTENDO) {
-			// Typical Nintendo-style mapping: B=0, A=1, Y=2, X=3
-			g_cycle_button_code = 3; // physical X
-			g_help_button_code = 0;  // physical B
-		} else {
-			// Xbox-style default mapping
-			g_cycle_button_code = JS_BUTTON_X;
-			g_help_button_code = JS_BUTTON_B;
-		}
-	}
-
-	// Env overrides: numeric or label
-	const char *cb = getenv("PICKLE_CYCLE_BUTTON");
-	if (cb && *cb) {
-		char *end=NULL; long v = strtol(cb, &end, 10);
-		if (end && *end=='\0') g_cycle_button_code = (int)v; else {
-			int code = g_use_label_mapping ?
-				(!strcasecmp(cb,"X")?g_btn_code_X:!strcasecmp(cb,"A")?g_btn_code_A:!strcasecmp(cb,"B")?g_btn_code_B:!strcasecmp(cb,"Y")?g_btn_code_Y:-1)
-				: label_to_code_default(cb);
-			if (code >= 0) g_cycle_button_code = code;
-		}
-	}
-    
-	const char *hb = getenv("PICKLE_HELP_BUTTON");
-	if (hb && *hb) {
-		char *end=NULL; long v = strtol(hb, &end, 10);
-		if (end && *end=='\0') g_help_button_code = (int)v; else {
-			int code = g_use_label_mapping ?
-				(!strcasecmp(hb,"X")?g_btn_code_X:!strcasecmp(hb,"A")?g_btn_code_A:!strcasecmp(hb,"B")?g_btn_code_B:!strcasecmp(hb,"Y")?g_btn_code_Y:-1)
-				: label_to_code_default(hb);
-			if (code >= 0) g_help_button_code = code;
-		}
-	}
-
-	LOG_INFO("Cycle button code=%d%s, Help button code=%d%s",
-			 g_cycle_button_code, (cb&&*cb)?" (env)":"",
-			 g_help_button_code, (hb&&*hb)?" (env)":"");
-}
-
-// Forward declarations
-static bool init_joystick(void);
-// Function is defined in input.c, don't need declaration here
-// bool handle_joystick_event(struct js_event *event);
+// Removed forward declarations - functions are now in input.c module
 
 bool ensure_drm_master(int fd) __attribute__((weak)); 
 bool ensure_drm_master(int fd) {
@@ -896,13 +752,13 @@ void show_help_overlay(mpv_handle *mpv) {
 		"Pickle controls:\n"
 		"  q: quit    h: help overlay\n"
 		"  k: toggle keystone    1-4: select corner\n"
-		"  arrows / WASD: move point\n"
+		"  arrows: move point\n"
 		"  +/-: step    r: reset\n"
 		"  b: toggle border    [ / ]: border width\n"
 	"  c: toggle corner markers\n"
 		"  o: flip X (mirror)  p: flip Y (invert)\n"
 		"  m: mesh mode (experimental)\n"
-		"  S: save keystone\n"
+		"  s/S: save keystone\n"
 		"\nGamepad:\n"
 		"  START: toggle keystone\n"
 		"  Cycle button (default X): corners TL -> TR -> BR -> BL\n"
@@ -1607,68 +1463,17 @@ static bool keystone_save_config(const char* path) {
 /**
  * Initialize joystick/gamepad support
  * Attempts to open the first joystick device and set up event handling
- * 
+ *
  * @return true if a joystick was found and initialized
  */
-static bool init_joystick(void) {
-    // Try to open joystick device
-    const char *device = "/dev/input/js0";
-    g_joystick_fd = open(device, O_RDONLY | O_NONBLOCK);
-    
-    if (g_joystick_fd < 0) {
-        LOG_WARN("Could not open joystick at %s: %s", device, strerror(errno));
-        return false;
-    }
-    
-    // Get joystick name
-    if (ioctl(g_joystick_fd, JSIOCGNAME(sizeof(g_joystick_name)), g_joystick_name) < 0) {
-        strcpy(g_joystick_name, "Unknown Controller");
-    }
-    
-    LOG_INFO("Joystick initialized: %s", g_joystick_name);
-    g_joystick_enabled = true;
-    
-    // Initialize the first corner as selected
-    g_selected_corner = 0;
-
-	// Determine gamepad layout
-	const char *layout_env = getenv("PICKLE_GAMEPAD_LAYOUT");
-	if (layout_env && *layout_env) {
-		if (!strcasecmp(layout_env, "xbox")) g_gamepad_layout = GP_LAYOUT_XBOX;
-		else if (!strcasecmp(layout_env, "nintendo")) g_gamepad_layout = GP_LAYOUT_NINTENDO;
-		else g_gamepad_layout = GP_LAYOUT_AUTO;
-	} else {
-		// Heuristic: prefer Nintendo layout for 8BitDo Zero or Nintendo devices
-		if (strstr(g_joystick_name, "Nintendo") || strstr(g_joystick_name, "Zero")) {
-			g_gamepad_layout = GP_LAYOUT_NINTENDO;
-		} else {
-			g_gamepad_layout = GP_LAYOUT_XBOX;
-		}
-	}
-	LOG_INFO("Gamepad layout: %s", (g_gamepad_layout==GP_LAYOUT_NINTENDO?"nintendo":(g_gamepad_layout==GP_LAYOUT_XBOX?"xbox":"auto")));
-    
-	// Apply optional explicit ABXY mapping from environment (takes precedence for ABXY selection)
-	setup_label_mapping();
-	// Configure which buttons perform cycle and help based on layout/env
-	configure_special_buttons();
-    
-    return true;
-}
+/* init_joystick function has been moved to input.c */
 
 /**
  * Clean up joystick resources
  */
-static void cleanup_joystick(void) {
-    if (g_joystick_fd >= 0) {
-        close(g_joystick_fd);
-        g_joystick_fd = -1;
-    }
-    g_joystick_enabled = false;
-}
+/* cleanup_joystick function has been moved to input.c */
 
-// We now use the implementation of handle_joystick_event from input.c
-
-// Removed const from drm_ctx parameter because drmModeSetCrtc expects a non-const drmModeModeInfoPtr.
+// We now use the implementation of handle_joystick_event from input.c// Removed const from drm_ctx parameter because drmModeSetCrtc expects a non-const drmModeModeInfoPtr.
 // We cache framebuffer IDs per gbm_bo to avoid per-frame AddFB/RmFB churn.
 // user data holds a small struct with fb id + drm fd and a destroy handler.
 int g_scanout_disabled = 0; // when set, we skip page flips/modeset and just let mpv decode & render offscreen
@@ -1852,6 +1657,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			// Use RGBA format to ensure proper alpha blending for video
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 			// Create FBO
 			glGenFramebuffers(1, &g_keystone_fbo);
@@ -1876,7 +1682,11 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	mpv_opengl_fbo mpv_fbo;
 	int mpv_flip_y = 0; // default: no flip (handled in final pass if needed)
 	if (g_keystone.enabled && g_keystone_fbo) {
+		// Clear the FBO first to ensure proper rendering
 		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black
+		glClear(GL_COLOR_BUFFER_BIT);
+		
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)g_keystone_fbo, .w = g_keystone_fbo_w, .h = g_keystone_fbo_h, .internal_format = 0 };
 	} else {
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1909,8 +1719,15 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		// Set up texture
 		glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
+		glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
 		glUniform1i(g_keystone_u_texture_loc, 0);
+		
+		// Always enable blending for proper rendering regardless of border state
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		
+		// Ensure alpha blending is properly handled for video content
+		glDisable(GL_DEPTH_TEST);
 		
 		// Correct warping approach: Draw a warped quad where vertices match the keystone corners
 		// Convert keystone points from normalized [0,1] space to clip space [-1,1]
@@ -1970,7 +1787,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
 		glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glDisable(GL_BLEND); // Disable blending after drawing the video
 		glUseProgram(0);
 	}
 	
@@ -2393,6 +2210,17 @@ int main(int argc, char **argv) {
             }
         }
     }
+    
+    // Ensure the keystone rendering is properly initialized
+    // Don't force border visibility, respect the loaded setting
+    if (g_keystone.enabled) {
+        g_show_border = g_keystone.border_visible ? 1 : 0;
+        
+        // Make sure shader will be initialized on first render
+        if (g_keystone_shader_program == 0) {
+            LOG_INFO("Keystone enabled at startup, shader will be initialized on first render");
+        }
+    }
 	
 	// Initialize either MPV or V4L2 decoder based on flag
 	if (g_use_v4l2_decoder) {
@@ -2458,8 +2286,7 @@ int main(int argc, char **argv) {
 	fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK);
 	
 	// Initialize joystick/gamepad support for 8BitDo controller
-	init_joystick();
-	if (g_joystick_enabled) {
+	if (init_joystick()) {
 		LOG_INFO("8BitDo controller detected and enabled for keystone adjustment");
 		LOG_INFO("Controller mappings: START=Toggle keystone mode");
 		LOG_INFO("Cycle button (default X) = Corners TL->TR->BR->BL");
@@ -2519,7 +2346,7 @@ int main(int argc, char **argv) {
 			}
 		}
 		// Check controller quit combo (START+SELECT 2s)
-		if (g_joystick_enabled) {
+		if (is_joystick_enabled()) {
 			// Polling cadence: on every loop iteration; guarded by state flags
 			struct timeval now; gettimeofday(&now, NULL);
 			(void)now; // currently unused beyond gettimeofday side effect
@@ -2559,8 +2386,8 @@ int main(int argc, char **argv) {
 		pfds[n].fd = STDIN_FILENO; pfds[n].events = POLLIN; pfds[n].revents = 0; n++;
 		
 		// Add joystick to poll set if available
-		if (g_joystick_enabled && g_joystick_fd >= 0) {
-			pfds[n].fd = g_joystick_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; n++;
+		if (is_joystick_enabled() && get_joystick_fd() >= 0) {
+			pfds[n].fd = get_joystick_fd(); pfds[n].events = POLLIN; pfds[n].revents = 0; n++;
 		}
 		int timeout_ms = -1;
 		
@@ -2614,7 +2441,7 @@ int main(int argc, char **argv) {
 						g_keystone.active_corner = 0;
 						keystone_update_matrix();
 						LOG_INFO("Keystone correction FORCE enabled, adjusting corner %d", g_keystone.active_corner + 1);
-						fprintf(stderr, "\rKeystone correction FORCE enabled, use arrow keys or WASD to adjust corner %d", 
+						fprintf(stderr, "\rKeystone correction FORCE enabled, use arrow keys to adjust corner %d", 
 								g_keystone.active_corner + 1);
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 						continue;
@@ -2634,7 +2461,7 @@ int main(int argc, char **argv) {
 					}
 
 					// Handle keystone adjustment keys first (to avoid 'q' conflict)
-					bool keystone_handled = keystone_handle_key(c);
+					bool keystone_handled = handle_keyboard_input(c);
 					LOG_DEBUG("Keystone handler returned: %d", keystone_handled);
 					if (keystone_handled) {
 						// Force a redraw when keystone parameters change
@@ -2648,10 +2475,10 @@ int main(int argc, char **argv) {
 						break;
 					}
 				}
-			} else if (g_joystick_enabled && pfds[i].fd == g_joystick_fd) {
+			} else if (is_joystick_enabled() && pfds[i].fd == get_joystick_fd()) {
 				// Handle joystick input
 				struct js_event event;
-				while (read(g_joystick_fd, &event, sizeof(event)) > 0) {
+				while (read(get_joystick_fd(), &event, sizeof(event)) > 0) {
 					if (handle_joystick_event(&event)) {
 						// Force a redraw when keystone parameters change
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
@@ -2796,9 +2623,7 @@ int main(int argc, char **argv) {
 	tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
 	
 	// Clean up joystick resources
-	if (g_joystick_enabled) {
-		cleanup_joystick();
-	}
+	cleanup_joystick();
 	
 	// Clean up HVS keystone if initialized
 	hvs_keystone_cleanup();
@@ -2822,9 +2647,7 @@ fail:
 	tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
 	
 	// Clean up joystick resources
-	if (g_joystick_enabled) {
-		cleanup_joystick();
-	}
+	cleanup_joystick();
 	
 	// Clean up HVS keystone if initialized
 	hvs_keystone_cleanup();

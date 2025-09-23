@@ -8,6 +8,7 @@
 #include <string.h>
 #include <errno.h>
 #include <GLES2/gl2.h>
+#include <linux/limits.h>  // For PATH_MAX
 
 // Global keystone state
 keystone_t g_keystone = {
@@ -41,7 +42,7 @@ keystone_t g_keystone = {
 int g_keystone_adjust_step = 1;
 
 // UI visibility flags
-int g_show_border = 0;
+int g_show_border = 0;  // Initialize to 0 (disabled) so border is not visible by default
 int g_border_width = 5;
 int g_show_corner_markers = 1;
 
@@ -174,10 +175,13 @@ void keystone_init(void) {
     g_keystone.mesh_points = NULL;
     g_keystone.active_mesh_point[0] = -1;
     g_keystone.active_mesh_point[1] = -1;
-    g_keystone.border_visible = false;
+    g_keystone.border_visible = false;  // Default to hiding border
     g_keystone.border_width = 5;
     g_keystone.corner_markers = true;
     g_keystone.active_corner = -1;
+    
+    // Initialize border to disabled by default
+    g_show_border = 0;
     
     for (int i = 0; i < 4; i++) {
         g_keystone.perspective_pins[i] = false;
@@ -522,9 +526,13 @@ bool keystone_load_config(const char* path) {
         }
         else if (strncmp(line, "border=", 7) == 0) {
             g_keystone.border_visible = (atoi(line + 7) != 0);
+            // Sync with global border flag to ensure visibility
+            g_show_border = g_keystone.border_visible ? 1 : 0;
         }
         else if (strncmp(line, "cornermarks=", 12) == 0) {
             g_keystone.corner_markers = (atoi(line + 12) != 0);
+            // Sync with global corner markers flag
+            g_show_corner_markers = g_keystone.corner_markers ? 1 : 0;
         }
         else if (strncmp(line, "border_width=", 13) == 0) {
             int width = atoi(line + 13);
@@ -636,7 +644,98 @@ int get_keystone_selected_corner(void) {
 
 // Simple key handler to be called from the main program
 bool keystone_handle_key(char key) {
-    // This is a placeholder for the key handler function
-    // In the real implementation, this would handle keystone-related key events
-    return false; // Return true if the key was handled
+    if (!g_keystone.enabled) {
+        // Special case to enable keystone mode with 'k'
+        if (key == 'k') {
+            g_keystone.enabled = true;
+            g_keystone.active_corner = 0;
+            // Border remains hidden by default
+            keystone_update_matrix();
+            LOG_INFO("Keystone correction enabled, adjusting corner %d", 
+                    g_keystone.active_corner + 1);
+            fprintf(stderr, "\rKeystone correction enabled, use arrow keys to adjust corner %d", 
+                   g_keystone.active_corner + 1);
+            return true;
+        }
+        return false;
+    }
+    
+    // Process keystone keys only when keystone mode is enabled
+    switch (key) {
+        // Corner selection
+        case '1': // Top-left
+            g_keystone.active_corner = 0;
+            fprintf(stderr, "\rAdjusting corner %d (top-left)\n", g_keystone.active_corner + 1);
+            return true;
+        case '2': // Top-right
+            g_keystone.active_corner = 1;
+            fprintf(stderr, "\rAdjusting corner %d (top-right)\n", g_keystone.active_corner + 1);
+            return true;
+        case '3': // Bottom-left
+            g_keystone.active_corner = 2;
+            fprintf(stderr, "\rAdjusting corner %d (bottom-left)\n", g_keystone.active_corner + 1);
+            return true;
+        case '4': // Bottom-right
+            g_keystone.active_corner = 3;
+            fprintf(stderr, "\rAdjusting corner %d (bottom-right)\n", g_keystone.active_corner + 1);
+            return true;
+            
+        // Movement keys - arrow keys only
+        case 65: // Up arrow
+            keystone_adjust_corner(g_keystone.active_corner, 0, -0.01f);
+            return true;
+        case 66: // Down arrow
+            keystone_adjust_corner(g_keystone.active_corner, 0, 0.01f);
+            return true;
+        case 68: // Left arrow
+            keystone_adjust_corner(g_keystone.active_corner, -0.01f, 0);
+            return true;
+        case 67: // Right arrow
+            keystone_adjust_corner(g_keystone.active_corner, 0.01f, 0);
+            return true;
+            
+        // Toggle features
+        case 'b': // Toggle border
+            g_show_border = !g_show_border;
+            // Sync keystone border visibility with the global setting
+            g_keystone.border_visible = (g_show_border != 0);
+            fprintf(stderr, "\rBorder %s\n", g_show_border ? "enabled" : "disabled");
+            return true;
+        case 'c': // Toggle corner markers
+            g_show_corner_markers = !g_show_corner_markers;
+            // Sync keystone corner markers visibility with the global setting
+            g_keystone.corner_markers = (g_show_corner_markers != 0);
+            fprintf(stderr, "\rCorner markers %s\n", g_show_corner_markers ? "enabled" : "disabled");
+            return true;
+        case 'r': // Reset keystone
+            keystone_init(); // Re-initialize to defaults
+            fprintf(stderr, "\rKeystone settings reset\n");
+            return true;
+        case 'S': // Save keystone (uppercase S)
+        case 's': // Save keystone (lowercase s)
+            // Save to both the current directory and user config
+            if (keystone_save_config("./keystone.conf")) {
+                fprintf(stderr, "\rKeystone configuration saved to ./keystone.conf\n");
+            }
+            // Also try to save to user config directory
+            char config_path[PATH_MAX];
+            const char* home = getenv("HOME");
+            if (home) {
+                snprintf(config_path, sizeof(config_path), "%s/.config/pickle_keystone.conf", home);
+                if (keystone_save_config(config_path)) {
+                    fprintf(stderr, "\rKeystone configuration also saved to %s\n", config_path);
+                }
+            }
+            return true;
+        case 'k': // Toggle keystone mode
+            g_keystone.enabled = !g_keystone.enabled;
+            fprintf(stderr, "\rKeystone correction %s\n", g_keystone.enabled ? "enabled" : "disabled");
+            return true;
+        case 27: // ESC - Exit keystone mode
+            g_keystone.enabled = false;
+            fprintf(stderr, "\rKeystone correction disabled\n");
+            return true;
+    }
+    
+    return false; // Key not handled
 }

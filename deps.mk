@@ -1,5 +1,5 @@
 pickle.o: pickle.c pickle_globals.h drm.h egl.h v4l2_player.h \
- v4l2_decoder.h utils.h shader.h keystone.h hvs_keystone.h \
+ v4l2_decoder.h utils.h shader.h keystone.h input.h hvs_keystone.h \
  compute_keystone.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
@@ -28,10 +28,10 @@ compute_keystone.o: compute_keystone.c compute_keystone.h keystone.h \
 event.o: event.c event.h
 event_callbacks.o: event_callbacks.c event_callbacks.h event.h mpv.h \
  error.h keystone.h drm.h v4l2_player.h v4l2_decoder.h pickle_globals.h \
- egl.h
+ egl.h input.h
 pickle_events.o: pickle_events.c pickle_events.h event.h mpv.h error.h \
  drm.h v4l2_decoder.h v4l2_player.h event_callbacks.h keystone.h \
- pickle_globals.h egl.h
+ pickle_globals.h egl.h input.h
 pickle_globals.o: pickle_globals.c pickle_globals.h drm.h egl.h \
  v4l2_player.h v4l2_decoder.h
 mpv_render.o: mpv_render.c pickle_globals.h drm.h egl.h v4l2_player.h \

@@ -35,7 +35,7 @@ Test the following scenarios to ensure the event-driven architecture works corre
    PICKLE_KEYSTONE=1 ./pickle vid.mp4
    ```
    - Keystone mode should be enabled
-   - Corner adjustment with 1-4 keys and arrow keys/WASD should work
+   - Corner adjustment with 1-4 keys and arrow keys should work
    - Border toggle should work with 'b'
    - Corner marker toggle should work with 'c'
 

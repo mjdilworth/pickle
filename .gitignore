@@ -1,21 +1,73 @@
-# Build artifacts
-pickle.o
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
 pickle
 
-# Logs
-*.log
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Build artifacts
+build/
+*.d
 
 # Editor/IDE
 .vscode/
+.idea/
 *.swp
 *~
+.*.sw[a-p]
 
 # OS files
 .DS_Store
 Thumbs.db
+.directory
+Desktop.ini
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# Media files
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.webm
 
 # Misc
 *.bak
 *.tmp
-*.mp4
-
+*.orig
+.env
+core
+tags

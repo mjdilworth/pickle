@@ -374,3 +374,12 @@ const char* get_joystick_name(void) {
 gamepad_layout_t get_gamepad_layout(void) {
     return g_gamepad_layout;
 }
+
+/**
+ * Get the joystick file descriptor
+ *
+ * @return Joystick file descriptor or -1 if not connected
+ */
+int get_joystick_fd(void) {
+    return g_joystick_fd;
+}

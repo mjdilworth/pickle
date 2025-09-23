@@ -306,7 +306,7 @@ run-help: $(APP)
 	echo "  h                     Show/hide help overlay"; \
 	echo "  k                     Enable keystone mode"; \
 	echo "  1-4                   Select keystone corner"; \
-	echo "  Arrow keys/WASD       Adjust selected corner"; \
+	echo "  Arrow keys             Adjust selected corner"; \
 	echo "  r                     Reset keystone"; \
 	echo ""; \
 	echo "Examples:"; \
@@ -318,6 +318,10 @@ preflight:
 	@bash tools/preflight.sh
 
 clean:
-	rm -f $(OBJ) $(APP)
+	rm -f $(OBJECTS) $(APP)
 
-.PHONY: all run try-run preflight release debug sanitize rpi4 maxperf rpi4-maxperf rpi4-release strip deps help run-help clean install uninstall
+# Clean all build artifacts including object files, binaries, and backups
+distclean: clean
+	rm -f *.o *.a *.so *.bak *~ *.orig
+
+.PHONY: all run try-run preflight release debug sanitize rpi4 maxperf rpi4-maxperf rpi4-release strip deps help run-help clean distclean install uninstall

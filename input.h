@@ -36,6 +36,7 @@ bool handle_keyboard_input(char key);
 bool is_joystick_enabled(void);
 const char* get_joystick_name(void);
 gamepad_layout_t get_gamepad_layout(void);
+int get_joystick_fd(void);
 
 // Setup gamepad button configurations
 void setup_label_mapping(void);
