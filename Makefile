@@ -22,13 +22,14 @@
 # ✅ Create input module (input.c/input.h)
 
 APP      := pickle
+VULKAN_CHECK := check_vulkan_hw
 
 # Source files - add new modules here
-COMMON_SOURCES := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c render_backend.c
+COMMON_SOURCES := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c compute_keystone_matrix.c gpu_optimize_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c render_backend.c
 
 # Conditional source files based on features
 ifeq ($(VULKAN),1)
-SOURCES := $(COMMON_SOURCES) vulkan.c vulkan_utils.c vulkan_compute.c
+SOURCES := $(COMMON_SOURCES) vulkan.c vulkan_utils.c vulkan_compute.c vulkan_perf.c
 else
 SOURCES := $(COMMON_SOURCES)
 endif
@@ -199,6 +200,10 @@ $(APP): $(OBJECTS)
 	@ if [ -z "$(PKG_LIBS)" ]; then echo "[warn] pkg-config not found or missing pc files; using fallback libs."; fi
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+# Vulkan hardware check tool
+$(VULKAN_CHECK): check_vulkan_hw.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS) -lvulkan
+
 # Compile each source file
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -331,6 +336,7 @@ help:
 	echo "  preflight            Environment readiness checks"; \
 	echo "  deps                 Show package dependencies"; \
 	echo "  run-help             Show runtime command-line options"; \
+	echo "  check-vulkan         Build and run Vulkan hardware check"; \
 	echo ""; \
 	echo "Environment Variables:"; \
 	echo "  CROSS                Cross-compiler prefix"; \
@@ -384,8 +390,13 @@ run-help: $(APP)
 preflight:
 	@bash tools/preflight.sh
 
+check-vulkan: $(VULKAN_CHECK)
+	@echo "=== Running Vulkan Hardware Check ==="
+	@./$(VULKAN_CHECK)
+	@echo "==================================="
+
 clean:
-	rm -f $(OBJECTS) $(APP)
+	rm -f $(OBJECTS) $(APP) $(VULKAN_CHECK)
 
 # Clean all build artifacts including object files, binaries, and backups
 distclean: clean

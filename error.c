@@ -55,6 +55,59 @@ const char *pickle_error_string(pickle_result_t code) {
             return "Invalid parameter";
         case PICKLE_ERROR_NOT_IMPLEMENTED:
             return "Not implemented";
+        case PICKLE_ERROR_GL_FRAMEBUFFER:
+            return "OpenGL framebuffer error";
+        case PICKLE_ERROR_UNSUPPORTED:
+            return "Unsupported operation";
+        // Vulkan specific errors
+        case PICKLE_ERROR_VULKAN_INSTANCE:
+            return "Vulkan instance error";
+        case PICKLE_ERROR_VULKAN_DEVICE:
+            return "Vulkan device error";
+        case PICKLE_ERROR_VULKAN_SURFACE:
+            return "Vulkan surface error";
+        case PICKLE_ERROR_VULKAN_SWAPCHAIN:
+            return "Vulkan swapchain error";
+        case PICKLE_ERROR_VULKAN_COMMAND_POOL:
+            return "Vulkan command pool error";
+        case PICKLE_ERROR_VULKAN_COMMAND_BUFFERS:
+            return "Vulkan command buffers error";
+        case PICKLE_ERROR_VULKAN_SYNC_OBJECTS:
+            return "Vulkan synchronization objects error";
+        case PICKLE_ERROR_VULKAN_SHADER:
+            return "Vulkan shader error";
+        case PICKLE_ERROR_VULKAN_PIPELINE:
+            return "Vulkan pipeline error";
+        case PICKLE_ERROR_VULKAN_FRAMEBUFFER:
+            return "Vulkan framebuffer error";
+        case PICKLE_ERROR_VULKAN_MEMORY:
+            return "Vulkan memory error";
+        case PICKLE_ERROR_VULKAN_IMAGE:
+            return "Vulkan image error";
+        case PICKLE_ERROR_VULKAN_VALIDATION_LAYERS:
+            return "Vulkan validation layers error";
+        case PICKLE_ERROR_VULKAN_DEBUG_MESSENGER:
+            return "Vulkan debug messenger error";
+        case PICKLE_ERROR_VULKAN_NO_DEVICE:
+            return "No Vulkan device found";
+        case PICKLE_ERROR_VULKAN_NO_SUITABLE_DEVICE:
+            return "No suitable Vulkan device found";
+        case PICKLE_ERROR_OUT_OF_MEMORY:
+            return "Out of memory error";
+        case PICKLE_ERROR_GBM_INIT:
+            return "GBM initialization error";
+        case PICKLE_ERROR_GBM_SURFACE:
+            return "GBM surface error";
+        case PICKLE_ERROR_VULKAN_NO_DISPLAY:
+            return "No Vulkan display found";
+        case PICKLE_ERROR_VULKAN_NO_DISPLAY_MODE:
+            return "No suitable Vulkan display mode found";
+        case PICKLE_ERROR_VULKAN_IMAGE_VIEW:
+            return "Vulkan image view error";
+        case PICKLE_ERROR_VULKAN_RENDER_PASS:
+            return "Vulkan render pass error";
+        case PICKLE_ERROR_VULKAN_SYNC:
+            return "Vulkan synchronization error";
         default:
             return "Unknown error";
     }

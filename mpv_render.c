@@ -1,7 +1,5 @@
+#include "mpv_render.h"
 #include "pickle_globals.h"
-#include "mpv.h"
-#include "drm.h"
-#include "egl.h"
 #include <stdio.h>
 
 // Simple wrapper for MPV rendering (used by pickle_events.c)

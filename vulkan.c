@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "log.h"
 #include "keystone.h"
+#include "vulkan_perf.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -712,6 +713,9 @@ pickle_result_t vulkan_init(vulkan_ctx_t *ctx, const kms_ctx_t *drm) {
     ctx->initialized = true;
     g_vulkan_available = true;
     
+    // Log hardware information to help verify GPU acceleration
+    log_vulkan_hardware_info(ctx);
+    
     LOG_VULKAN("Vulkan initialization complete");
     return PICKLE_OK;
 }
@@ -1167,7 +1171,51 @@ pickle_result_t vulkan_render_frame(vulkan_ctx_t *ctx, mpv_handle *mpv, mpv_rend
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     };
-    vkBeginCommandBuffer(ctx->command_buffers[image_index], &begin_info);
+    
+    VkResult vk_result = vkBeginCommandBuffer(ctx->command_buffers[image_index], &begin_info);
+    if (vk_result != VK_SUCCESS) {
+        LOG_ERROR("Failed to begin command buffer recording: %d", vk_result);
+        return PICKLE_ERROR_VULKAN_COMMAND_BUFFERS;
+    }
+    
+    // Create synchronization primitives for MPV rendering
+    VkSemaphore mpv_render_complete = VK_NULL_HANDLE;
+    VkSemaphoreCreateInfo semaphore_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    };
+    
+    if (mpv_has_frame) {
+        vkCreateSemaphore(ctx->device, &semaphore_info, NULL, &mpv_render_complete);
+    }
+    
+    // Transition swapchain image layout for rendering
+    VkImageMemoryBarrier image_memory_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = ctx->swapchain.images[image_index],
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+    
+    vkCmdPipelineBarrier(
+        ctx->command_buffers[image_index],
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0,
+        0, NULL,
+        0, NULL,
+        1, &image_memory_barrier
+    );
     
     // Set up render pass
     VkClearValue clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -1185,12 +1233,26 @@ pickle_result_t vulkan_render_frame(vulkan_ctx_t *ctx, mpv_handle *mpv, mpv_rend
     
     // Render video content with MPV if available
     if (mpv_has_frame) {
-        // Since we don't have Vulkan support in MPV headers, 
-        // we're using a placeholder for now
-        // A real implementation would integrate properly with MPV's Vulkan rendering
+        // MPV Vulkan integration
         
-        // Just log that we would render the frame
-        LOG_DEBUG("MPV has frame available for rendering");
+        // Get current Vulkan instance from context
+        VkInstance vk_instance = ctx->instance;
+        VkPhysicalDevice vk_physical_device = ctx->physical_device;
+        VkDevice vk_device = ctx->device;
+        VkQueue vk_queue = ctx->graphics_queue;
+        uint32_t vk_queue_family = ctx->queue_indices.graphics;
+        
+        // Get current swapchain image and framebuffer
+        VkImage swapchain_image = ctx->swapchain.images[image_index];
+        VkImageView swapchain_image_view = ctx->swapchain.image_views[image_index];
+        
+        // Setup MPV render parameters for Vulkan
+        // MPV doesn't support Vulkan rendering directly, so we'll use offscreen rendering with OpenGL
+        // and then copy the result to our Vulkan surface
+        
+        // For now, just return an error as this isn't implemented yet
+        LOG_ERROR("MPV Vulkan rendering not supported in current version");
+        return PICKLE_ERROR_GENERIC;
     }
     
     // End render pass
@@ -1199,16 +1261,143 @@ pickle_result_t vulkan_render_frame(vulkan_ctx_t *ctx, mpv_handle *mpv, mpv_rend
     // Apply keystone correction if enabled and compute shader is available
     keystone_t *keystone = keystone_get_config();
     if (keystone && keystone->enabled && ctx->compute.initialized) {
-        LOG_DEBUG("Applying keystone correction with Vulkan compute shader");
+        LOG_INFO("Applying keystone correction with Vulkan compute shader");
+        
+        // Update keystone uniform data
+        VkResult update_result = vulkan_compute_update_uniform(ctx, keystone);
+        if (update_result != VK_SUCCESS) {
+            LOG_ERROR("Failed to update keystone uniform buffer: %d", update_result);
+        }
+        
+        // Transition swapchain image to compute shader storage format
+        VkImageMemoryBarrier pre_compute_barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = ctx->swapchain.images[image_index],
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        
+        vkCmdPipelineBarrier(
+            ctx->command_buffers[image_index],
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0, NULL,
+            0, NULL,
+            1, &pre_compute_barrier
+        );
         
         // Apply keystone correction to the rendered frame
         vulkan_compute_keystone_apply(ctx, ctx->swapchain.images[image_index], keystone);
+        
+        // Transition back to presentable layout
+        VkImageMemoryBarrier post_compute_barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = ctx->swapchain.images[image_index],
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        
+        vkCmdPipelineBarrier(
+            ctx->command_buffers[image_index],
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            0, NULL,
+            0, NULL,
+            1, &post_compute_barrier
+        );
+        
+        // Log performance statistics periodically
+        log_keystone_performance(ctx, ctx->swapchain.images[image_index], keystone);
+    } else {
+        // If no keystone, just transition to present layout
+        VkImageMemoryBarrier present_barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = ctx->swapchain.images[image_index],
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        
+        vkCmdPipelineBarrier(
+            ctx->command_buffers[image_index],
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            0, NULL,
+            0, NULL,
+            1, &present_barrier
+        );
     }
     
     // End command buffer recording
     if (vkEndCommandBuffer(ctx->command_buffers[image_index]) != VK_SUCCESS) {
         LOG_ERROR("Failed to record command buffer");
+        if (mpv_render_complete != VK_NULL_HANDLE) {
+            vkDestroySemaphore(ctx->device, mpv_render_complete, NULL);
+        }
         return PICKLE_ERROR_VULKAN_COMMAND_BUFFERS;
+    }
+    
+    // Wait for MPV rendering to complete if we rendered with MPV
+    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = mpv_has_frame && mpv_render_complete ? 1 : 0,
+        .pWaitSemaphores = mpv_has_frame && mpv_render_complete ? &mpv_render_complete : NULL,
+        .pWaitDstStageMask = wait_stages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &ctx->command_buffers[image_index],
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &ctx->render_finished_semaphores[ctx->current_frame]
+    };
+    
+    // Submit the command buffer
+    vk_result = vkQueueSubmit(ctx->graphics_queue, 1, &submit_info, ctx->in_flight_fences[ctx->current_frame]);
+    if (vk_result != VK_SUCCESS) {
+        LOG_ERROR("Failed to submit draw command buffer: %d", vk_result);
+        if (mpv_render_complete != VK_NULL_HANDLE) {
+            vkDestroySemaphore(ctx->device, mpv_render_complete, NULL);
+        }
+        return PICKLE_ERROR_VULKAN_COMMAND_BUFFERS;
+    }
+    
+    // Clean up the MPV render semaphore
+    if (mpv_render_complete != VK_NULL_HANDLE) {
+        vkDestroySemaphore(ctx->device, mpv_render_complete, NULL);
     }
     
     // Submit the rendered frame

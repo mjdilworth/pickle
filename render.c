@@ -25,6 +25,7 @@ pickle_result_t render_init(render_context_t *ctx, double refresh_rate) {
     // Initialize frame pacing
     frame_pacing_init(&ctx->frame_pacing, refresh_rate);
     
+#ifdef VULKAN_ENABLED
     // Determine the render backend to use
     render_backend_type_t preferred = render_backend_get_preferred();
     
@@ -40,6 +41,10 @@ pickle_result_t render_init(render_context_t *ctx, double refresh_rate) {
             ctx->backend_type = RENDER_BACKEND_GLES;
         }
     }
+#else
+    // When Vulkan is not enabled, always use GLES
+    ctx->backend_type = RENDER_BACKEND_GLES;
+#endif
     
     LOG_RENDER_INFO("Using render backend: %s", render_backend_name(ctx->backend_type));
     
@@ -104,9 +109,37 @@ bool render_frame(render_context_t *ctx, kms_ctx_t *drm, egl_ctx_t *egl,
     }
 #ifdef VULKAN_ENABLED
     else if (ctx->backend_type == RENDER_BACKEND_VULKAN) {
-        // Vulkan rendering path
+        // Basic Vulkan rendering path - no MPV integration yet
         if (mpv && mpv_ctx) {
-            result = (vulkan_render_frame(&ctx->vulkan, mpv, mpv_ctx) == PICKLE_OK);
+            // Get the next swapchain image
+            uint32_t image_index;
+            pickle_result_t begin_result = vulkan_begin_frame(&ctx->vulkan, &image_index);
+            if (begin_result != PICKLE_OK) {
+                LOG_RENDER_ERROR("Failed to begin Vulkan frame: %s", pickle_error_string(begin_result));
+                return false;
+            }
+            
+            // TODO: Integrate MPV with Vulkan renderer here
+            LOG_RENDER_INFO("Vulkan rendering path is not fully implemented yet");
+            
+            // Apply keystone correction if enabled
+            keystone_t *keystone = keystone_get_config();
+            if (keystone && keystone->enabled && ctx->vulkan.compute.initialized) {
+                LOG_RENDER_DEBUG("Applying keystone correction with Vulkan compute shader");
+                vulkan_compute_update_uniform(&ctx->vulkan, keystone);
+                vulkan_compute_keystone_apply(&ctx->vulkan, 
+                                             ctx->vulkan.swapchain.images[image_index], 
+                                             keystone);
+            }
+            
+            // End the frame and present
+            pickle_result_t end_result = vulkan_end_frame(&ctx->vulkan, image_index);
+            if (end_result != PICKLE_OK) {
+                LOG_RENDER_ERROR("Failed to end Vulkan frame: %s", pickle_error_string(end_result));
+                return false;
+            }
+            
+            result = true;
         } else {
             LOG_RENDER_ERROR("Missing required context for Vulkan rendering");
             result = false;
@@ -309,3 +342,5 @@ const char* render_get_backend_name(render_context_t *ctx) {
     
     return render_backend_name(ctx->backend_type);
 }
+
+

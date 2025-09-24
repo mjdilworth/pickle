@@ -1,6 +1,7 @@
 pickle.o: pickle.c drm_keystone.h keystone.h drm.h pickle_globals.h egl.h \
  v4l2_player.h v4l2_decoder.h utils.h shader.h input.h hvs_keystone.h \
- compute_keystone.h render_backend.h error.h
+ compute_keystone.h compute_keystone_matrix.h gpu_optimize_keystone.h \
+ render_backend.h error.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
 keystone.o: keystone.c keystone.h utils.h shader.h hvs_keystone.h \
@@ -30,6 +31,11 @@ v4l2_decoder.o: v4l2_decoder.c v4l2_decoder.h log.h
 hvs_keystone.o: hvs_keystone.c hvs_keystone.h keystone.h dispmanx.h log.h
 compute_keystone.o: compute_keystone.c compute_keystone.h keystone.h \
  shader.h utils.h log.h
+compute_keystone_matrix.o: compute_keystone_matrix.c \
+ compute_keystone_matrix.h
+gpu_optimize_keystone.o: gpu_optimize_keystone.c gpu_optimize_keystone.h \
+ log.h /usr/include/libdrm/drm_fourcc.h /usr/include/libdrm/drm.h \
+ /usr/include/libdrm/drm_mode.h
 event.o: event.c event.h
 event_callbacks.o: event_callbacks.c event_callbacks.h event.h mpv.h \
  error.h keystone.h drm.h v4l2_player.h v4l2_decoder.h pickle_globals.h \
@@ -39,6 +45,6 @@ pickle_events.o: pickle_events.c pickle_events.h event.h mpv.h error.h \
  pickle_globals.h egl.h input.h
 pickle_globals.o: pickle_globals.c pickle_globals.h drm.h egl.h \
  v4l2_player.h v4l2_decoder.h
-mpv_render.o: mpv_render.c pickle_globals.h drm.h egl.h v4l2_player.h \
- v4l2_decoder.h mpv.h error.h
+mpv_render.o: mpv_render.c mpv_render.h mpv.h error.h drm.h egl.h \
+ pickle_globals.h v4l2_player.h v4l2_decoder.h
 render_backend.o: render_backend.c render_backend.h error.h log.h

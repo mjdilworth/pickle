@@ -6,8 +6,24 @@
 
 // Forward declarations for functions defined in vulkan_utils.c
 
+// Check if Vulkan GPU acceleration should be used
+static bool should_use_gpu_acceleration(void) {
+    // Check for environment variable to enable/disable GPU acceleration
+    const char* env_var = getenv("PICKLE_USE_VULKAN_GPU");
+    if (env_var) {
+        return atoi(env_var) != 0;
+    }
+    return true;  // Default to using GPU acceleration
+}
+
 // Check if compute shaders are supported
 bool vulkan_compute_is_supported(vulkan_ctx_t *ctx) {
+    // Check if GPU acceleration is enabled via environment variable
+    if (!should_use_gpu_acceleration()) {
+        LOG_INFO("Vulkan GPU acceleration disabled by environment variable");
+        return false;
+    }
+
     if (!ctx || !ctx->device) {
         LOG_ERROR("Invalid Vulkan context");
         return false;

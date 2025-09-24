@@ -15,7 +15,7 @@ typedef struct {
     bool loop_playback;
     char *hwdec_mode;
     char *video_file;
-    void *proc_context;  // Context for get_proc_address function
+    void *proc_context;   // Context for get_proc_address function
 } mpv_player_t;
 
 // Initialize MPV player

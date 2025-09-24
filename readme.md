@@ -11,6 +11,8 @@ Minimal fullscreen Raspberry Pi 4 DRM/KMS + GBM + EGL + libmpv hardware accelera
 * Keystone correction for projector use.
 * Hardware-accelerated keystone using RPi4 HVS (Hardware Video Scaler).
 * Compute shader-based keystone for efficient GPU acceleration.
+* Vulkan compute shader support for optimal GPU-based keystone correction.
+* GPU-optimized keystone implementation using OpenGL ES 3.1 compute shaders for reduced CPU load.
 * V4L2 direct decoder path for bypassing MPV for better performance.
 * Plays one file then exits (Ctrl+C to stop early).
 * Optional continuous playback looping.
@@ -21,6 +23,11 @@ Install development headers:
 ```
 sudo apt update
 sudo apt install -y libmpv-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev build-essential pkg-config
+```
+
+For Vulkan support, also install:
+```
+sudo apt install libvulkan-dev vulkan-tools
 ```
 
 Make sure `dtoverlay=vc4-kms-v3d` (or `dtoverlay=vc4-kms-v3d-pi4`) is enabled in `/boot/firmware/config.txt` then reboot.
@@ -35,6 +42,9 @@ make RELEASE=1
 
 # Maximum performance build with Raspberry Pi 4 optimizations
 make RELEASE=1 MAXPERF=1 RPI4_OPT=1
+
+# Build with Vulkan support for GPU-accelerated keystone correction
+make VULKAN=1
 ```
 
 Or manually:
@@ -87,6 +97,68 @@ PICKLE_STATS=1 ./pickle video.mp4
 # Enable looping
 PICKLE_LOOP=1 ./pickle video.mp4
 ```
+
+### Vulkan GPU Acceleration
+```
+# Force Vulkan GPU acceleration for keystone correction
+PICKLE_USE_VULKAN_GPU=1 ./pickle --vulkan video.mp4
+
+# Force CPU-only processing for keystone correction
+PICKLE_USE_VULKAN_GPU=0 ./pickle --gles video.mp4
+
+# Enable performance logging
+PICKLE_PERF_LOG=1 ./pickle --vulkan video.mp4
+```
+
+## Verifying Vulkan GPU Acceleration
+
+Pickle includes several tools to verify if Vulkan hardware GPU acceleration is being used for keystone correction:
+
+1. **Vulkan Hardware Check**:
+   ```
+   make check-vulkan
+   ```
+   This will check if your system has Vulkan-compatible hardware with compute shader support.
+
+2. **Keystone Test Script**:
+   ```
+   # Run the keystone correction performance test
+   ./test_vulkan_keystone.sh
+   
+   # Use a specific video file
+   ./test_vulkan_keystone.sh --video my_video.mp4
+   
+   # Use heavier keystone settings for more GPU load
+   ./test_vulkan_keystone.sh --keystone heavy
+   ```
+   This script runs identical keystone corrections using both GPU and CPU processing,
+   then compares the performance to verify if GPU acceleration is providing benefits.
+
+3. **Verification Script**:
+   ```
+   # Check Vulkan hardware capabilities
+   ./verify_vulkan_usage.sh --check
+   
+   # Monitor GPU usage during playback
+   ./verify_vulkan_usage.sh --monitor
+   
+   # Compare performance between GPU and CPU
+   ./verify_vulkan_usage.sh --perf
+   ```
+
+4. **Performance Comparison**:
+   Run pickle with both GPU and CPU modes and compare the performance:
+   ```
+   # GPU mode
+   sudo PICKLE_USE_VULKAN_GPU=1 PICKLE_PERF_LOG=1 ./pickle --vulkan video.mp4
+   
+   # CPU mode
+   sudo PICKLE_USE_VULKAN_GPU=0 PICKLE_PERF_LOG=1 ./pickle --gles video.mp4
+   ```
+
+For more detailed information, see:
+- `VULKAN_CHECK.md` - Quick guide to checking Vulkan GPU usage
+- `docs/vulkan_verification.md` - Comprehensive verification guide
 
 ### Performance Tips for Raspberry Pi 4
 
@@ -308,6 +380,7 @@ The player supports several environment variables for production deployment:
 **Keystone Correction:**
 * `PICKLE_KEYSTONE=1`         Enable keystone correction mode
 * `PICKLE_KEYSTONE_STEP=n`    Set keystone adjustment step size (1-100, default 10)
+* `PICKLE_GPU_OPTIMIZE=1`     Enable GPU-optimized keystone implementation (reduces CPU load)
 
 **Visual Aids:**
 * `PICKLE_SHOW_BORDER=n`      Show border around video with width n pixels (1-50)
