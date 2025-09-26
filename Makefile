@@ -24,7 +24,7 @@
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c pickle_stubs.c h264_analysis.c hwdec_monitor.c
 
 # Add Vulkan modules when enabled
 ifeq ($(VULKAN),1)
@@ -37,7 +37,7 @@ SOURCES += mp4_demuxer.c
 endif
 
 OBJECTS  := $(SOURCES:.c=.o)
-HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h stats_overlay.h
+HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h stats_overlay.h h264_analysis.h hwdec_monitor.h
 
 # Add Vulkan headers when enabled
 ifeq ($(VULKAN),1)
@@ -86,7 +86,7 @@ PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS) 2>/dev/null)
 PKG_LIBS   := $(shell $(PKG_CONFIG) --libs $(PKGS) 2>/dev/null)
 
 # Basic flags
-CFLAGS  ?= $(OPT) $(DEBUG) $(WARN) -std=$(CSTD) $(PKG_CFLAGS) -DPICKLE_KEYSTONE_MODULAR
+CFLAGS  ?= $(OPT) $(DEBUG) -Wall -Werror=implicit-function-declaration -std=$(CSTD) $(PKG_CFLAGS) -DPICKLE_KEYSTONE_MODULAR
 LDFLAGS ?=
 
 # If pkg-config fails, fall back to a reasonable default library set
@@ -188,9 +188,22 @@ $(APP): $(OBJECTS)
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Special rules for files with specific warning suppressions
+pickle.o: pickle.c $(HEADERS)
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -c $< -o $@
+
+stats_overlay.o: stats_overlay.c $(HEADERS)
+	$(CC) $(CFLAGS) -Wno-conversion -c $< -o $@
+
+drm.o: drm.c $(HEADERS)
+	$(CC) $(CFLAGS) -Wno-sign-compare -c $< -o $@
+
 # Dependency tracking
 deps.mk: $(SOURCES)
 	$(CC) -MM $(CFLAGS) $^ > $@
+
+# Force rebuild pickle_stubs.o after pickle.o to avoid mpv_player_t conflicts
+pickle_stubs.o: pickle_stubs.c $(HEADERS) pickle.o
 
 -include deps.mk
 
@@ -235,6 +248,11 @@ maxperf: clean $(APP)
 
 # RPi4 optimized with maximum performance
 rpi4-maxperf: RPI4_OPT=1
+
+# Disable warnings completely - use for production builds when warnings have been reviewed
+nowarnings: CFLAGS := $(OPT) $(DEBUG) -w -std=$(CSTD) $(PKG_CFLAGS) -DPICKLE_KEYSTONE_MODULAR
+nowarnings: clean $(APP)
+	@echo "Built with all warnings disabled"
 rpi4-maxperf: MAXPERF=1
 rpi4-maxperf: clean $(APP)
 	@echo "Built RPi4 optimized binary with max performance: $(APP)"
@@ -387,4 +405,16 @@ diagnostics: v4l2_diagnostic v4l2_test
 distclean: clean
 	rm -f *.o *.a *.so *.bak *~ *.orig
 
-.PHONY: all run try-run preflight release debug sanitize rpi4 maxperf rpi4-maxperf rpi4-release strip deps help run-help clean distclean install uninstall
+# CUDA stub library to prevent errors on non-NVIDIA hardware
+libcuda.so.1: stub_libcuda.c
+	$(CC) -shared -fPIC -o $@ $<
+
+.PHONY: cuda-stub
+cuda-stub: libcuda.so.1
+	@echo "Built CUDA stub library"
+
+# Run with CUDA stub library to avoid errors
+run-no-cuda: $(APP) libcuda.so.1
+	LD_PRELOAD=./libcuda.so.1 ./$(APP) $(VIDEO)
+
+.PHONY: all run try-run preflight release debug sanitize rpi4 maxperf rpi4-maxperf rpi4-release strip deps help run-help clean distclean install uninstall cuda-stub run-no-cuda

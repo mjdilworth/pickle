@@ -122,9 +122,11 @@ void stats_overlay_render_frame_end(stats_overlay_t *stats) {
         stats->avg_render_time_ms = stats->avg_render_time_ms * 0.9f + render_time * 0.1f;
     }
     
-    // Estimate GPU usage based on render time vs frame time
-    float target_frame_time = 1000.0f / 60.0f; // Assuming 60 FPS target
-    stats->gpu_usage = fminf(100.0f, (stats->avg_render_time_ms / target_frame_time) * 100.0f);
+    // Estimate GPU usage based on render time vs total frame time
+    // We'll use a more conservative estimate to avoid always showing 100%
+    // For Raspberry Pi, consider anything over 5ms to be significant GPU load
+    float max_expected_render_time = 10.0f; // 10ms is considered "full load" for RPi
+    stats->gpu_usage = fminf(100.0f, (stats->avg_render_time_ms / max_expected_render_time) * 100.0f);
 }
 
 // Update all stats

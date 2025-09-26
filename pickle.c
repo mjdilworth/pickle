@@ -44,10 +44,9 @@
 
 // Include our refactored modules
 #include "pickle_globals.h"
-
-// Include our refactored modules
 #include "utils.h"
 #include "shader.h"
+#include "pickle_stubs.h"
 #include "keystone.h"
 #include "input.h"
 #include "hvs_keystone.h"
@@ -55,6 +54,8 @@
 #include "drm.h"
 #include "egl.h"
 #include "stats_overlay.h"
+#include "h264_analysis.h"
+#include "hwdec_monitor.h"
 
 // For event-driven architecture
 #ifdef EVENT_DRIVEN_ENABLED
@@ -203,6 +204,9 @@ static void log_system_memory(void) {
 // Exported globals for use in other modules
 volatile sig_atomic_t g_stop = 0;
 
+// Global hardware decoder monitor
+static hwdec_monitor_t g_hwdec_monitor = {0};
+
 // Global terminal settings for signal handler restoration
 static struct termios g_original_term;
 static bool g_terminal_modified = false;
@@ -315,7 +319,6 @@ typedef struct fb_ring fb_ring_t;
 typedef struct fb_ring_entry fb_ring_entry_t;
 
 // Global state 
-static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
 int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
 
@@ -325,11 +328,13 @@ int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decode
 static int g_loop_playback = 0; // Whether to loop video playback
 
 // Simple solid-color shader for drawing outlines/borders around keystone quad
+#ifdef ENABLE_BORDER_SHADER
 static GLuint g_border_shader_program = 0;
 static GLuint g_border_vertex_shader = 0;
 static GLuint g_border_fragment_shader = 0;
 static GLint  g_border_a_position_loc = -1;
 static GLint  g_border_u_color_loc = -1;
+#endif
 
 // Joystick/gamepad support
 // Note: All joystick-related variables and functions are now in input.c
@@ -728,11 +733,14 @@ void deinit_gbm_egl(egl_ctx_t *e) {
 
 // MPV rendering integration
 #ifndef EVENT_DRIVEN_ENABLED
+#ifndef PICKLE_MPV_H
+// Only define this if mpv.h hasn't been included
 typedef struct {
 	mpv_handle *mpv;             // MPV API handle
 	mpv_render_context *rctx;    // MPV render context for OpenGL rendering
 	int using_libmpv;            // Flag indicating fallback to vo=libmpv occurred
-} mpv_player_t;
+} mpv_player_t_unused; // Renamed to avoid conflict
+#endif
 
 // V4L2 decoder integration is defined in v4l2_player.h
 #include "v4l2_player.h"
@@ -758,8 +766,6 @@ static int g_vsync_enabled = 1;         // Enable vsync by default
 static int g_frame_timing_enabled = 0;  // Detailed frame timing metrics (when PICKLE_TIMING=1)
 
 // Texture orientation controls (used in keystone pass only)
-static int g_tex_flip_x = 0; // 1 = mirror horizontally (left/right)
-static int g_tex_flip_y = 0; // 1 = flip vertically (top/bottom)
 int g_help_visible = 0; // toggle state for help overlay
 
 // --- Statistics ---
@@ -813,9 +819,9 @@ static void stats_log_periodic(mpv_player_t *p) {
 	double avg_fps  = (total > 0.0) ? (double)frames_now / total : 0.0;
 	// Query mpv drop stats if possible
 	int64_t drop_dec = 0, drop_vo = 0;
-	if (p && p->mpv) {
-		mpv_get_property(p->mpv, "drop-frame-count", MPV_FORMAT_INT64, &drop_dec);
-		mpv_get_property(p->mpv, "vo-drop-frame-count", MPV_FORMAT_INT64, &drop_vo);
+	if (p && p->handle) {
+		mpv_get_property(p->handle, "drop-frame-count", MPV_FORMAT_INT64, &drop_dec);
+		mpv_get_property(p->handle, "vo-drop-frame-count", MPV_FORMAT_INT64, &drop_vo);
 	}
 	fprintf(stderr, "[stats] total=%.2fs frames=%llu avg_fps=%.2f inst_fps=%.2f dropped_dec=%lld dropped_vo=%lld\n",
 			total, (unsigned long long)frames_now, avg_fps, inst_fps,
@@ -830,9 +836,9 @@ static void stats_log_final(mpv_player_t *p) {
 	double total = tv_diff(&now, &g_stats_start);
 	double avg_fps = (total > 0.0) ? (double)g_stats_frames / total : 0.0;
 	int64_t drop_dec = 0, drop_vo = 0;
-	if (p && p->mpv) {
-		mpv_get_property(p->mpv, "drop-frame-count", MPV_FORMAT_INT64, &drop_dec);
-		mpv_get_property(p->mpv, "vo-drop-frame-count", MPV_FORMAT_INT64, &drop_vo);
+	if (p && p->handle) {
+		mpv_get_property(p->handle, "drop-frame-count", MPV_FORMAT_INT64, &drop_dec);
+		mpv_get_property(p->handle, "vo-drop-frame-count", MPV_FORMAT_INT64, &drop_vo);
 	}
 	fprintf(stderr, "[stats-final] duration=%.2fs frames=%llu avg_fps=%.2f dropped_dec=%lld dropped_vo=%lld\n",
 			total, (unsigned long long)g_stats_frames, avg_fps, (long long)drop_dec, (long long)drop_vo);
@@ -920,16 +926,16 @@ void hide_help_overlay(mpv_handle *mpv) {
 // Using log_opt_result from utils.c now instead of this static version
 
 static bool init_mpv(mpv_player_t *p, const char *file) {
-	memset(p,0,sizeof(*p));
+	memset(p, 0, sizeof(*p));
 	const char *no_mpv = getenv("PICKLE_NO_MPV");
 	if (no_mpv && *no_mpv) {
 		fprintf(stderr, "[mpv] Skipping mpv initialization (PICKLE_NO_MPV set)\n");
 		return true;
 	}
-	p->mpv = mpv_create();
-	if (!p->mpv) { fprintf(stderr, "mpv_create failed\n"); return false; }
+	p->handle = mpv_create();
+	if (!p->handle) { fprintf(stderr, "mpv_create failed\n"); return false; }
 	const char *want_debug = getenv("PICKLE_LOG_MPV");
-	if (want_debug && *want_debug) mpv_request_log_messages(p->mpv, "debug"); else mpv_request_log_messages(p->mpv, "warn");
+	if (want_debug && *want_debug) mpv_request_log_messages(p->handle, "debug"); else mpv_request_log_messages(p->handle, "warn");
 
 	// Production defaults: vo=gpu, no forced custom gpu-context unless explicitly requested.
 	int r=0;
@@ -942,57 +948,57 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 
 	const char *vo_req = getenv("PICKLE_VO");
 	if (!vo_req || !*vo_req) vo_req = "libmpv"; // Changed default from "gpu" to avoid conflicts
-	r = mpv_set_option_string(p->mpv, "vo", vo_req);
+	r = mpv_set_option_string(p->handle, "vo", vo_req);
 	if (r < 0) {
 		fprintf(stderr, "[mpv] vo=%s failed (%d); falling back to vo=libmpv\n", vo_req, r);
 		vo_req = "libmpv";
-		r = mpv_set_option_string(p->mpv, "vo", "libmpv");
+		r = mpv_set_option_string(p->handle, "vo", "libmpv");
 		log_opt_result("vo=libmpv", r);
 	}
 	const char *vo_used = vo_req;
 	const char *hwdec_pref = getenv("PICKLE_HWDEC");
 	if (!hwdec_pref || !*hwdec_pref) hwdec_pref = "auto-safe";
-	r = mpv_set_option_string(p->mpv, "hwdec", hwdec_pref); log_opt_result("hwdec", r);
-	r = mpv_set_option_string(p->mpv, "opengl-es", "yes"); log_opt_result("opengl-es=yes", r);
+	r = mpv_set_option_string(p->handle, "hwdec", hwdec_pref); log_opt_result("hwdec", r);
+	r = mpv_set_option_string(p->handle, "opengl-es", "yes"); log_opt_result("opengl-es=yes", r);
 	
 	// Video sync mode for better frame timing
 	const char *video_sync = g_vsync_enabled ? "display-resample" : "audio";
-	r = mpv_set_option_string(p->mpv, "video-sync", video_sync);
+	r = mpv_set_option_string(p->handle, "video-sync", video_sync);
 	log_opt_result("video-sync", r);
 	
 	// Optimize queue size based on performance mode
 	const char *queue_size = g_vsync_enabled ? "4" : "1";  // Reduce queue for lower latency when vsync off
-	r = mpv_set_option_string(p->mpv, "vo-queue-size", queue_size);
+	r = mpv_set_option_string(p->handle, "vo-queue-size", queue_size);
 	log_opt_result("vo-queue-size", r);
 	
 	// Configure loop behavior if enabled
 	if (g_loop_playback) {
-		r = mpv_set_option_string(p->mpv, "loop-file", "inf");
+		r = mpv_set_option_string(p->handle, "loop-file", "inf");
 		log_opt_result("loop-file", r);
-		r = mpv_set_option_string(p->mpv, "loop-playlist", "inf");
+		r = mpv_set_option_string(p->handle, "loop-playlist", "inf");
 		log_opt_result("loop-playlist", r);
 	}
 	
 	// Performance-based cache settings
 	if (g_vsync_enabled) {
 		// Larger cache for quality when vsync enabled
-		r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "64MiB");
+		r = mpv_set_option_string(p->handle, "demuxer-max-bytes", "64MiB");
 		log_opt_result("demuxer-max-bytes", r);
-		r = mpv_set_option_string(p->mpv, "cache-secs", "10");
+		r = mpv_set_option_string(p->handle, "cache-secs", "10");
 		log_opt_result("cache-secs", r);
 	} else {
 		// Smaller cache for lower latency when performance mode
-		r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "16MiB");
+		r = mpv_set_option_string(p->handle, "demuxer-max-bytes", "16MiB");
 		log_opt_result("demuxer-max-bytes (perf)", r);
-		r = mpv_set_option_string(p->mpv, "cache-secs", "2");
+		r = mpv_set_option_string(p->handle, "cache-secs", "2");
 		log_opt_result("cache-secs (perf)", r);
 		// Enable aggressive frame dropping for maximum performance
-		r = mpv_set_option_string(p->mpv, "framedrop", "decoder+vo");
+		r = mpv_set_option_string(p->handle, "framedrop", "decoder+vo");
 		log_opt_result("framedrop", r);
 	}
 	
 	// Set a larger audio buffer for smoother audio output
-	r = mpv_set_option_string(p->mpv, "audio-buffer", "0.2");  // 200ms audio buffer
+	r = mpv_set_option_string(p->handle, "audio-buffer", "0.2");  // 200ms audio buffer
 	log_opt_result("audio-buffer", r);
 	
 	// Prefer using MPV_RENDER_PARAM_FLIP_Y during rendering instead of global rotation
@@ -1001,14 +1007,14 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	int forced_headless = getenv("PICKLE_FORCE_HEADLESS") ? 1 : 0;
 	int headless_attempted = 0;
 	if (ctx_override && *ctx_override && strcmp(vo_used, "gpu") == 0) {
-		int rc = mpv_set_option_string(p->mpv, "gpu-context", ctx_override);
+		int rc = mpv_set_option_string(p->handle, "gpu-context", ctx_override);
 		log_opt_result("gpu-context (override)", rc);
 	} else if (strcmp(vo_used, "gpu") == 0) {
 		// Always try to avoid DRM contexts that conflict with our own DRM usage
 		const char *try_contexts[] = {"x11egl", "waylandvk", "wayland", "x11vk", "displayvk", NULL};
 		int ctx_set = 0;
 		for (int i = 0; try_contexts[i] && !ctx_set; i++) {
-			int rc = mpv_set_option_string(p->mpv, "gpu-context", try_contexts[i]);
+			int rc = mpv_set_option_string(p->handle, "gpu-context", try_contexts[i]);
 			if (rc >= 0) {
 				fprintf(stderr, "[mpv] Using gpu-context=%s to avoid DRM conflicts\n", try_contexts[i]);
 				ctx_set = 1;
@@ -1016,7 +1022,7 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 			}
 		}
 		if (!ctx_set && (forced_headless || (!g_have_master && !getenv("PICKLE_DISABLE_HEADLESS")))) {
-			int rc = mpv_set_option_string(p->mpv, "gpu-context", "headless");
+			int rc = mpv_set_option_string(p->handle, "gpu-context", "headless");
 			if (rc < 0) {
 				fprintf(stderr, "[mpv] gpu-context=headless unsupported (%d); will proceed without it.\n", rc);
 			} else {
@@ -1026,17 +1032,17 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 		}
 	}
 	if (strcmp(vo_used, "gpu") == 0) {
-		mpv_set_option_string(p->mpv, "terminal", "no");
-		mpv_set_option_string(p->mpv, "input-default-bindings", "no");
-		mpv_set_option_string(p->mpv, "input-vo-keyboard", "no");  // Disable mpv's keyboard handling
-		mpv_set_option_string(p->mpv, "input-cursor", "no");       // Disable cursor handling
-		mpv_set_option_string(p->mpv, "input-media-keys", "no");   // Disable media key handling
+		mpv_set_option_string(p->handle, "terminal", "no");
+		mpv_set_option_string(p->handle, "input-default-bindings", "no");
+		mpv_set_option_string(p->handle, "input-vo-keyboard", "no");  // Disable mpv's keyboard handling
+		mpv_set_option_string(p->handle, "input-cursor", "no");       // Disable cursor handling
+		mpv_set_option_string(p->handle, "input-media-keys", "no");   // Disable media key handling
 		// Prevent mpv from attempting any DRM/KMS operations since we handle display ourselves
 		if (!getenv("PICKLE_KEEP_ATOMIC")) {
-			mpv_set_option_string(p->mpv, "drm-atomic", "no");
-			mpv_set_option_string(p->mpv, "drm-mode", "");
-			mpv_set_option_string(p->mpv, "drm-connector", "");
-			mpv_set_option_string(p->mpv, "drm-device", "");
+			mpv_set_option_string(p->handle, "drm-atomic", "no");
+			mpv_set_option_string(p->handle, "drm-mode", "");
+			mpv_set_option_string(p->handle, "drm-connector", "");
+			mpv_set_option_string(p->handle, "drm-device", "");
 		}
 	}
 
@@ -1053,8 +1059,8 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 			if (!xdg || !*xdg) { fprintf(stderr, "[mpv] XDG_RUNTIME_DIR missing under root; disabling audio (set PICKLE_FORCE_AUDIO=1 to override)\n"); disable_audio = 1; }
 		}
 	}
-	if (disable_audio) mpv_set_option_string(p->mpv, "audio", "no");
-	if (mpv_initialize(p->mpv) < 0) { fprintf(stderr, "mpv_initialize failed\n"); return false; }
+	if (disable_audio) mpv_set_option_string(p->handle, "audio", "no");
+	if (mpv_initialize(p->handle) < 0) { fprintf(stderr, "mpv_initialize failed\n"); return false; }
 
 	mpv_opengl_init_params gl_init = { .get_proc_address = mpv_get_proc_address, .get_proc_address_ctx = NULL };
 	mpv_render_param params[4]; memset(params,0,sizeof(params)); int pi=0;
@@ -1063,27 +1069,52 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	if (use_adv) { params[pi].type = MPV_RENDER_PARAM_ADVANCED_CONTROL; params[pi++].data = (void*)1; }
 	params[pi].type = 0;
 	fprintf(stderr, "[mpv] Creating render context (advanced_control=%d vo=%s) ...\n", use_adv, vo_used);
-	int cr = mpv_render_context_create(&p->rctx, p->mpv, params);
+	int cr = mpv_render_context_create(&p->render_ctx, p->handle, params);
 	if (cr < 0 && strcmp(vo_used, "gpu") == 0 && !forced_headless && !headless_attempted) {
 		// Retry once with libmpv fallback for compatibility
 		fprintf(stderr, "[mpv] render context create failed (%d); retrying with vo=libmpv\n", cr);
-		mpv_terminate_destroy(p->mpv); p->mpv=NULL; p->rctx=NULL;
-		p->mpv = mpv_create();
-		if (!p->mpv) { fprintf(stderr, "mpv_create (retry) failed\n"); return false; }
-		if (want_debug && *want_debug) mpv_request_log_messages(p->mpv, "debug"); else mpv_request_log_messages(p->mpv, "warn");
-		mpv_set_option_string(p->mpv, "vo", "libmpv");
-		mpv_set_option_string(p->mpv, "hwdec", hwdec_pref);
-		if (disable_audio) mpv_set_option_string(p->mpv, "audio", "no");
-		if (mpv_initialize(p->mpv) < 0) { fprintf(stderr, "mpv_initialize (libmpv retry) failed\n"); return false; }
-		p->using_libmpv = 1;
-		cr = mpv_render_context_create(&p->rctx, p->mpv, params);
+		mpv_terminate_destroy(p->handle); p->handle=NULL; p->render_ctx=NULL;
+		p->handle = mpv_create();
+		if (!p->handle) { fprintf(stderr, "mpv_create (retry) failed\n"); return false; }
+		if (want_debug && *want_debug) mpv_request_log_messages(p->handle, "debug"); else mpv_request_log_messages(p->handle, "warn");
+		mpv_set_option_string(p->handle, "vo", "libmpv");
+		mpv_set_option_string(p->handle, "hwdec", hwdec_pref);
+		if (disable_audio) mpv_set_option_string(p->handle, "audio", "no");
+		if (mpv_initialize(p->handle) < 0) { fprintf(stderr, "mpv_initialize (libmpv retry) failed\n"); return false; }
+		p->initialized = 1;
+		cr = mpv_render_context_create(&p->render_ctx, p->handle, params);
 	}
 	if (cr < 0) { fprintf(stderr, "mpv_render_context_create failed (%d)\n", cr); return false; }
 	fprintf(stderr, "[mpv] Render context OK\n");
-	mpv_render_context_set_update_callback(p->rctx, on_mpv_events, NULL);
-	mpv_set_wakeup_callback(p->mpv, mpv_wakeup_cb, NULL);
+	mpv_render_context_set_update_callback(p->render_ctx, on_mpv_events, NULL);
+	mpv_set_wakeup_callback(p->handle, mpv_wakeup_cb, NULL);
 	const char *cmd[] = {"loadfile", file, NULL};
-	if (mpv_command(p->mpv, cmd) < 0) { fprintf(stderr, "Failed to load file %s\n", file); return false; }
+	if (mpv_command(p->handle, cmd) < 0) { fprintf(stderr, "Failed to load file %s\n", file); return false; }
+	
+	// Initialize hardware decoder monitoring
+	hwdec_monitor_init(&g_hwdec_monitor);
+	
+	// Optionally analyze H.264 profile if requested
+	if (getenv("PICKLE_ANALYZE_VIDEO")) {
+		h264_analysis_result_t result = {0};
+		if (analyze_h264_profile(file, &result)) {
+			if (result.is_h264) {
+				printf("[H.264 Analysis] Codec: %s, Format: %s, Resolution: %dx%d, FPS: %.2f\n", 
+				       result.codec_name ? result.codec_name : "unknown",
+				       result.format_name ? result.format_name : "unknown", 
+				       (int)result.width, (int)result.height, result.fps);
+				if (!result.hw_compatible) {
+					printf("[H.264 Analysis] WARNING: This video may not be hardware accelerated on Raspberry Pi 4\n");
+					if (result.compatibility_warning) {
+						printf("[H.264 Analysis] Reason: %s\n", result.compatibility_warning);
+					}
+				}
+			}
+			// Clean up allocated memory
+			free_h264_analysis_result(&result);
+		}
+	}
+	
 	fprintf(stderr, "[mpv] Initialized successfully (vo=%s)\n", vo_used);
 	return true;
 }
@@ -1096,14 +1127,14 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 static void destroy_mpv(mpv_player_t *p) {
 	if (!p) return;
 	
-	if (p->rctx) {
-		mpv_render_context_free(p->rctx);
-		p->rctx = NULL;
+	if (p->render_ctx) {
+		mpv_render_context_free(p->render_ctx);
+		p->render_ctx = NULL;
 	}
 	
-	if (p->mpv) {
-		mpv_terminate_destroy(p->mpv);
-		p->mpv = NULL;
+	if (p->handle) {
+		mpv_terminate_destroy(p->handle);
+		p->handle = NULL;
 	}
 }
 
@@ -1305,6 +1336,7 @@ static void destroy_v4l2_decoder(v4l2_player_t *p) {
  * @param p Pointer to V4L2 player structure
  * @return true if processing should continue, false to stop playback
  */
+#ifdef USE_V4L2_DECODER
 static bool process_v4l2_frame(v4l2_player_t *p) {
 	if (!p || !p->is_active) return false;
 	
@@ -1323,7 +1355,6 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	}
 	
 	// Frame rate limiting to prevent overwhelming the decoder
-	static struct timespec last_frame_time = {0, 0};
 	struct timespec current_time;
 	clock_gettime(CLOCK_MONOTONIC, &current_time);
 	
@@ -1379,7 +1410,7 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	}
 	struct timespec current_time_check;
 	clock_gettime(CLOCK_MONOTONIC, &current_time_check);
-	double elapsed_seconds = (current_time_check.tv_sec - start_time.tv_sec);
+	double elapsed_seconds = (double)(current_time_check.tv_sec - start_time.tv_sec);
 	if (elapsed_seconds > 30.0) {  // Auto-exit after 30 seconds for testing
 		LOG_INFO("Emergency timeout reached (%.1f seconds), exiting V4L2 frame processing", elapsed_seconds);
 		return false;
@@ -1491,16 +1522,16 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 		}
 		
 		// Try to get a decoded frame
-		v4l2_decoded_frame_t frame;
+		v4l2_decoded_frame_t decoded_frame;
 		LOG_DEBUG("Attempting to get decoded frame...");
-		if (v4l2_decoder_get_frame(p->decoder, &frame)) {
+		if (v4l2_decoder_get_frame(p->decoder, &decoded_frame)) {
 			// Store frame information in the player struct
             p->current_frame.valid = true;
-            p->current_frame.dmabuf_fd = frame.dmabuf_fd;
-            p->current_frame.width = frame.width;
-            p->current_frame.height = frame.height;
-            p->current_frame.format = frame.format;
-            p->current_frame.buf_index = frame.buf_index;
+            p->current_frame.dmabuf_fd = decoded_frame.dmabuf_fd;
+            p->current_frame.width = decoded_frame.width;
+            p->current_frame.height = decoded_frame.height;
+            p->current_frame.format = decoded_frame.format;
+            p->current_frame.buf_index = decoded_frame.buf_index;
             
             LOG_INFO("Got frame: %dx%d timestamp: %ld, dmabuf_fd: %d", 
                      frame.width, frame.height, frame.timestamp, frame.dmabuf_fd);
@@ -1575,6 +1606,7 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	
 	return true;
 }
+#endif // USE_V4L2_DECODER
 
 void drain_mpv_events(mpv_handle *h) {
 	while (1) {
@@ -1585,6 +1617,10 @@ void drain_mpv_events(mpv_handle *h) {
 		}
 		if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
 			mpv_event_log_message *lm = ev->data;
+			
+			// Check for hardware decoder failures using our monitor
+			hwdec_monitor_log_message(lm);
+			
 			// Only print warnings/errors by default; set PICKLE_LOG_MPV for full detail earlier.
 			if (lm->level && (strstr(lm->level, "error") || strstr(lm->level, "warn"))) {
 				fprintf(stderr, "[mpv-log] %s: %s", lm->level, lm->text ? lm->text : "\n");
@@ -1594,8 +1630,13 @@ void drain_mpv_events(mpv_handle *h) {
 		if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) {
 			// This event can indicate that playback is resuming after a pause
 			// Mark it as activity to prevent stall detection from triggering
-			if (g_debug) fprintf(stderr, "[mpv] PLAYBACK_RESTART\n");
+			if (g_debug) fprintf(stderr, "[mpv] PLAYBOOK_RESTART\n");
 			gettimeofday(&g_last_frame_time, NULL);
+			
+			// Check for hardware decoder status changes on restart
+			const char *current_file = mpv_get_property_string(h, "path");
+			hwdec_monitor_check_failure(&g_hwdec_monitor, h, current_file);
+			if (current_file) mpv_free((void*)current_file);
 		}
 		if (ev->event_id == MPV_EVENT_END_FILE) {
 			const mpv_event_end_file *ef = ev->data;
@@ -1745,9 +1786,23 @@ static void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
 */
 
 // Forward declaration for border shader initialization
+#ifdef ENABLE_BORDER_SHADER
 static bool init_border_shader();
 
 static bool init_border_shader() {
+    const char *g_border_vs_src =
+        "attribute vec2 a_position;\n"
+        "void main() {\n"
+        "  gl_Position = vec4(a_position, 0.0, 1.0);\n"
+        "}\n";
+    
+    const char *g_border_fs_src =
+        "precision mediump float;\n"
+        "uniform vec4 u_color;\n"
+        "void main() {\n"
+        "  gl_FragColor = u_color;\n"
+        "}\n";
+
     g_border_vertex_shader = compile_shader(GL_VERTEX_SHADER, g_border_vs_src);
     if (!g_border_vertex_shader) return false;
     g_border_fragment_shader = compile_shader(GL_FRAGMENT_SHADER, g_border_fs_src);
@@ -1770,6 +1825,7 @@ static bool init_border_shader() {
     g_border_u_color_loc = glGetUniformLocation(g_border_shader_program, "u_color");
     return true;
 }
+#endif
 
 // Initialize keystone shader program
 /* Moved to keystone.c module */
@@ -1834,740 +1890,6 @@ static bool keystone_save_config(const char* path) {
     ...
 }
 */
-
-/**
- * Initialize joystick/gamepad support
- * Attempts to open the first joystick device and set up event handling
- *
- * @return true if a joystick was found and initialized
- */
-/* init_joystick function has been moved to input.c */
-
-/**
- * Clean up joystick resources
- */
-/* cleanup_joystick function has been moved to input.c */
-
-// We now use the implementation of handle_joystick_event from input.c// Removed const from drm_ctx parameter because drmModeSetCrtc expects a non-const drmModeModeInfoPtr.
-// We cache framebuffer IDs per gbm_bo to avoid per-frame AddFB/RmFB churn.
-// user data holds a small struct with fb id + drm fd and a destroy handler.
-int g_scanout_disabled = 0; // when set, we skip page flips/modeset and just let mpv decode & render offscreen
-struct fb_holder { uint32_t fb; int fd; };
-void bo_destroy_handler(struct gbm_bo *bo, void *data) __attribute__((weak));
-void bo_destroy_handler(struct gbm_bo *bo, void *data) {
-	(void)bo;
-	struct fb_holder *h = data;
-	if (h) {
-		if (h->fb) drmModeRmFB(h->fd, h->fb);
-		free(h);
-	}
-}
-
-/**
- * Render a frame using the V4L2 decoder
- * 
- * @param d Pointer to KMS context
- * @param e Pointer to EGL context
- * @param p Pointer to V4L2 player structure
- * @return true if rendering succeeded, false otherwise
- */
-bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
-	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
-		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
-	}
-	
-	// Initialize keystone shader if needed and enabled
-	if (g_keystone.enabled && g_keystone_shader_program == 0) {
-		if (!init_keystone_shader()) {
-			LOG_ERROR("Failed to initialize keystone shader, disabling keystone correction");
-			g_keystone.enabled = false;
-		}
-	}
-	// Initialize border shader lazily if needed for border rendering
-	if (g_show_border && g_border_shader_program == 0) {
-		if (!init_border_shader()) {
-			LOG_WARN("Failed to initialize border shader; border will be disabled");
-			g_show_border = false;
-		}
-	}
-	
-	// Background is always black
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT);
-	
-	// Process a frame from the V4L2 decoder
-	if (!process_v4l2_frame(p)) {
-        // No new frame available
-        return false;
-    }
-    
-    // Check for active frame
-    if (!p->current_frame.valid) {
-        return false;
-    }
-    
-    // Create/update OpenGL texture from V4L2 decoded frame
-    if (p->current_frame.dmabuf_fd >= 0) {
-        // We have a DMA-BUF frame, use zero-copy path if possible
-        if (!g_scanout_disabled && should_use_zero_copy(d, e)) {
-            // Setup source and destination rectangles
-            float src_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full texture
-            float dst_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full screen
-            
-            // Use zero-copy path to present the frame
-            if (present_frame_zero_copy(d, e, p->current_frame.texture, src_rect, dst_rect)) {
-                // Successfully presented using zero-copy path
-                static bool first_frame = true;
-                if (g_debug && first_frame) {
-                    fprintf(stderr, "[debug] Using zero-copy DMA-BUF path with %s modesetting\n", 
-                            d->atomic_supported ? "atomic" : "legacy");
-                    first_frame = false;
-                }
-                return true;
-            }
-        }
-    }
-	
-	// Apply keystone correction if enabled
-	if (g_keystone.enabled && g_keystone_shader_program) {
-		// Render keystone-corrected quad (similar to render_frame_fixed)
-		// For now, just rendering a black screen with keystone shape
-		glUseProgram(g_keystone_shader_program);
-		// Set keystone uniforms...
-	}
-	
-	// Swap buffers
-	if (!eglSwapBuffers(e->dpy, e->surf)) {
-		int err = eglGetError();
-		fprintf(stderr, "eglSwapBuffers failed (0x%x)\n", err); 
-		return false;
-	}
-	
-	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
-	if (!bo) {
-		fprintf(stderr, "gbm_surface_lock_front_buffer failed\n");
-		return false;
-	}
-	
-	// Get framebuffer ID associated with the buffer object
-	uint32_t fb_id = 0;
-	for (int i = 0; i < g_fb_ring.count; i++) {
-		if (g_fb_ring.entries[i].bo == bo) {
-			fb_id = g_fb_ring.entries[i].fb_id;
-			break;
-		}
-	}
-	
-	if (fb_id == 0) {
-		fprintf(stderr, "Failed to find framebuffer for BO\n");
-		gbm_surface_release_buffer(e->gbm_surf, bo);
-		return false;
-	}
-	
-	// Present the framebuffer using KMS
-	bool ret = true;
-	if (d->atomic_supported) {
-		ret = atomic_present_framebuffer(d, fb_id, g_vsync_enabled);
-	} else {
-		drmModePageFlip(d->fd, d->crtc_id, fb_id, g_vsync_enabled ? DRM_MODE_PAGE_FLIP_EVENT : 0, d);
-	}
-	
-	// Wait for page flip to complete if using vsync
-	if (g_vsync_enabled) {
-		wait_for_flip(d->fd);
-	}
-	
-	// Release the buffer
-	gbm_surface_release_buffer(e->gbm_surf, bo);
-	
-	// Release the buffer
-	gbm_surface_release_buffer(e->gbm_surf, bo);
-	
-	return ret;
-}
-
-static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
-	// Start stats timing
-	stats_overlay_render_frame_start(&g_stats_overlay);
-	
-	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
-		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
-	}
-	
-	// Check if we should use hardware-accelerated DRM keystone instead of software keystone
-	// Force use of OpenGL ES keystone instead of DRM keystone (which has framebuffer issues)
-	bool use_drm_keystone = false; // Disabled until framebuffer integration is fixed
-	
-	// Initialize keystone shader if needed and enabled (only for software keystone)
-	if (g_keystone.enabled && !use_drm_keystone && g_keystone_shader_program == 0) {
-		if (!init_keystone_shader()) {
-			LOG_ERROR("Failed to initialize keystone shader, disabling keystone correction");
-			g_keystone.enabled = false;
-		}
-	}
-	// Initialize border shader lazily if needed for border rendering
-	if (g_show_border && g_border_shader_program == 0) {
-		if (!init_border_shader()) {
-			LOG_WARN("Failed to initialize border shader; border will be disabled");
-			g_show_border = false;
-		}
-	}
-	
-	// Background is always black
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT);
-	
-	// Ensure reusable FBO exists when software keystone is enabled, sized to current mode
-	if (g_keystone.enabled && !use_drm_keystone) {
-		int want_w = (int)d->mode.hdisplay;
-		int want_h = (int)d->mode.vdisplay;
-		bool need_recreate = (g_keystone_fbo == 0) || (g_keystone_fbo_w != want_w) || (g_keystone_fbo_h != want_h);
-		if (need_recreate) {
-			// Destroy previous if any
-			if (g_keystone_fbo) {
-				glDeleteFramebuffers(1, &g_keystone_fbo);
-				g_keystone_fbo = 0;
-			}
-			if (g_keystone_fbo_texture) {
-				glDeleteTextures(1, &g_keystone_fbo_texture);
-				g_keystone_fbo_texture = 0;
-			}
-			// Create texture with proper configuration for video
-			glGenTextures(1, &g_keystone_fbo_texture);
-			glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-			
-			// Use RGBA format with proper alpha handling
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-			
-			// Set proper blend mode to ensure texture can be displayed
-			glBindTexture(GL_TEXTURE_2D, 0);
-			glEnable(GL_BLEND);
-			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-			
-			// Check for errors in texture creation
-			GLenum tex_error = glGetError();
-			if (tex_error != GL_NO_ERROR) {
-				LOG_ERROR("Failed to create keystone texture: GL error %d", tex_error);
-				glBindTexture(GL_TEXTURE_2D, 0);
-				glDeleteTextures(1, &g_keystone_fbo_texture);
-				g_keystone_fbo_texture = 0;
-				return false;
-			}
-			// Create FBO
-			glGenFramebuffers(1, &g_keystone_fbo);
-			glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
-			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_keystone_fbo_texture, 0);
-			
-			// Check for errors during FBO configuration
-			GLenum fbo_error = glGetError();
-			if (fbo_error != GL_NO_ERROR) {
-				LOG_ERROR("Error configuring FBO: GL error %d", fbo_error);
-				glBindFramebuffer(GL_FRAMEBUFFER, 0);
-				glDeleteFramebuffers(1, &g_keystone_fbo);
-				glDeleteTextures(1, &g_keystone_fbo_texture);
-				g_keystone_fbo = 0;
-				g_keystone_fbo_texture = 0;
-				return false;
-			}
-			
-			// Verify FBO is complete
-			GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-			if (status != GL_FRAMEBUFFER_COMPLETE) {
-				LOG_ERROR("FBO is incomplete, status: %d", status);
-				// Provide more detailed error information
-				switch (status) {
-					case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT:
-						LOG_ERROR("GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT - attachment point incomplete");
-						break;
-					case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:
-						LOG_ERROR("GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT - no attachments");
-						break;
-					case GL_FRAMEBUFFER_UNSUPPORTED:
-						LOG_ERROR("GL_FRAMEBUFFER_UNSUPPORTED - combination of formats not supported");
-						break;
-					default:
-						LOG_ERROR("Unknown framebuffer error");
-				}
-				
-				glBindFramebuffer(GL_FRAMEBUFFER, 0);
-				glDeleteFramebuffers(1, &g_keystone_fbo);
-				glDeleteTextures(1, &g_keystone_fbo_texture);
-				g_keystone_fbo = 0;
-				g_keystone_fbo_texture = 0;
-			} else {
-				g_keystone_fbo_w = want_w;
-				g_keystone_fbo_h = want_h;
-			}
-		}
-	}
-	
-	// Render MPV frame either to our FBO or directly to screen
-	mpv_opengl_fbo mpv_fbo;
-	int mpv_flip_y = 0; // default: no flip (handled in final pass if needed)
-	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo) {
-		// Clear the FBO first to ensure proper rendering
-		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
-		glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Clear with opaque black
-		glClear(GL_COLOR_BUFFER_BIT);
-		
-		// Force default viewport settings for the FBO rendering
-		glViewport(0, 0, g_keystone_fbo_w, g_keystone_fbo_h);
-		
-		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)g_keystone_fbo, .w = g_keystone_fbo_w, .h = g_keystone_fbo_h, .internal_format = 0 };
-	} else {
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		mpv_fbo = (mpv_opengl_fbo){ .fbo = 0, .w = (int)d->mode.hdisplay, .h = (int)d->mode.vdisplay, .internal_format = 0 };
-		// When rendering directly to the default framebuffer (no keystone), mpv should flip vertically
-		mpv_flip_y = 1;
-	}
-	
-	mpv_render_param r_params[] = {
-		(mpv_render_param){MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
-		(mpv_render_param){MPV_RENDER_PARAM_FLIP_Y, &mpv_flip_y},
-		(mpv_render_param){0}
-	};
-	
-	if (!p->rctx) {
-		fprintf(stderr, "mpv render context NULL\n");
-		return false;
-	}
-	
-	// Ensure proper OpenGL state before rendering
-	if (g_keystone.enabled && !use_drm_keystone) {
-		glDisable(GL_DEPTH_TEST);
-		glDisable(GL_CULL_FACE);
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	}
-	
-	// Render the mpv frame
-	mpv_render_context_render(p->rctx, r_params);
-	
-	// If software keystone is enabled, render the FBO texture with our shader
-	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo && g_keystone_fbo_texture) {
-		// Switch back to default framebuffer
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		
-		// Reset viewport to match screen size
-		glViewport(0, 0, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
-		
-		// Use our shader program
-		glUseProgram(g_keystone_shader_program);
-		
-		// Check for shader attribute locations before using them
-		if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
-			// Re-acquire attribute locations
-			g_keystone_a_position_loc = glGetAttribLocation(g_keystone_shader_program, "a_position");
-			g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
-			g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
-			
-			fprintf(stderr, "DEBUG: Reacquired shader attributes: pos=%d tex=%d u_tex=%d\n", 
-				g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
-				
-			if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
-				fprintf(stderr, "ERROR: Failed to get shader attributes\n");
-				return false; // Can't continue with invalid attributes
-			}
-		}
-		
-		// Set up texture
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
-		glUniform1i(g_keystone_u_texture_loc, 0);
-		
-		// Always enable blending for proper rendering regardless of border state
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		
-		// Ensure alpha blending is properly handled for video content
-		glDisable(GL_DEPTH_TEST);
-		
-		// Clear any previous OpenGL errors
-		while (glGetError() != GL_NO_ERROR);
-		
-		// Correct warping approach: Draw a warped quad where vertices match the keystone corners
-		// Convert keystone points from normalized [0,1] space to clip space [-1,1]
-		float vertices[] = {
-			g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[0][1] * 2.0f),  // Top left 
-			g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[1][1] * 2.0f),  // Top right
-			g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[3][1] * 2.0f),  // Bottom left 
-			g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[2][1] * 2.0f)   // Bottom right
-		};
-		
-		// Texture coordinates with optional flips
-		float u0 = g_tex_flip_x ? 1.0f : 0.0f;
-		float u1 = g_tex_flip_x ? 0.0f : 1.0f;
-		float v0 = g_tex_flip_y ? 1.0f : 0.0f;
-		float v1 = g_tex_flip_y ? 0.0f : 1.0f;
-		float texcoords[] = {
-			u0, v0,  // Top left
-			u1, v0,  // Top right
-			u0, v1,  // Bottom left
-			u1, v1   // Bottom right
-		};
-		
-		// Enable vertex arrays
-		glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
-		glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
-		
-		// Initialize buffers if needed
-		if (g_keystone_vertex_buffer == 0) {
-			glGenBuffers(1, &g_keystone_vertex_buffer);
-		}
-		if (g_keystone_texcoord_buffer == 0) {
-			glGenBuffers(1, &g_keystone_texcoord_buffer);
-		}
-		
-		// Bind and set vertex positions
-		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
-		glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-		
-		// Bind and set texture coordinates
-		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_texcoord_buffer);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_DYNAMIC_DRAW);
-		glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-		
-		// Prepare a cached index buffer for two triangles
-		if (g_keystone_index_buffer == 0) {
-			GLushort indices[] = {0, 1, 2, 2, 1, 3};
-			glGenBuffers(1, &g_keystone_index_buffer);
-			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
-			glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-		} else {
-			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
-		}
-		
-	// Draw using indexed triangles
-	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
-	
-	// Unbind buffers
-	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-	glBindBuffer(GL_ARRAY_BUFFER, 0);
-	
-	// Disable attribute arrays
-	glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
-	glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
-	
-	// Reset texture binding
-	glBindTexture(GL_TEXTURE_2D, 0);
-	
-	// Output debug info after drawing
-	GLenum error = glGetError();
-	if (error != GL_NO_ERROR) {
-		fprintf(stderr, "DEBUG: OpenGL error after drawing keystone texture: %d\n", error);
-		// Print more details about the error
-		switch (error) {
-			case GL_INVALID_ENUM: fprintf(stderr, "GL_INVALID_ENUM: An unacceptable value is specified for an enumerated argument\n"); break;
-			case GL_INVALID_VALUE: fprintf(stderr, "GL_INVALID_VALUE: A numeric argument is out of range\n"); break;
-			case GL_INVALID_OPERATION: fprintf(stderr, "GL_INVALID_OPERATION: The specified operation is not allowed in the current state\n"); break;
-			case GL_INVALID_FRAMEBUFFER_OPERATION: fprintf(stderr, "GL_INVALID_FRAMEBUFFER_OPERATION: The framebuffer object is not complete\n"); break;
-			case GL_OUT_OF_MEMORY: fprintf(stderr, "GL_OUT_OF_MEMORY: There is not enough memory left to execute the command\n"); break;
-			default: fprintf(stderr, "Unknown OpenGL error\n");
-		}
-	}
-		
-		// Clean up
-		glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
-		glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
-		glDisable(GL_BLEND); // Disable blending after drawing the video
-		glUseProgram(0);
-	}
-	
-	// Draw border around the keystone quad if enabled (software keystone only)
-	if (g_show_border && !use_drm_keystone) {
-		// Determine quad positions in clip space matching the keystone corners
-		float vx = g_keystone.points[0][0]*2.0f-1.0f;
-		float vy = 1.0f-(g_keystone.points[0][1]*2.0f);
-		float v0[2] = { vx, vy }; // TL
-		float v1[2] = { g_keystone.points[1][0]*2.0f-1.0f, 1.0f-(g_keystone.points[1][1]*2.0f) }; // TR
-		float v2[2] = { g_keystone.points[3][0]*2.0f-1.0f, 1.0f-(g_keystone.points[3][1]*2.0f) }; // BL
-		float v3[2] = { g_keystone.points[2][0]*2.0f-1.0f, 1.0f-(g_keystone.points[2][1]*2.0f) }; // BR
-		float lines[] = {
-			v0[0], v0[1], v1[0], v1[1], // top edge
-			v1[0], v1[1], v3[0], v3[1], // right edge
-			v3[0], v3[1], v2[0], v2[1], // bottom edge
-			v2[0], v2[1], v0[0], v0[1], // left edge
-		};
-		// Use border shader
-		glUseProgram(g_border_shader_program);
-		glUniform4f(g_border_u_color_loc, 1.0f, 1.0f, 0.0f, 1.0f); // Yellow
-	// Upload a tiny VBO on existing vertex buffer to avoid creating a new one
-		if (g_keystone_vertex_buffer == 0) glGenBuffers(1, &g_keystone_vertex_buffer);
-		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(lines), lines, GL_DYNAMIC_DRAW);
-		glEnableVertexAttribArray((GLuint)g_border_a_position_loc);
-		glVertexAttribPointer((GLuint)g_border_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-	// Set line width (may be clamped to 1 on some GLES2 drivers)
-	glLineWidth((GLfloat)g_border_width);
-	// Draw 4 line segments (each pair of vertices forms a segment)
-		glDrawArrays(GL_LINES, 0, 8);
-		// Cleanup
-		glDisableVertexAttribArray((GLuint)g_border_a_position_loc);
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
-		glUseProgram(0);
-	}
-	
-	// Draw corner markers for keystone adjustment if enabled (software keystone only)
-	// This is simplistic and would need a shader-based approach for proper GLES2 implementation
-	if (g_keystone.enabled && !use_drm_keystone && g_show_corner_markers) {
-		// Draw colored markers at each corner position to show their current locations
-		int corner_size = 10;
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		
-		int w = d->mode.hdisplay;
-		int h = d->mode.vdisplay;
-		
-		for (int i = 0; i < 4; i++) {
-			// Calculate screen position from normalized coordinates
-			int x = (int)((float)g_keystone.points[i][0] * (float)w);
-			int y = (int)((float)g_keystone.points[i][1] * (float)h);
-			
-			// Set color: active corner is red, others are green
-			if (i == g_keystone.active_corner) {
-				glClearColor(1.0f, 0.0f, 0.0f, 0.8f); // Red
-			} else {
-				glClearColor(0.0f, 1.0f, 0.0f, 0.8f); // Green
-			}
-			
-			// Ensure marker stays visible within screen bounds (integer clamps)
-			x = x - corner_size/2;
-			y = y - corner_size/2;
-			if (x < 0) x = 0; else if (x > w - corner_size) x = w - corner_size;
-			if (y < 0) y = 0; else if (y > h - corner_size) y = h - corner_size;
-			
-			// Draw the corner marker
-			glScissor(x, h - y - corner_size, corner_size, corner_size);
-			glEnable(GL_SCISSOR_TEST);
-			glClear(GL_COLOR_BUFFER_BIT);
-		}
-		
-		glDisable(GL_SCISSOR_TEST);
-		glDisable(GL_BLEND);
-	}
-	
-	// Render stats overlay if enabled (before buffer swap)
-	if (g_show_stats_overlay) {
-		stats_overlay_update(&g_stats_overlay);
-		stats_overlay_render_text(&g_stats_overlay, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
-	}
-	
-	// Swap buffers to display the rendered frame
-	eglSwapBuffers(e->dpy, e->surf);
-
-	// If we're using DRM keystone, apply the transformation after the OpenGL rendering is done
-	if (use_drm_keystone) {
-		// Get the current DRM framebuffer ID
-		GLint current_fb;
-		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fb);
-		
-		// Update the DRM keystone transformation for this frame
-		if (!drm_keystone_display_frame(NULL, 0, 0, 0, 0)) {
-			LOG_WARN("Failed to apply DRM keystone transformation for this frame");
-		}
-	}
-
-	static bool first_frame = true;
-
-	// Check if we should use zero-copy path
-	if (!g_scanout_disabled && should_use_zero_copy(d, e)) {
-		// We'd need a way to get the MPV rendered texture, but that's not directly exposed
-		// This is something to implement in the future when we can extract the texture from MPV
-		GLuint video_texture = 0; 
-		
-		// Setup source and destination rectangles
-		float src_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full texture
-		float dst_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full screen
-		
-		// Use zero-copy path to present the frame
-		if (present_frame_zero_copy(d, e, video_texture, src_rect, dst_rect)) {
-			// Successfully presented using zero-copy path
-			if (g_debug && first_frame) {
-				fprintf(stderr, "[debug] Using zero-copy DMA-BUF path with %s modesetting\n", 
-						d->atomic_supported ? "atomic" : "legacy");
-			}
-			return true;
-		}
-		
-		// If zero-copy fails, fall back to standard path
-		if (g_debug && first_frame) {
-			fprintf(stderr, "[debug] Zero-copy path failed, falling back to standard path\n");
-		}
-	}
-
-	// Standard (non-zero-copy) path
-	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
-	if (!bo) { fprintf(stderr, "gbm_surface_lock_front_buffer failed\n"); return false; }
-	struct fb_holder *h = gbm_bo_get_user_data(bo);
-	uint32_t fb_id = h ? h->fb : 0;
-	if (!fb_id) {
-		uint32_t handle = gbm_bo_get_handle(bo).u32;
-		uint32_t pitch = gbm_bo_get_stride(bo);
-		uint32_t width = gbm_bo_get_width(bo);
-		uint32_t height= gbm_bo_get_height(bo);
-		if (!g_scanout_disabled && drmModeAddFB(d->fd, width, height, 24, 32, pitch, handle, &fb_id)) {
-			fprintf(stderr, "drmModeAddFB failed (w=%u h=%u pitch=%u handle=%u err=%s)\n", width, height, pitch, handle, strerror(errno));
-			gbm_surface_release_buffer(e->gbm_surf, bo);
-			return false;
-		}
-		struct fb_holder *nh = calloc(1, sizeof(*nh));
-		if (!nh) { fprintf(stderr, "Out of memory allocating fb_holder\n"); gbm_surface_release_buffer(e->gbm_surf, bo); return false; }
-		nh->fb = fb_id; nh->fd = d->fd;
-		gbm_bo_set_user_data(bo, nh, bo_destroy_handler);
-	}
-	static bool first=true;
-	if (!g_scanout_disabled && first) {
-		// Initial modeset; retain BO until next successful page flip to avoid premature release while scanning out.
-		bool success = false;
-		
-		if (d->atomic_supported) {
-			// Use atomic modesetting for tear-free updates
-			success = atomic_present_framebuffer(d, fb_id, g_vsync_enabled);
-		} else {
-			// Legacy modesetting
-			success = (drmModeSetCrtc(d->fd, d->crtc_id, fb_id, 0, 0, &d->connector_id, 1, &d->mode) == 0);
-		}
-		
-		if (!success) {
-			int err = errno;
-			fprintf(stderr, "%s failed (%s)\n", 
-				d->atomic_supported ? "atomic_present_framebuffer" : "drmModeSetCrtc", 
-				strerror(err));
-				
-			if (err == EACCES || err == EPERM) {
-				fprintf(stderr, "[DRM] Permission denied on modeset – entering NO-SCANOUT fallback (offscreen decode).\n");
-				g_scanout_disabled = 1;
-				// Release this BO immediately; no page flip path.
-				gbm_surface_release_buffer(e->gbm_surf, bo);
-				return true;
-			}
-			return false;
-		}
-		first=false;
-		g_first_frame_bo = bo; // retain; release after we have performed one page flip on a new frame
-		return true; // do not release now
-	}
-	if (!g_scanout_disabled) {
-		g_egl_for_handler = e;
-		gettimeofday(&g_last_flip_submit, NULL); // Record time of submission
-		
-		// For triple buffering, allow up to 2 page flips in flight
-		// If we already have max pending flips, wait for one to complete
-		int max_pending = g_triple_buffer ? 2 : 1;
-		
-		if (g_pending_flips >= max_pending) {
-			if (g_debug) fprintf(stderr, "[buffer] Waiting for page flip to complete (pending=%d)\n", g_pending_flips);
-			
-			// Wait for a pending flip to complete before scheduling another
-			fd_set fds;
-			FD_ZERO(&fds);
-			FD_SET(d->fd, &fds);
-			
-			// Set reasonable timeout to avoid indefinite wait
-			struct timeval timeout = {0, 100000}; // 100ms
-			
-			if (select(d->fd + 1, &fds, NULL, NULL, &timeout) <= 0) {
-				// Timeout or error occurred, force reset pending flip state
-				if (g_debug) fprintf(stderr, "[buffer] Page flip wait timeout, resetting state\n");
-				g_pending_flip = 0;
-			} else if (FD_ISSET(d->fd, &fds)) {
-				// Handle the page flip event
-				drmEventContext ev = { .version = DRM_EVENT_CONTEXT_VERSION, .page_flip_handler = page_flip_handler };
-				drmHandleEvent(d->fd, &ev);
-			}
-		}
-		
-		if (d->atomic_supported) {
-			// Use atomic modesetting for page flip
-			if (!atomic_present_framebuffer(d, fb_id, g_vsync_enabled)) {
-				gbm_surface_release_buffer(e->gbm_surf, bo);
-				return false;
-			}
-		} else {
-			// Legacy page flip
-			if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
-				gbm_surface_release_buffer(e->gbm_surf, bo);
-				return false;
-			}
-		}
-		g_pending_flip = 1; // will release in handler
-		g_pending_flips++;  // increment pending flip count
-	} else {
-		// Offscreen mode: just release BO immediately (no scanout usage).
-		gbm_surface_release_buffer(e->gbm_surf, bo);
-	}
-	
-	// End stats timing
-	stats_overlay_render_frame_end(&g_stats_overlay);
-	
-	// No need to remove FB each frame; retained until BO destroyed.
-	return true;
-}
-
-// Preallocate (discover) up to ring_size unique GBM BOs + FB IDs by performing dummy swaps.
-/**
- * Pre-allocate framebuffer objects for triple-buffering
- * 
- * @param d Pointer to DRM context
- * @param e Pointer to EGL context
- * @param ring_size Number of framebuffers to pre-allocate (typically 3 for triple-buffering)
- */
-static void preallocate_fb_ring(kms_ctx_t *d, egl_ctx_t *e, int ring_size) {
-	if (ring_size <= 0) return;
-	if (g_fb_ring.entries) return; // already done
-	g_fb_ring.entries = calloc((size_t)ring_size, sizeof(*g_fb_ring.entries));
-	if (!g_fb_ring.entries) { fprintf(stderr, "[fb-ring] allocation failed\n"); return; }
-	g_fb_ring.count = ring_size;
-	fprintf(stderr, "[fb-ring] Preallocating up to %d framebuffers...\n", ring_size);
-	// We intentionally do NOT modeset here; we only want FB IDs ready so first real frame
-	// can modeset without incurring drmModeAddFB latency.
-	for (int i=0; i<ring_size; ++i) {
-		// Simple clear to ensure back buffer considered updated.
-		glClearColor(0.f,0.f,0.f,1.f);
-		glClear(GL_COLOR_BUFFER_BIT);
-		eglSwapBuffers(e->dpy, e->surf);
-		struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
-		if (!bo) { fprintf(stderr, "[fb-ring] lock_front_buffer failed at %d\n", i); break; }
-		// Check if this BO already seen (gbm may recycle quickly for small surfaces)
-		int seen = 0;
-		for (int j=0; j<g_fb_ring.produced; ++j) {
-			if (g_fb_ring.entries[j].bo == bo) { seen = 1; break; }
-		}
-		if (!seen) {
-			uint32_t fb_id = 0;
-			struct fb_holder *h = gbm_bo_get_user_data(bo);
-			if (h) fb_id = h->fb;
-			if (!fb_id) {
-				uint32_t handle = gbm_bo_get_handle(bo).u32;
-				uint32_t pitch  = gbm_bo_get_stride(bo);
-				uint32_t width  = gbm_bo_get_width(bo);
-				uint32_t height = gbm_bo_get_height(bo);
-				if (drmModeAddFB(d->fd, width, height, 24, 32, pitch, handle, &fb_id)) {
-					fprintf(stderr, "[fb-ring] drmModeAddFB failed (%s)\n", strerror(errno));
-					gbm_surface_release_buffer(e->gbm_surf, bo);
-					break;
-				}
-				struct fb_holder *nh = calloc(1, sizeof(*nh));
-				if (nh) { nh->fb = fb_id; nh->fd = d->fd; gbm_bo_set_user_data(bo, nh, bo_destroy_handler); }
-			}
-			if (g_fb_ring.produced < g_fb_ring.count) {
-				g_fb_ring.entries[g_fb_ring.produced].bo = bo;
-				g_fb_ring.entries[g_fb_ring.produced].fb_id = fb_id;
-				g_fb_ring.produced++;
-			}
-		}
-		// Release immediately so normal rendering path can reacquire; we only needed FB ID.
-		gbm_surface_release_buffer(e->gbm_surf, bo);
-		if (g_fb_ring.produced >= g_fb_ring.count) break;
-	}
-	fprintf(stderr, "[fb-ring] Prepared %d unique framebuffer(s)\n", g_fb_ring.produced);
-}
 
 int main(int argc, char **argv) {
 	// Parse command line options
@@ -2869,9 +2191,9 @@ int main(int argc, char **argv) {
 		LOG_INFO("Controller mappings: START=Toggle keystone mode");
 		LOG_INFO("Cycle button (default X) = Corners TL->TR->BR->BL");
 		LOG_INFO("Help button (default B) = Toggle help overlay");
-	LOG_INFO("D-pad/Left stick=Move corners, L1/R1=Decrease/Increase step size");
-	LOG_INFO("SELECT=Reset keystone, HOME(Guide)=Toggle border");
-	LOG_INFO("START+SELECT (hold 2s)=Quit");
+		LOG_INFO("D-pad/Left stick=Move corners, L1/R1=Decrease/Increase step size");
+		LOG_INFO("SELECT=Reset keystone, HOME(Guide)=Toggle border");
+		LOG_INFO("START+SELECT (hold 2s)=Quit");
 	}
 	
 #ifdef EVENT_DRIVEN_ENABLED
@@ -2902,9 +2224,9 @@ int main(int argc, char **argv) {
 			// MPV-specific event handling
 			if (g_mpv_wakeup) {
 				g_mpv_wakeup = 0;
-				drain_mpv_events(player.mpv);
-				if (player.rctx) {
-					uint64_t flags = mpv_render_context_update(player.rctx);
+				drain_mpv_events(player.handle);
+				if (player.render_ctx) {
+					uint64_t flags = mpv_render_context_update(player.render_ctx);
 					g_mpv_update_flags |= flags;
 				}
 			}
@@ -2947,10 +2269,10 @@ int main(int argc, char **argv) {
 		if (g_help_toggle_request) {
 			g_help_toggle_request = 0;
 			if (!g_help_visible) {
-				show_help_overlay(player.mpv);
+				show_help_overlay(player.handle);
 				g_help_visible = 1;
 			} else {
-				hide_help_overlay(player.mpv);
+				hide_help_overlay(player.handle);
 				g_help_visible = 0;
 			}
 			g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
@@ -3031,10 +2353,10 @@ int main(int argc, char **argv) {
 					// Help overlay
 					if (c == 'h' && !g_key_seq_state.in_escape_seq) {
 						if (!g_help_visible) {
-							show_help_overlay(player.mpv);
+							show_help_overlay(player.handle);
 							g_help_visible = 1;
 						} else {
-							hide_help_overlay(player.mpv);
+							hide_help_overlay(player.handle);
 							g_help_visible = 0;
 						}
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
@@ -3069,9 +2391,9 @@ int main(int argc, char **argv) {
 		}
 		if (g_mpv_wakeup) {
 			g_mpv_wakeup = 0;
-			drain_mpv_events(player.mpv);
-			if (player.rctx) {
-				uint64_t flags = mpv_render_context_update(player.rctx);
+			drain_mpv_events(player.handle);
+			if (player.render_ctx) {
+				uint64_t flags = mpv_render_context_update(player.render_ctx);
 				g_mpv_update_flags |= flags;
 			}
 		}
@@ -3108,8 +2430,8 @@ int main(int argc, char **argv) {
 				g_stall_reset_count++;
 				
 				// Try to get mpv back on track by forcing an update
-				if (player.rctx) {
-					uint64_t flags = mpv_render_context_update(player.rctx);
+				if (player.render_ctx) {
+					uint64_t flags = mpv_render_context_update(player.render_ctx);
 					g_mpv_update_flags |= flags;
 					
 					// Reset decoder if needed (for more aggressive recovery)
@@ -3118,18 +2440,18 @@ int main(int argc, char **argv) {
 						if (g_loop_playback) {
 							// Get current position and duration
 							double pos = 0, duration = 0;
-							mpv_get_property(player.mpv, "time-pos", MPV_FORMAT_DOUBLE, &pos);
-							mpv_get_property(player.mpv, "duration", MPV_FORMAT_DOUBLE, &duration);
+							mpv_get_property(player.handle, "time-pos", MPV_FORMAT_DOUBLE, &pos);
+							mpv_get_property(player.handle, "duration", MPV_FORMAT_DOUBLE, &duration);
 							
 							// If we're near the end, force a restart
 							if (duration > 0 && pos > (duration - 1.0)) {
 								fprintf(stderr, "[wd] near end of file (%.1f/%.1f), forcing restart for loop\n", pos, duration);
-								const char *cmd[] = {"loadfile", mpv_get_property_string(player.mpv, "path"), "replace", NULL};
-								mpv_command_async(player.mpv, 0, cmd);
+								const char *cmd[] = {"loadfile", mpv_get_property_string(player.handle, "path"), "replace", NULL};
+								mpv_command_async(player.handle, 0, cmd);
 							} else {
 								// Just try to step forward
 								const char *cmd[] = {"frame-step", NULL};
-								mpv_command_async(player.mpv, 0, cmd);
+								mpv_command_async(player.handle, 0, cmd);
 								fprintf(stderr, "[wd] requesting explicit frame-step for recovery\n");
 							}
 						}
@@ -3137,7 +2459,7 @@ int main(int argc, char **argv) {
 						// If we're still having issues, try cycling the hardware decoder
 						if (g_stall_reset_count > 2) {
 							const char *cmd[] = {"cycle-values", "hwdec", "auto-safe", "no", NULL};
-							mpv_command_async(player.mpv, 0, cmd);
+							mpv_command_async(player.handle, 0, cmd);
 							fprintf(stderr, "[wd] cycling hwdec as part of recovery\n");
 						}
 					}

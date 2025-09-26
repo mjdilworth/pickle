@@ -166,6 +166,15 @@ pickle_result_t mpv_player_init(mpv_player_t *player, void *proc_ctx) {
     mpv_player_set_hwdec(player, best_hwdec);
     mpv_player_set_option_flag(player, "osc", 0);  // Disable on-screen controller
     
+    // Explicitly disable CUDA to avoid errors on non-NVIDIA hardware
+    mpv_set_option_string(player->handle, "cuda", "no");
+    mpv_set_option_string(player->handle, "cuda-decode", "no");
+    
+    // For V4L2, set additional helpful options
+    if (strcmp(best_hwdec, "v4l2m2m") == 0) {
+        mpv_set_option_string(player->handle, "vd-lavc-o", "hwdec=v4l2m2m:hwdec-codecs=all");
+    }
+    
     // Set log level to get more verbose output for debugging
     mpv_request_log_messages(player->handle, "warn");
     
@@ -389,13 +398,20 @@ bool mpv_player_process_events(mpv_player_t *player) {
             case MPV_EVENT_LOG_MESSAGE: {
                 mpv_event_log_message *msg = event->data;
                 if (msg && msg->prefix && msg->text) {
+                    // Completely filter out CUDA-related errors - don't even log them
+                    if (strstr(msg->text, "Cannot load libcuda.so.1") ||
+                        strstr(msg->text, "Could not dynamically load CUDA") ||
+                        strstr(msg->text, "CUDA")) {
+                        // Skip CUDA-related messages completely
+                        break;
+                    }
+
+                    // Process other messages normally
                     if (strcmp(msg->level, "error") == 0) {
                         LOG_ERROR("MPV: %s", msg->text);
                         
-                        // Check for hardware decoding errors
-                        if (strstr(msg->text, "Cannot load libcuda.so.1") ||
-                            strstr(msg->text, "hardware decoding failed") ||
-                            strstr(msg->text, "AVHWDeviceContext") ||
+                        // Check for hardware decoding errors (excluding CUDA)
+                        if (strstr(msg->text, "hardware decoding failed") ||
                             strstr(msg->text, "after creating texture: OpenGL error")) {
                             hwdec_error_detected = true;
                         }

@@ -18,6 +18,7 @@ typedef struct {
     unsigned long long last_idle_time;
     
     // GPU usage (approximate based on render time)
+    // For Raspberry Pi, values are scaled where 10ms render time = 100% usage
     float gpu_usage;
     struct timeval last_render_start;
     struct timeval last_render_end;

@@ -1,6 +1,7 @@
 pickle.o: pickle.c drm_keystone.h keystone.h drm.h pickle_globals.h egl.h \
- v4l2_player.h v4l2_decoder.h utils.h shader.h input.h hvs_keystone.h \
- compute_keystone.h stats_overlay.h
+ v4l2_player.h v4l2_decoder.h utils.h shader.h pickle_stubs.h mpv.h \
+ error.h input.h hvs_keystone.h compute_keystone.h stats_overlay.h \
+ h264_analysis.h hwdec_monitor.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
 keystone.o: keystone.c keystone.h utils.h shader.h hvs_keystone.h \
@@ -43,3 +44,7 @@ pickle_globals.o: pickle_globals.c pickle_globals.h drm.h egl.h \
 mpv_render.o: mpv_render.c pickle_globals.h drm.h egl.h v4l2_player.h \
  v4l2_decoder.h mpv.h error.h
 stats_overlay.o: stats_overlay.c stats_overlay.h
+pickle_stubs.o: pickle_stubs.c utils.h egl.h drm.h v4l2_player.h \
+ v4l2_decoder.h mpv.h error.h stats_overlay.h keystone.h
+h264_analysis.o: h264_analysis.c h264_analysis.h utils.h
+hwdec_monitor.o: hwdec_monitor.c hwdec_monitor.h h264_analysis.h utils.h

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>   // For struct timespec
 
 // Only include videodev2.h when V4L2 is enabled
 #if defined(USE_V4L2_DECODER)

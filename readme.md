@@ -199,6 +199,38 @@ The V4L2 decoder path is optimized for:
 - Proper synchronization with display refresh
 - Direct integration with the HVS keystone implementation
 
+## Hardware Decoder Monitoring
+
+Pickle includes automatic hardware decoder monitoring that provides helpful suggestions when hardware acceleration is not available:
+
+- **Automatic Detection**: Monitors when hardware decoding falls back to software
+- **Helpful Suggestions**: Provides specific transcoding commands for hardware compatibility  
+- **Non-Blocking**: Videos continue to play normally with software decoding
+- **H.264 Analysis**: Optional detailed analysis of video properties and compatibility
+
+### Usage
+
+Hardware decoder monitoring is always active and will provide informative messages when needed:
+
+```bash
+# Normal playback with automatic monitoring
+./pickle video.mp4
+
+# Enable detailed H.264 profile analysis
+PICKLE_ANALYZE_VIDEO=1 ./pickle video.mp4
+```
+
+When hardware decoding is unavailable, pickle will suggest transcoding commands like:
+```bash
+ffmpeg -i vid.mp4 \
+  -c:v h264_v4l2m2m \
+  -profile:v main -level:v 4.0 \
+  -pix_fmt yuv420p \
+  -c:a copy output.mp4
+```
+
+The monitoring is purely advisory - all videos will play normally using software decoding when hardware acceleration is not available.
+
 ## Keystone Correction
 
 Pickle supports keystone correction for projector use, allowing you to adjust the image geometry when projecting onto non-perpendicular surfaces:
@@ -400,3 +432,19 @@ connect <MAC_ADDRESS>
 
 
 sudo ddrescue -b 32M -v /dev/sda /home/dilly/Projects/pickle/images/rpi4_backup.img /home/dilly/Projects/pickle/images/rpi4_backup.log
+
+
+if video is too much for pi
+
+ffprobe -v quiet -show_streams -select_streams v:0 vid.mp4
+
+profile 77
+
+ffmpeg -i vid.mp4 \
+  -c:v h264_v4l2m2m \
+  -level 4.0 \
+  -pix_fmt nv12 \
+  -b:v 10M \
+  -g 60 \
+  -bf 0 \
+  out.mp4

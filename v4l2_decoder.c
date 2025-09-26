@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>  // For struct timespec
 
 #if defined(USE_V4L2_DECODER)
 #include <unistd.h>
@@ -374,7 +375,7 @@ bool v4l2_decoder_set_output_format(v4l2_decoder_t *dec, uint32_t pixel_format) 
         dec->pixel_format = fmt.fmt.pix.pixelformat;
     }
     
-    LOG_INFO("V4L2", "Output format: %dx%d, stride=%d, format=%4.4s",
+    LOG_INFO("[V4L2] Output format: %dx%d, stride=%d, format=%4.4s",
              dec->width, dec->height, dec->stride,
              (char*)&dec->pixel_format);
     
@@ -1382,13 +1383,13 @@ bool v4l2_decoder_process_events(v4l2_decoder_t *dec) {
     while (ioctl(dec->fd, VIDIOC_DQEVENT, &event) == 0) {
         switch (event.type) {
             case V4L2_EVENT_SOURCE_CHANGE:
-                LOG_INFO("V4L2 source change event detected");
+                LOG_INFO("[V4L2] Source change event detected");
                 // Handle resolution change
                 // We'd need to stop streaming, query the new format, and restart
                 break;
                 
             case V4L2_EVENT_EOS:
-                LOG_INFO("V4L2 end of stream event");
+                LOG_INFO("[V4L2] End of stream event");
                 // Handle end of stream
                 break;
                 
