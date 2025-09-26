@@ -28,6 +28,7 @@ extern int g_keystone_adjust_step;
 extern int g_show_border;
 extern int g_border_width;
 extern int g_show_corner_markers;
+extern int g_show_stats_overlay;
 extern GLuint g_keystone_shader_program;
 extern GLuint g_keystone_vertex_shader;
 extern GLuint g_keystone_fragment_shader;

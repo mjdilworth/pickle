@@ -24,7 +24,7 @@
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c
 
 # Add Vulkan modules when enabled
 ifeq ($(VULKAN),1)
@@ -37,7 +37,7 @@ SOURCES += mp4_demuxer.c
 endif
 
 OBJECTS  := $(SOURCES:.c=.o)
-HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h
+HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h stats_overlay.h
 
 # Add Vulkan headers when enabled
 ifeq ($(VULKAN),1)

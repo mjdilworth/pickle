@@ -21,6 +21,7 @@ int g_keystone_adjust_step = 10;  // Increased from 1 to 10
 int g_show_border = 0;  // Initialize to 0 (disabled) so border is not visible by default
 int g_border_width = 5;
 int g_show_corner_markers = 1;
+int g_show_stats_overlay = 0;  // Stats overlay disabled by default
 
 // OpenGL shader resources
 GLuint g_keystone_shader_program = 0;
@@ -804,6 +805,10 @@ bool keystone_handle_key(char key) {
         case 'k': // Toggle keystone mode
             g_keystone.enabled = !g_keystone.enabled;
             fprintf(stderr, "\rKeystone correction %s\n", g_keystone.enabled ? "enabled" : "disabled");
+            return true;
+        case 'v': // Toggle stats overlay
+            g_show_stats_overlay = !g_show_stats_overlay;
+            fprintf(stderr, "\rStats overlay %s\n", g_show_stats_overlay ? "enabled" : "disabled");
             return true;
         // Remove handling of raw ESC key here since it's part of arrow key sequences
         // and is already properly handled in event_callbacks.c

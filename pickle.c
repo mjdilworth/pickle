@@ -54,6 +54,7 @@
 #include "compute_keystone.h"
 #include "drm.h"
 #include "egl.h"
+#include "stats_overlay.h"
 
 // For event-driven architecture
 #ifdef EVENT_DRIVEN_ENABLED
@@ -959,8 +960,9 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	r = mpv_set_option_string(p->mpv, "video-sync", video_sync);
 	log_opt_result("video-sync", r);
 	
-	// Set a higher frame queue size for smoother playback
-	r = mpv_set_option_string(p->mpv, "vo-queue-size", "4");
+	// Optimize queue size based on performance mode
+	const char *queue_size = g_vsync_enabled ? "4" : "1";  // Reduce queue for lower latency when vsync off
+	r = mpv_set_option_string(p->mpv, "vo-queue-size", queue_size);
 	log_opt_result("vo-queue-size", r);
 	
 	// Configure loop behavior if enabled
@@ -970,13 +972,24 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 		r = mpv_set_option_string(p->mpv, "loop-playlist", "inf");
 		log_opt_result("loop-playlist", r);
 	}
-	// Increase demuxer cache for smoother playback
-	r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "64MiB");
-	log_opt_result("demuxer-max-bytes", r);
 	
-	// Optimize for smoother playback over perfect A/V sync
-	r = mpv_set_option_string(p->mpv, "cache-secs", "10");
-	log_opt_result("cache-secs", r);
+	// Performance-based cache settings
+	if (g_vsync_enabled) {
+		// Larger cache for quality when vsync enabled
+		r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "64MiB");
+		log_opt_result("demuxer-max-bytes", r);
+		r = mpv_set_option_string(p->mpv, "cache-secs", "10");
+		log_opt_result("cache-secs", r);
+	} else {
+		// Smaller cache for lower latency when performance mode
+		r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "16MiB");
+		log_opt_result("demuxer-max-bytes (perf)", r);
+		r = mpv_set_option_string(p->mpv, "cache-secs", "2");
+		log_opt_result("cache-secs (perf)", r);
+		// Enable aggressive frame dropping for maximum performance
+		r = mpv_set_option_string(p->mpv, "framedrop", "decoder+vo");
+		log_opt_result("framedrop", r);
+	}
 	
 	// Set a larger audio buffer for smoother audio output
 	r = mpv_set_option_string(p->mpv, "audio-buffer", "0.2");  // 200ms audio buffer
@@ -1974,6 +1987,9 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 }
 
 static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
+	// Start stats timing
+	stats_overlay_render_frame_start(&g_stats_overlay);
+	
 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
 	}
@@ -2336,6 +2352,12 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glDisable(GL_BLEND);
 	}
 	
+	// Render stats overlay if enabled (before buffer swap)
+	if (g_show_stats_overlay) {
+		stats_overlay_update(&g_stats_overlay);
+		stats_overlay_render_text(&g_stats_overlay, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
+	}
+	
 	// Swap buffers to display the rendered frame
 	eglSwapBuffers(e->dpy, e->surf);
 
@@ -2480,6 +2502,10 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Offscreen mode: just release BO immediately (no scanout usage).
 		gbm_surface_release_buffer(e->gbm_surf, bo);
 	}
+	
+	// End stats timing
+	stats_overlay_render_frame_end(&g_stats_overlay);
+	
 	// No need to remove FB each frame; retained until BO destroyed.
 	return true;
 }
@@ -2549,11 +2575,13 @@ int main(int argc, char **argv) {
 		{"loop", no_argument, NULL, 'l'},
 		{"help", no_argument, NULL, 'h'},
 		{"v4l2", no_argument, NULL, 'v'},
+		{"no-vsync", no_argument, NULL, 'n'},
+		{"high-performance", no_argument, NULL, 'p'},
 		{0, 0, 0, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "lhv", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "lhvnp", long_options, NULL)) != -1) {
 		switch (opt) {
 			case 'l':
 				g_loop_playback = 1;
@@ -2561,11 +2589,23 @@ int main(int argc, char **argv) {
 			case 'v':
 				g_use_v4l2_decoder = 1;
 				break;
+			case 'n':
+				g_vsync_enabled = 0;
+				fprintf(stderr, "VSync disabled for maximum framerate\n");
+				break;
+			case 'p':
+				g_vsync_enabled = 0;
+				g_triple_buffer = 0;  // Reduce latency
+				setenv("PICKLE_FORCE_RENDER_LOOP", "1", 1);  // Force continuous rendering
+				fprintf(stderr, "High-performance mode: VSync off, continuous rendering enabled\n");
+				break;
 			case 'h':
 				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
 				fprintf(stderr, "  -v, --v4l2            Use V4L2 hardware decoder (RPi4 only)\n");
+				fprintf(stderr, "  -n, --no-vsync        Disable VSync for maximum framerate\n");
+				fprintf(stderr, "  -p, --high-performance Enable high-performance mode (no VSync, continuous render)\n");
 				fprintf(stderr, "  -h, --help            Show this help message\n");
 				return 0;
 			default:
@@ -2650,6 +2690,9 @@ int main(int argc, char **argv) {
 	}
 
 	if (!init_drm(&drm)) RET("init_drm");
+
+	// Initialize stats overlay
+	stats_overlay_init(&g_stats_overlay);
 
 	// Check for render backend selection via environment
 	const char *backend_env = getenv("PICKLE_BACKEND");
@@ -2786,6 +2829,7 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "  r - Reset keystone to default\n");
 	fprintf(stderr, "  b - Toggle border around video\n");
 	fprintf(stderr, "  [/] - Decrease/increase border width\n");
+	fprintf(stderr, "  v - Toggle performance stats overlay (FPS, CPU, GPU, RAM)\n");
 	fprintf(stderr, "  (border draws around keystone quad; background is always black)\n\n");
 
 	// Watchdog: if no frame submitted within WD_FIRST_MS, force a render attempt even if mpv flags missing.
@@ -2928,6 +2972,9 @@ int main(int argc, char **argv) {
 		// Calculate appropriate poll timeout based on frame rate and vsync
 		if (force_loop || (g_mpv_update_flags & MPV_RENDER_UPDATE_FRAME)) {
 			timeout_ms = 0; // don't block if render pending
+		} else if (!g_vsync_enabled) {
+			// When vsync is disabled, use very short timeout for maximum fps
+			timeout_ms = 1; // 1ms for aggressive polling (up to 1000fps theoretical)
 		} else if (frames > 0 && g_vsync_enabled) {
 			// Estimate appropriate timeout based on refresh rate for vsync
 			double refresh_rate = drm.mode.vrefresh ? 
