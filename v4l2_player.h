@@ -6,6 +6,10 @@
 #include <GLES2/gl2.h>
 #include "v4l2_decoder.h"
 
+#ifdef USE_V4L2_DECODER
+#include "mp4_demuxer.h"
+#endif
+
 /**
  * @file v4l2_player.h
  * @brief V4L2 decoder player integration for Pickle
@@ -23,6 +27,12 @@ typedef struct {
     size_t buffer_size;          // Size of the buffer
     int64_t timestamp;           // Current timestamp
     GLuint texture;              // OpenGL texture for rendering
+    
+#ifdef USE_V4L2_DECODER
+    // MP4 demuxer integration (for V4L2 mode)
+    mp4_demuxer_t demuxer;       // MP4 demuxer instance
+    bool use_demuxer;            // Flag indicating demuxer is being used
+#endif
     
     // Current frame information
     struct {

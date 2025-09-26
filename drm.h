@@ -29,6 +29,10 @@
 #define DRM_CAP_ATOMIC 0x20
 #endif
 
+#ifndef DRM_CLIENT_CAP_ATOMIC
+#define DRM_CLIENT_CAP_ATOMIC 3
+#endif
+
 // Forward declaration
 typedef struct kms_ctx kms_ctx_t;
 typedef struct egl_ctx egl_ctx_t;

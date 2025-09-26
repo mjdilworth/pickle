@@ -410,13 +410,15 @@ bool drm_keystone_is_supported(void) {
             LOG_INFO("Using DRM dumb buffers for keystone correction");
         }
         
-        // Check for atomic modesetting support
-        if (drmGetCap(fd, DRM_CAP_ATOMIC, &cap_value) < 0 || !cap_value) {
-            LOG_INFO("DRM device does not support atomic modesetting");
-            // We'll continue without atomic support
-        } else {
+        // Check for atomic modesetting support by trying to allocate an atomic request
+        drmModeAtomicReqPtr test_req = drmModeAtomicAlloc();
+        if (test_req) {
             g_drm_keystone_state.atomic_supported = true;
             LOG_INFO("DRM device supports atomic modesetting");
+            drmModeAtomicFree(test_req);
+        } else {
+            LOG_INFO("DRM device does not support atomic modesetting");
+            // We'll continue without atomic support
         }
         
         close(fd);

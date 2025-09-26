@@ -14,16 +14,19 @@
 
 // Global property name to ID mapping
 struct prop_ids {
-    uint32_t crtc_id;
-    uint32_t mode_id;
-    uint32_t active;
-    uint32_t fb_id;
-    uint32_t crtc_x;
-    uint32_t crtc_y;
-    uint32_t src_x;
-    uint32_t src_y;
-    uint32_t src_w;
-    uint32_t src_h;
+    // CRTC properties
+    uint32_t crtc_mode_id;
+    uint32_t crtc_active;
+    
+    // Plane properties
+    uint32_t plane_fb_id;
+    uint32_t plane_crtc_id;
+    uint32_t plane_crtc_x;
+    uint32_t plane_crtc_y;
+    uint32_t plane_src_x;
+    uint32_t plane_src_y;
+    uint32_t plane_src_w;
+    uint32_t plane_src_h;
 };
 
 /**
@@ -70,23 +73,23 @@ bool find_atomic_properties(kms_ctx_t *d, struct prop_ids *props) {
     if (!d || !props) return false;
     
     // Find CRTC properties
-    props->crtc_id = find_property_id(d->fd, d->crtc, DRM_MODE_OBJECT_CRTC, "CRTC_ID");
-    props->mode_id = find_property_id(d->fd, d->crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
-    props->active = find_property_id(d->fd, d->crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+    props->crtc_mode_id = find_property_id(d->fd, d->crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+    props->crtc_active = find_property_id(d->fd, d->crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
     
     // Find plane properties
-    props->fb_id = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "FB_ID");
-    props->crtc_id = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
-    props->crtc_x = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "CRTC_X");
-    props->crtc_y = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
-    props->src_x = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_X");
-    props->src_y = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_Y");
-    props->src_w = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_W");
-    props->src_h = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_H");
+    props->plane_fb_id = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "FB_ID");
+    props->plane_crtc_id = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+    props->plane_crtc_x = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+    props->plane_crtc_y = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+    props->plane_src_x = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_X");
+    props->plane_src_y = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+    props->plane_src_w = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_W");
+    props->plane_src_h = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "SRC_H");
     
     // Check if we found all required properties
-    if (!props->crtc_id || !props->active || !props->fb_id) {
-        LOG_ERROR("Failed to find required atomic properties");
+    if (!props->crtc_mode_id || !props->crtc_active || !props->plane_fb_id) {
+        LOG_ERROR("Failed to find required atomic properties (CRTC MODE_ID:%u, ACTIVE:%u, Plane FB_ID:%u)",
+                 props->crtc_mode_id, props->crtc_active, props->plane_fb_id);
         return false;
     }
     
@@ -102,13 +105,16 @@ bool find_atomic_properties(kms_ctx_t *d, struct prop_ids *props) {
 bool init_atomic_modesetting(kms_ctx_t *d) {
     if (!d) return false;
     
-    // Check if atomic modesetting is supported
-    uint64_t cap = 0;
-    if (drmGetCap(d->fd, DRM_CAP_ATOMIC, &cap) < 0 || !cap) {
-        LOG_ERROR("Atomic modesetting not supported by DRM driver - zero-copy performance will be limited");
+    // We've already enabled DRM_CLIENT_CAP_ATOMIC, so atomic should be available
+    // We'll verify by trying to allocate an atomic request
+    drmModeAtomicReqPtr test_req = drmModeAtomicAlloc();
+    if (!test_req) {
+        LOG_ERROR("Failed to allocate atomic request - atomic modesetting not available");
         d->atomic_supported = false;
         return false;
     }
+    drmModeAtomicFree(test_req);
+    LOG_DRM("Atomic request allocation successful - atomic modesetting available");
     
     // Get atomic property IDs
     d->prop_ids = calloc(1, sizeof(struct prop_ids));
@@ -124,9 +130,11 @@ bool init_atomic_modesetting(kms_ctx_t *d) {
         return false;
     }
     
-    d->atomic_supported = true;
-    LOG_INFO("Atomic modesetting initialized successfully");
-    return true;
+    // Temporarily disable atomic modesetting due to segfault issues
+    // TODO: Fix atomic page flip event handling
+    d->atomic_supported = false;
+    LOG_INFO("Atomic modesetting available but disabled (needs debugging)");
+    return false;
 }
 
 /**
@@ -169,21 +177,21 @@ bool atomic_present_framebuffer(kms_ctx_t *d, uint32_t fb_id, bool wait_vsync) {
     
     // Add properties to the request
     // Set plane properties
-    drmModeAtomicAddProperty(req, d->plane, props->fb_id, fb_id);
-    drmModeAtomicAddProperty(req, d->plane, props->crtc_id, d->crtc);
-    drmModeAtomicAddProperty(req, d->plane, props->crtc_x, 0);
-    drmModeAtomicAddProperty(req, d->plane, props->crtc_y, 0);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_fb_id, fb_id);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_crtc_id, d->crtc);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_crtc_x, 0);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_crtc_y, 0);
     
     // Source coordinates are in 16.16 fixed-point format
-    drmModeAtomicAddProperty(req, d->plane, props->src_x, 0);
-    drmModeAtomicAddProperty(req, d->plane, props->src_y, 0);
-    drmModeAtomicAddProperty(req, d->plane, props->src_w, d->mode.hdisplay << 16);
-    drmModeAtomicAddProperty(req, d->plane, props->src_h, d->mode.vdisplay << 16);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_src_x, 0);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_src_y, 0);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_src_w, d->mode.hdisplay << 16);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_src_h, d->mode.vdisplay << 16);
     
     // Set CRTC properties if it's the first frame
     if (!d->crtc_initialized) {
-        drmModeAtomicAddProperty(req, d->crtc, props->active, 1);
-        drmModeAtomicAddProperty(req, d->crtc, props->mode_id, d->mode_blob_id);
+        drmModeAtomicAddProperty(req, d->crtc, props->crtc_active, 1);
+        drmModeAtomicAddProperty(req, d->crtc, props->crtc_mode_id, d->mode_blob_id);
         d->crtc_initialized = true;
     }
     

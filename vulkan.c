@@ -40,12 +40,8 @@
     } while(0)
 #endif
 
-// Validation layer support
-#ifdef NDEBUG
-    const bool enableValidationLayers = false;
-#else
-    const bool enableValidationLayers = true;
-#endif
+// Validation layer support - force disabled for now
+const bool enableValidationLayers = false;
 
 // Validation layers to request
 const char* validationLayers[] = {

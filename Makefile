@@ -24,25 +24,29 @@
 APP      := pickle
 
 # Source files - add new modules here
-COMMON_SOURCES := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c render_backend.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c
 
-# Conditional source files based on features
+# Add Vulkan modules when enabled
 ifeq ($(VULKAN),1)
-SOURCES := $(COMMON_SOURCES) vulkan.c vulkan_utils.c vulkan_compute.c
-else
-SOURCES := $(COMMON_SOURCES)
+SOURCES += vulkan.c vulkan_utils.c vulkan_compute.c
+endif
+
+# Add demuxer module when V4L2 is enabled
+ifeq ($(V4L2),1)
+SOURCES += mp4_demuxer.c
 endif
 
 OBJECTS  := $(SOURCES:.c=.o)
+HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h
 
-# Common header files
-COMMON_HEADERS := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h render_backend.h
-
-# Conditional header files
+# Add Vulkan headers when enabled
 ifeq ($(VULKAN),1)
-HEADERS := $(COMMON_HEADERS) vulkan.h
-else
-HEADERS := $(COMMON_HEADERS)
+HEADERS += vulkan.h vulkan_utils.h
+endif
+
+# Add demuxer header when V4L2 is enabled
+ifeq ($(V4L2),1)
+HEADERS += mp4_demuxer.h
 endif
 
 # Toolchain / standards
@@ -62,20 +66,18 @@ NO_MPV  ?= 0   # build with -DPICKLE_NO_MPV_DEFAULT so runtime can skip mpv init
 PERF    ?= 0   # high-performance build tweaks (e.g. make PERF=1)
 EVENT   ?= 1   # Enable event-driven architecture
 DISPMANX ?= 1  # Enable DispmanX support for RPi (e.g. make DISPMANX=1)
-VULKAN  ?= 0   # Enable Vulkan support (e.g. make VULKAN=1)
+V4L2    ?= 1   # Enable V4L2 hardware decoding support
 
 PKGS       := mpv gbm egl glesv2 libdrm libv4l2
+
+# Add FFmpeg libraries for MP4 demuxing when V4L2 is enabled
+ifeq ($(V4L2),1)
+PKGS += libavformat libavcodec libavutil
+endif
 
 # Add bcm_host package for Raspberry Pi with DispmanX
 ifeq ($(DISPMANX),1)
 	PKGS += bcm_host
-endif
-
-# Add Vulkan package if Vulkan is enabled
-ifeq ($(VULKAN),1)
-PKGS += vulkan
-# Add explicit include path for libdrm to avoid conflicts with local drm.h
-CFLAGS += -I/usr/include/libdrm
 endif
 
 # Allow overriding pkg-config binary
@@ -84,45 +86,14 @@ PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS) 2>/dev/null)
 PKG_LIBS   := $(shell $(PKG_CONFIG) --libs $(PKGS) 2>/dev/null)
 
 # Basic flags
-CFLAGS  ?= $(OPT) $(DEBUG) $(WARN) -std=$(CSTD)
+CFLAGS  ?= $(OPT) $(DEBUG) $(WARN) -std=$(CSTD) $(PKG_CFLAGS) -DPICKLE_KEYSTONE_MODULAR
 LDFLAGS ?=
-
-# Define feature flags
-ifeq ($(VULKAN),1)
-FEATURE_FLAGS += -DVULKAN_ENABLED=1
-$(info Building with Vulkan support enabled - VULKAN_ENABLED=1 will be defined)
-endif
-
-ifeq ($(ZEROCOPY),1)
-FEATURE_FLAGS += -DZEROCOPY_ENABLED=1
-endif
-
-ifeq ($(EVENT),1)
-FEATURE_FLAGS += -DEVENT_DRIVEN_ENABLED=1
-endif
-
-ifeq ($(DISPMANX),1)
-FEATURE_FLAGS += -DDISPMANX_ENABLED=1
-endif
-
-# Combine all flags
-CFLAGS += $(PKG_CFLAGS) -DPICKLE_KEYSTONE_MODULAR $(FEATURE_FLAGS)
 
 # If pkg-config fails, fall back to a reasonable default library set
 ifeq ($(strip $(PKG_LIBS)),)
 LIBS     := -lmpv -lgbm -lEGL -lGLESv2 -ldrm -lv4l2 -lpthread -lm
-# Add Vulkan library if Vulkan is enabled
-ifeq ($(VULKAN),1)
-LIBS     += -lvulkan
-endif
 else
 LIBS     := $(PKG_LIBS) -lpthread -lm
-# Ensure Vulkan lib is included when pkg-config is available
-ifeq ($(VULKAN),1)
-ifeq ($(shell $(PKG_CONFIG) --exists vulkan || echo notfound),notfound)
-LIBS     += -lvulkan
-endif
-endif
 endif
 
 # Apply toggles
@@ -132,6 +103,10 @@ ifeq ($(LTO),1)
 endif
 ifeq ($(NO_MPV),1)
 	CFLAGS  += -DPICKLE_NO_MPV_DEFAULT=1
+endif
+ifeq ($(VULKAN),1)
+	CFLAGS  += -DVULKAN_ENABLED=1
+	LIBS    += -lvulkan
 endif
 ifeq ($(PERF),1)
 	CFLAGS += -O3 -DNDEBUG -fomit-frame-pointer -march=native -mtune=native
@@ -162,6 +137,16 @@ endif
 # Check for DispmanX support
 ifeq ($(DISPMANX),1)
 	CFLAGS += -DDISPMANX_ENABLED=1
+endif
+
+# Check for V4L2 decoder support
+ifeq ($(V4L2),1)
+CFLAGS += -DUSE_V4L2_DECODER=1
+endif
+
+# Allow CFLAGS to be appended instead of replaced when specified externally
+ifdef EXTRA_CFLAGS
+	CFLAGS += $(EXTRA_CFLAGS)
 endif
 
 # RPi4-specific optimizations
@@ -385,7 +370,18 @@ preflight:
 	@bash tools/preflight.sh
 
 clean:
-	rm -f $(OBJECTS) $(APP)
+	rm -f $(OBJECTS) $(APP) v4l2_diagnostic v4l2_test
+
+# Diagnostic tools
+v4l2_diagnostic: v4l2_diagnostic.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+v4l2_test: v4l2_test.c v4l2_decoder.o log.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
+
+.PHONY: diagnostics
+diagnostics: v4l2_diagnostic v4l2_test
+	@echo "Built diagnostic tools"
 
 # Clean all build artifacts including object files, binaries, and backups
 distclean: clean

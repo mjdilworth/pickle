@@ -11,6 +11,11 @@
 #define O_CLOEXEC 02000000
 #endif
 
+// Define DRM_MODE_OBJECT_PLANE if not available
+#ifndef DRM_MODE_OBJECT_PLANE
+#define DRM_MODE_OBJECT_PLANE 0xeeeeeeee
+#endif
+
 // Define logging macros if not already defined
 #ifndef LOG_DRM
 #define LOG_DRM(fmt, ...) fprintf(stderr, "[DRM] " fmt "\n", ##__VA_ARGS__)
@@ -146,6 +151,11 @@ bool init_drm(kms_ctx_t *d) {
         
         LOG_DRM("Selected card path %s", path);
         ensure_drm_master(fd);
+        
+        // Enable atomic modesetting client capability early
+        int atomic_ret = drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
+        LOG_DRM("DRM_CLIENT_CAP_ATOMIC enable early: ret=%d, fd=%d", atomic_ret, fd);
+        
         found_card = true;
         break;
     }
@@ -192,27 +202,121 @@ bool init_drm(kms_ctx_t *d) {
     }
     
     // Look for a primary plane that can be used with our CRTC
+    uint32_t crtc_index = 0;
+    for (uint32_t i = 0; i < d->res->count_crtcs; i++) {
+        if (d->res->crtcs[i] == d->crtc) {
+            crtc_index = i;
+            break;
+        }
+    }
+    
+    LOG_DRM("Looking for plane compatible with CRTC index %u (CRTC ID %u)", crtc_index, d->crtc);
+    
+    // First, try to find primary planes by checking known plane IDs from modetest
+    // Primary planes are often not in the plane resources list on some drivers
+    uint32_t primary_plane_candidates[] = {46, 65, 77, 89, 101, 113};
+    for (uint32_t i = 0; i < sizeof(primary_plane_candidates)/sizeof(primary_plane_candidates[0]); i++) {
+        uint32_t plane_id = primary_plane_candidates[i];
+        drmModePlanePtr plane = drmModeGetPlane(d->fd, plane_id);
+        if (plane && (plane->possible_crtcs & (1 << crtc_index))) {
+            // Verify it's a primary plane
+            drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(d->fd, plane_id, DRM_MODE_OBJECT_PLANE);
+            if (props) {
+                for (uint32_t j = 0; j < props->count_props; j++) {
+                    drmModePropertyPtr prop = drmModeGetProperty(d->fd, props->props[j]);
+                    if (prop && strcmp(prop->name, "type") == 0) {
+                        if (props->prop_values[j] == 1) {  // DRM_PLANE_TYPE_PRIMARY
+                            d->plane = plane_id;
+                            LOG_DRM("Found primary plane %u (possible_crtcs=0x%x)", d->plane, plane->possible_crtcs);
+                            drmModeFreeProperty(prop);
+                            drmModeFreeObjectProperties(props);
+                            drmModeFreePlane(plane);
+                            drmModeFreePlaneResources(planes);
+                            goto found_primary_plane;
+                        }
+                    }
+                    if (prop) drmModeFreeProperty(prop);
+                }
+                drmModeFreeObjectProperties(props);
+            }
+        }
+        if (plane) drmModeFreePlane(plane);
+    }
+    
+    LOG_DRM("No primary plane found in candidates, checking enumerated planes...");
+    LOG_DRM("Total planes available: %u", planes->count_planes);
+    
+    // First pass: check all planes and log their details
+    for (uint32_t i = 0; i < planes->count_planes; i++) {
+        drmModePlanePtr plane = drmModeGetPlane(d->fd, planes->planes[i]);
+        if (!plane) continue;
+        
+        // Get plane type
+        uint64_t plane_type = 0;
+        drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(d->fd, plane->plane_id, DRM_MODE_OBJECT_PLANE);
+        if (props) {
+            for (uint32_t j = 0; j < props->count_props; j++) {
+                drmModePropertyPtr prop = drmModeGetProperty(d->fd, props->props[j]);
+                if (prop && strcmp(prop->name, "type") == 0) {
+                    plane_type = props->prop_values[j];
+                    drmModeFreeProperty(prop);
+                    break;
+                }
+                if (prop) drmModeFreeProperty(prop);
+            }
+            drmModeFreeObjectProperties(props);
+        }
+        
+        LOG_DRM("Plane %u: type=%llu, crtc_id=%u, possible_crtcs=0x%x, compatible=%s", 
+               plane->plane_id, plane_type, plane->crtc_id, plane->possible_crtcs,
+               (plane->possible_crtcs & (1 << crtc_index)) ? "YES" : "NO");
+        
+        drmModeFreePlane(plane);
+    }
+    
+    // Second pass: find a compatible primary plane first, then any compatible plane
+    uint32_t fallback_plane = 0;
+    
     for (uint32_t i = 0; i < planes->count_planes; i++) {
         drmModePlanePtr plane = drmModeGetPlane(d->fd, planes->planes[i]);
         if (!plane) continue;
         
         // Check if this plane works with our CRTC
-        bool compatible = false;
-        for (uint32_t j = 0; j < plane->count_formats; j++) {
-            if (plane->possible_crtcs & (1 << 0)) {  // Primary CRTC
-                compatible = true;
-                break;
+        if (plane->possible_crtcs & (1 << crtc_index)) {
+            // Verify plane type by checking its type property
+            drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(d->fd, plane->plane_id, DRM_MODE_OBJECT_PLANE);
+            if (props) {
+                for (uint32_t j = 0; j < props->count_props; j++) {
+                    drmModePropertyPtr prop = drmModeGetProperty(d->fd, props->props[j]);
+                    if (prop && strcmp(prop->name, "type") == 0) {
+                        if (props->prop_values[j] == 1) {  // DRM_PLANE_TYPE_PRIMARY
+                            d->plane = plane->plane_id;
+                            LOG_DRM("Selected primary plane %u", d->plane);
+                            drmModeFreeProperty(prop);
+                            drmModeFreeObjectProperties(props);
+                            drmModeFreePlane(plane);
+                            goto found_plane;
+                        } else if (props->prop_values[j] == 0 && !fallback_plane) {  // DRM_PLANE_TYPE_OVERLAY
+                            fallback_plane = plane->plane_id;
+                            LOG_DRM("Found compatible overlay plane %u as fallback", fallback_plane);
+                        }
+                    }
+                    if (prop) drmModeFreeProperty(prop);
+                }
+                drmModeFreeObjectProperties(props);
             }
-        }
-        
-        if (compatible) {
-            d->plane = plane->plane_id;
-            drmModeFreePlane(plane);
-            break;
         }
         
         drmModeFreePlane(plane);
     }
+    
+    // If no primary plane found, use overlay plane as fallback
+    if (!d->plane && fallback_plane) {
+        d->plane = fallback_plane;
+        LOG_DRM("Using overlay plane %u as fallback", d->plane);
+    }
+    
+found_plane:
     
     drmModeFreePlaneResources(planes);
     
@@ -220,6 +324,8 @@ bool init_drm(kms_ctx_t *d) {
         LOG_ERROR("Failed to find a suitable plane for display");
         return false;
     }
+    
+found_primary_plane:
     
     // Create a blob for the selected mode
     if (drmModeCreatePropertyBlob(d->fd, &d->mode, sizeof(d->mode), &d->mode_blob_id) != 0) {

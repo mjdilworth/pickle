@@ -54,7 +54,6 @@
 #include "compute_keystone.h"
 #include "drm.h"
 #include "egl.h"
-#include "render_backend.h"
 
 // For event-driven architecture
 #ifdef EVENT_DRIVEN_ENABLED
@@ -64,13 +63,20 @@
 #endif
 
 #include "v4l2_decoder.h"
+#ifdef USE_V4L2_DECODER
+#include "mp4_demuxer.h"
+#include <libavcodec/avcodec.h>
+#endif
 #include <execinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <poll.h>
 #include <termios.h>
 #include <linux/joystick.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
 #include <getopt.h>
 
 #include <xf86drm.h>
@@ -88,6 +94,11 @@
 #include <mpv/client.h>
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
+
+#ifdef VULKAN_ENABLED
+#include "vulkan.h"
+#include "error.h"
+#endif
 
 // Some minimal systems or older headers might miss certain DRM macros; guard them.
 #ifndef DRM_MODE_TYPE_PREFERRED
@@ -140,11 +151,96 @@ static const char *mpv_end_reason_str(int r) {
 #define RETURN_ERROR_EGL(msg) do { LOG_ERROR("%s (eglError=0x%04x)", msg, eglGetError()); return false; } while (0)
 #define RETURN_ERROR_IF(cond, msg) do { if (cond) { RETURN_ERROR(msg); } } while (0)
 
+// Memory monitoring functions
+static void log_memory_usage(const char *context) {
+    FILE *status = fopen("/proc/self/status", "r");
+    if (!status) return;
+    
+    char line[256];
+    unsigned long vm_size = 0, vm_rss = 0, vm_peak = 0;
+    
+    while (fgets(line, sizeof(line), status)) {
+        if (sscanf(line, "VmSize: %lu kB", &vm_size) == 1) continue;
+        if (sscanf(line, "VmRSS: %lu kB", &vm_rss) == 1) continue;
+        if (sscanf(line, "VmPeak: %lu kB", &vm_peak) == 1) continue;
+    }
+    fclose(status);
+    
+    LOG_INFO("[MEM-%s] VmSize: %lu KB, VmRSS: %lu KB, VmPeak: %lu KB", 
+             context, vm_size, vm_rss, vm_peak);
+    
+    // Warn if memory usage seems excessive
+    if (vm_rss > 500000) { // > 500 MB RSS
+        LOG_WARN("[MEM-%s] High RSS memory usage: %lu KB", context, vm_rss);
+    }
+}
+
+static void log_system_memory(void) {
+    FILE *meminfo = fopen("/proc/meminfo", "r");
+    if (!meminfo) return;
+    
+    char line[256];
+    unsigned long mem_total = 0, mem_free = 0, mem_available = 0;
+    
+    while (fgets(line, sizeof(line), meminfo)) {
+        if (sscanf(line, "MemTotal: %lu kB", &mem_total) == 1) continue;
+        if (sscanf(line, "MemFree: %lu kB", &mem_free) == 1) continue;
+        if (sscanf(line, "MemAvailable: %lu kB", &mem_available) == 1) continue;
+    }
+    fclose(meminfo);
+    
+    unsigned long mem_used = mem_total - mem_available;
+    LOG_INFO("[SYS-MEM] Total: %lu KB, Used: %lu KB, Available: %lu KB", 
+             mem_total, mem_used, mem_available);
+    
+    // Warn if system memory is low
+    if (mem_available < 100000) { // < 100 MB available
+        LOG_WARN("[SYS-MEM] Low system memory available: %lu KB", mem_available);
+    }
+}
+
 // Exported globals for use in other modules
 volatile sig_atomic_t g_stop = 0;
-static void handle_sigint(int s){ (void)s; g_stop = 1; }
+
+// Global terminal settings for signal handler restoration
+static struct termios g_original_term;
+static bool g_terminal_modified = false;
+
+static void restore_terminal_state(void) {
+	if (g_terminal_modified) {
+		// Try to restore text console mode
+		int console_fd = open("/dev/tty", O_RDWR);
+		if (console_fd >= 0) {
+			// Switch back to text mode
+			ioctl(console_fd, KDSETMODE, KD_TEXT);
+			close(console_fd);
+		}
+		
+		tcsetattr(STDIN_FILENO, TCSANOW, &g_original_term);
+		// Show cursor and reset terminal attributes (but keep output)
+		fprintf(stderr, "\033[?25h");  // Show cursor
+		fprintf(stderr, "\033[0m");    // Reset all attributes
+		fprintf(stderr, "\n");         // Add newline to separate from any previous output
+		fflush(stderr);
+		g_terminal_modified = false;
+	}
+}
+
+static void handle_sigint(int s){ 
+	(void)s; 
+	restore_terminal_state();
+	g_stop = 1; 
+}
+
+static void handle_sigterm(int s){ 
+	(void)s; 
+	restore_terminal_state();
+	g_stop = 1; 
+}
+
 static void handle_sigsegv(int s){
 	(void)s;
+	restore_terminal_state();
 	void *bt[32];
 	int n = backtrace(bt, 32);
 	fprintf(stderr, "\n*** SIGSEGV captured, backtrace (%d frames):\n", n);
@@ -1021,25 +1117,86 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		return false;
 	}
 	
-	// Open the input file
-	p->input_file = fopen(file, "rb");
-	if (!p->input_file) {
-		LOG_ERROR("Failed to open input file: %s", file);
-		free(p->decoder);
-		p->decoder = NULL;
-		return false;
+#ifdef USE_V4L2_DECODER
+	// Try to initialize MP4 demuxer first
+	if (mp4_demuxer_init(&p->demuxer, file)) {
+		p->use_demuxer = true;
+		
+		// Get stream information from demuxer
+		const char *codec_name;
+		double fps;
+		if (!mp4_demuxer_get_stream_info(&p->demuxer, &p->width, &p->height, &fps, &codec_name)) {
+			LOG_ERROR("Failed to get stream info from MP4 demuxer");
+			mp4_demuxer_cleanup(&p->demuxer);
+			free(p->decoder);
+			p->decoder = NULL;
+			return false;
+		}
+		
+		// Convert FFmpeg codec ID to V4L2 codec
+		if (!mp4_demuxer_is_codec_supported(&p->demuxer)) {
+			LOG_ERROR("Codec %s not supported by V4L2 hardware decoder", codec_name);
+			mp4_demuxer_cleanup(&p->demuxer);
+			free(p->decoder);
+			p->decoder = NULL;
+			return false;
+		}
+		
+		// Map codec to V4L2 codec enum
+		switch (p->demuxer.codec_id) {
+			case AV_CODEC_ID_H264:
+				p->codec = V4L2_CODEC_H264;
+				break;
+			case AV_CODEC_ID_HEVC:
+				p->codec = V4L2_CODEC_HEVC;
+				break;
+			case AV_CODEC_ID_VP8:
+				p->codec = V4L2_CODEC_VP8;
+				break;
+			case AV_CODEC_ID_VP9:
+				p->codec = V4L2_CODEC_VP9;
+				break;
+			default:
+				LOG_ERROR("Unsupported codec ID: %d", p->demuxer.codec_id);
+				mp4_demuxer_cleanup(&p->demuxer);
+				free(p->decoder);
+				p->decoder = NULL;
+				return false;
+		}
+		
+		LOG_INFO("Using MP4 demuxer: %s %dx%d @ %.2f fps", codec_name, p->width, p->height, fps);
+	} else {
+#endif
+		// Fallback to raw file reading
+#ifdef USE_V4L2_DECODER
+		p->use_demuxer = false;
+#endif
+		p->input_file = fopen(file, "rb");
+		if (!p->input_file) {
+			LOG_ERROR("Failed to open input file: %s", file);
+			free(p->decoder);
+			p->decoder = NULL;
+			return false;
+		}
+		
+		// For raw streams, assume H.264 codec
+		p->codec = V4L2_CODEC_H264;
+		p->width = 1920;  // Default values
+		p->height = 1080;
+		
+		LOG_INFO("Using raw stream mode (no demuxer)");
+#ifdef USE_V4L2_DECODER
 	}
+#endif
 	
-	// For now, assume H.264 codec - we would need to parse the file header to determine this
-	p->codec = V4L2_CODEC_H264;
-	p->width = 1920;  // Default values, will be updated after parsing
-	p->height = 1080;
+	LOG_INFO("Initializing V4L2 decoder for file: %s (codec: H.264, initial size: %dx%d)",
+		file, p->width, p->height);
 	
 	// Initialize the decoder
 	if (!v4l2_decoder_init(p->decoder, p->codec, p->width, p->height)) {
 		LOG_ERROR("Failed to initialize V4L2 decoder");
 		fclose(p->input_file);
-		free(p->decoder);
+		// Don't free the decoder memory here - v4l2_decoder_init already frees it on failure
 		p->decoder = NULL;
 		return false;
 	}
@@ -1049,12 +1206,19 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		LOG_WARN("DMA-BUF not supported, falling back to memory copy");
 	}
 	
+	LOG_INFO("Initialized V4L2 decoder for codec: %s, resolution: %dx%d", 
+		p->codec == V4L2_CODEC_H264 ? "H.264" :
+		p->codec == V4L2_CODEC_HEVC ? "HEVC" :
+		p->codec == V4L2_CODEC_VP8 ? "VP8" :
+		p->codec == V4L2_CODEC_VP9 ? "VP9" : "Unknown",
+		p->width, p->height);
+	
 	// Allocate buffers
 	if (!v4l2_decoder_allocate_buffers(p->decoder, 8, 8)) {
 		LOG_ERROR("Failed to allocate V4L2 decoder buffers");
 		v4l2_decoder_destroy(p->decoder);
 		fclose(p->input_file);
-		free(p->decoder);
+		// Don't free the decoder memory - v4l2_decoder_destroy already does this
 		p->decoder = NULL;
 		return false;
 	}
@@ -1064,19 +1228,19 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		LOG_ERROR("Failed to start V4L2 decoder");
 		v4l2_decoder_destroy(p->decoder);
 		fclose(p->input_file);
-		free(p->decoder);
+		// Don't free the decoder memory - v4l2_decoder_destroy already does this
 		p->decoder = NULL;
 		return false;
 	}
 	
 	// Allocate read buffer
-	p->buffer_size = 64 * 1024;  // 64KB buffer
+	p->buffer_size = 1024 * 1024;  // 1MB buffer
 	p->buffer = malloc(p->buffer_size);
 	if (!p->buffer) {
 		LOG_ERROR("Failed to allocate read buffer");
 		v4l2_decoder_destroy(p->decoder);
 		fclose(p->input_file);
-		free(p->decoder);
+		// Don't free the decoder memory - v4l2_decoder_destroy already does this
 		p->decoder = NULL;
 		return false;
 	}
@@ -1100,6 +1264,12 @@ static void destroy_v4l2_decoder(v4l2_player_t *p) {
 		free(p->buffer);
 		p->buffer = NULL;
 	}
+	
+#ifdef USE_V4L2_DECODER
+	if (p->use_demuxer) {
+		mp4_demuxer_cleanup(&p->demuxer);
+	}
+#endif
 	
 	if (p->input_file) {
 		fclose(p->input_file);
@@ -1125,26 +1295,191 @@ static void destroy_v4l2_decoder(v4l2_player_t *p) {
 static bool process_v4l2_frame(v4l2_player_t *p) {
 	if (!p || !p->is_active) return false;
 	
-	// Feed data to the decoder if needed
-	if (p->input_file && !feof(p->input_file)) {
-		// Read a chunk of data
-		size_t bytes_read = fread(p->buffer, 1, p->buffer_size, p->input_file);
-		if (bytes_read > 0) {
-			// Send to decoder
-			if (!v4l2_decoder_decode(p->decoder, p->buffer, bytes_read, p->timestamp)) {
-				LOG_ERROR("V4L2 decoder decode failed");
-			}
-			p->timestamp += 40000;  // Increment by 40ms (25fps)
-		}
+	// Check for stop signal immediately
+	if (g_stop) {
+		LOG_INFO("Stop signal received, exiting frame processing");
+		return false;
 	}
 	
-	// Poll for decoded frames
-	if (v4l2_decoder_poll(p->decoder, 0)) {
+	// Log memory usage at start of frame processing
+	static int frame_count = 0;
+	frame_count++;
+	if (frame_count % 1000 == 1) { // Log every 1000 frames to avoid spam
+		log_memory_usage("V4L2-FRAME");
+		log_system_memory();
+	}
+	
+	// Frame rate limiting to prevent overwhelming the decoder
+	static struct timespec last_frame_time = {0, 0};
+	struct timespec current_time;
+	clock_gettime(CLOCK_MONOTONIC, &current_time);
+	
+#ifdef USE_V4L2_DECODER
+	if (p->use_demuxer && p->demuxer.fps > 0) {
+		// Calculate target frame interval based on demuxer FPS
+		double target_interval_ms = 1000.0 / p->demuxer.fps;
+		
+		if (last_frame_time.tv_sec != 0) {
+			// Calculate time since last frame
+			double elapsed_ms = (current_time.tv_sec - last_frame_time.tv_sec) * 1000.0 +
+								(current_time.tv_nsec - last_frame_time.tv_nsec) / 1000000.0;
+			
+			// If we're processing too fast, add a small delay
+			if (elapsed_ms < target_interval_ms) {
+				double sleep_ms = target_interval_ms - elapsed_ms;
+				if (sleep_ms > 0 && sleep_ms < 100) { // Cap to avoid excessive delays
+					struct timespec sleep_time;
+					sleep_time.tv_sec = 0;
+					sleep_time.tv_nsec = (long)(sleep_ms * 1000000);
+					nanosleep(&sleep_time, NULL);
+					
+					if (frame_count % 50 == 0) {
+						LOG_DEBUG("Frame rate limiting: slept %.2f ms (target: %.2f ms)", sleep_ms, target_interval_ms);
+					}
+				}
+			}
+		}
+		
+		last_frame_time = current_time;
+	} else {
+	// Add minimum delay to prevent overwhelming the terminal/system
+	struct timespec min_sleep = {0, 5000000}; // 5ms minimum (reduced for better responsiveness)
+	nanosleep(&min_sleep, NULL);
+	}
+#endif
+
+	// Check for stop signal periodically and flush output
+	if (frame_count % 10 == 0) {
+		if (g_stop) {
+			LOG_INFO("Stop signal received, exiting V4L2 frame processing");
+			return false;
+		}
+		// Flush stdout/stderr to keep terminal responsive
+		fflush(stdout);
+		fflush(stderr);
+	}
+	
+	// Emergency timeout - if we've been running too long without user interaction, exit
+	static struct timespec start_time = {0, 0};
+	if (start_time.tv_sec == 0) {
+		clock_gettime(CLOCK_MONOTONIC, &start_time);
+	}
+	struct timespec current_time_check;
+	clock_gettime(CLOCK_MONOTONIC, &current_time_check);
+	double elapsed_seconds = (current_time_check.tv_sec - start_time.tv_sec);
+	if (elapsed_seconds > 30.0) {  // Auto-exit after 30 seconds for testing
+		LOG_INFO("Emergency timeout reached (%.1f seconds), exiting V4L2 frame processing", elapsed_seconds);
+		return false;
+	}
+	
+	// Track consecutive cycles with no frames to prevent infinite loops
+	static int no_frame_cycles = 0;
+	bool got_frame_this_cycle = false;
+	
+	// Feed data to the decoder if needed
+#ifdef USE_V4L2_DECODER
+	if (p->use_demuxer) {
+		// Limit packets per frame to prevent buffer overrun
+		static int packets_this_frame = 0;
+		static int frame_number = 0;
+		
+		if (frame_count != frame_number) {
+			// New frame, reset packet counter
+			frame_number = frame_count;
+			packets_this_frame = 0;
+		}
+		
+		// Only send a packet if we haven't exceeded our limit for this frame
+		if (packets_this_frame < 2) { // Allow max 2 packets per frame processing cycle
+			mp4_packet_t packet;
+		if (mp4_demuxer_get_packet(&p->demuxer, &packet)) {
+			LOG_DEBUG("Got elementary stream packet: size=%zu, pts=%lld, keyframe=%s", 
+					 packet.size, (long long)packet.pts, packet.is_keyframe ? "yes" : "no");
+			
+			// Send elementary stream packet to decoder
+			if (!v4l2_decoder_decode(p->decoder, packet.data, packet.size, packet.pts)) {
+				LOG_ERROR("V4L2 decoder decode failed");
+				log_memory_usage("V4L2-DECODE-FAIL");
+			} else {
+				LOG_DEBUG("Successfully sent %zu bytes (elementary stream) to V4L2 decoder", packet.size);
+				packets_this_frame++;
+			}				// Free packet data
+				mp4_demuxer_free_packet(&packet);
+			} else {
+				// No more packets available (EOF or error)
+				LOG_DEBUG("No more packets from MP4 demuxer");
+			}
+		} else {
+			LOG_DEBUG("Packet rate limiting: skipping packet (sent %d packets this frame)", packets_this_frame);
+		}
+		
+		// Check for stop signal during packet processing
+		if (g_stop) {
+			LOG_INFO("Stop signal received during packet processing");
+			return false;
+		}
+	} else {
+#endif
+		// Fallback: raw file reading for elementary streams
+		if (p->input_file && !feof(p->input_file)) {
+			// Use a safe chunk size for V4L2 decoder to avoid buffer issues
+			size_t max_chunk_size = 65536;  // 64KB - safe for most V4L2 drivers
+			
+			LOG_DEBUG("Using V4L2 chunk size: %zu bytes", max_chunk_size);
+			
+			// Read a chunk of data, but limit to safe chunk size
+			size_t bytes_to_read = max_chunk_size < p->buffer_size ? max_chunk_size : p->buffer_size;
+			size_t bytes_read = fread(p->buffer, 1, bytes_to_read, p->input_file);
+			LOG_DEBUG("Read %zu bytes from input file", bytes_read);
+			
+			if (bytes_read > 0) {
+				// Send to decoder
+				if (!v4l2_decoder_decode(p->decoder, p->buffer, bytes_read, p->timestamp)) {
+					LOG_ERROR("V4L2 decoder decode failed");
+					log_memory_usage("V4L2-DECODE-FAIL");
+				} else {
+					LOG_DEBUG("Successfully sent %zu bytes to V4L2 decoder", bytes_read);
+				}
+				p->timestamp += 40000;  // Increment by 40ms (25fps)
+			}
+		}
+#ifdef USE_V4L2_DECODER
+	}
+#endif
+	
+	// Check if we have any decoded frames available
+	v4l2_decoded_frame_t frame = {0};
+	bool frame_available = v4l2_decoder_get_frame(p->decoder, &frame);
+	
+	if (frame_available) {
+		LOG_DEBUG("Got decoded frame: size=%u, pts=%lld, width=%u, height=%u", 
+			frame.bytesused, (long long)frame.timestamp, frame.width, frame.height);
+		// Normally we would render the frame here
+		got_frame_this_cycle = true;
+		no_frame_cycles = 0;  // Reset counter when we get a frame
+	} else {
+		LOG_DEBUG("No decoded frame available yet");
+	}
+	
+	// Poll for decoded frames with timeout and signal checking
+	LOG_DEBUG("Polling V4L2 decoder for frames...");
+	int poll_result = v4l2_decoder_poll(p->decoder, 0);  // Non-blocking poll
+	LOG_DEBUG("V4L2 poll result: %d", poll_result);
+	
+	if (poll_result > 0) {
+		LOG_DEBUG("Processing V4L2 decoder events...");
 		// Process events
 		v4l2_decoder_process_events(p->decoder);
 		
+		// Check for stop signal after processing events
+		if (g_stop) {
+			LOG_INFO("Stop signal received after processing events");
+			return false;
+		}
+		
 		// Try to get a decoded frame
 		v4l2_decoded_frame_t frame;
+		LOG_DEBUG("Attempting to get decoded frame...");
 		if (v4l2_decoder_get_frame(p->decoder, &frame)) {
 			// Store frame information in the player struct
             p->current_frame.valid = true;
@@ -1156,6 +1491,13 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
             
             LOG_INFO("Got frame: %dx%d timestamp: %ld, dmabuf_fd: %d", 
                      frame.width, frame.height, frame.timestamp, frame.dmabuf_fd);
+            
+            // Log memory usage when successfully getting frames
+			static int successful_frame_count = 0;
+			successful_frame_count++;
+			if (successful_frame_count % 50 == 1) {
+				log_memory_usage("V4L2-FRAME-SUCCESS");
+			}
             
             // Create/update OpenGL texture with frame data
             if (frame.dmabuf_fd >= 0) {
@@ -1194,10 +1536,28 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 		}
 	}
 	
-	// Check if we've reached the end of the file and decoder is empty
-	if (feof(p->input_file) && p->decoder) {
+	// Check if we've reached the end of input and decoder is empty
+#ifdef USE_V4L2_DECODER
+	bool input_finished = p->use_demuxer ? p->demuxer.eof_reached : (p->input_file && feof(p->input_file));
+#else
+	bool input_finished = (p->input_file && feof(p->input_file));
+#endif
+	
+	if (input_finished && p->decoder) {
 		// Flush the decoder to get any remaining frames
         v4l2_decoder_flush(p->decoder);
+	}
+	
+	// Track cycles with no frames to detect potential infinite loops
+	if (!got_frame_this_cycle) {
+		no_frame_cycles++;
+		if (no_frame_cycles > 1000) {  // Exit if no frames for 1000 consecutive cycles
+			LOG_INFO("No frames received for %d consecutive cycles, potential infinite loop - exiting", no_frame_cycles);
+			return false;
+		}
+		if (no_frame_cycles % 100 == 0) {  // Log every 100 cycles
+			LOG_DEBUG("No frames for %d consecutive cycles", no_frame_cycles);
+		}
 	}
 	
 	return true;
@@ -1619,7 +1979,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	}
 	
 	// Check if we should use hardware-accelerated DRM keystone instead of software keystone
-	bool use_drm_keystone = g_keystone.enabled && drm_keystone_is_supported() && drm_keystone_is_active();
+	// Force use of OpenGL ES keystone instead of DRM keystone (which has framebuffer issues)
+	bool use_drm_keystone = false; // Disabled until framebuffer integration is fixed
 	
 	// Initialize keystone shader if needed and enabled (only for software keystone)
 	if (g_keystone.enabled && !use_drm_keystone && g_keystone_shader_program == 0) {
@@ -2188,16 +2549,11 @@ int main(int argc, char **argv) {
 		{"loop", no_argument, NULL, 'l'},
 		{"help", no_argument, NULL, 'h'},
 		{"v4l2", no_argument, NULL, 'v'},
-		{"vulkan", no_argument, NULL, 'k'},
-		{"gles", no_argument, NULL, 'g'},
-		{"render-backend", required_argument, NULL, 'r'},
 		{0, 0, 0, 0}
 	};
 
 	int opt;
-	render_backend_type_t preferred_backend = RENDER_BACKEND_AUTO;
-	
-	while ((opt = getopt_long(argc, argv, "lhvkgr:", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "lhv", long_options, NULL)) != -1) {
 		switch (opt) {
 			case 'l':
 				g_loop_playback = 1;
@@ -2205,43 +2561,11 @@ int main(int argc, char **argv) {
 			case 'v':
 				g_use_v4l2_decoder = 1;
 				break;
-			case 'k':
-#ifdef VULKAN_ENABLED
-				preferred_backend = RENDER_BACKEND_VULKAN;
-#else
-				fprintf(stderr, "Warning: Vulkan support is not enabled in this build\n");
-#endif
-				break;
-			case 'g':
-				preferred_backend = RENDER_BACKEND_GLES;
-				break;
-			case 'r':
-				if (strcasecmp(optarg, "vulkan") == 0) {
-#ifdef VULKAN_ENABLED
-					preferred_backend = RENDER_BACKEND_VULKAN;
-#else
-					fprintf(stderr, "Warning: Vulkan support is not enabled in this build\n");
-#endif
-				} else if (strcasecmp(optarg, "gles") == 0 || 
-				           strcasecmp(optarg, "opengl") == 0 ||
-				           strcasecmp(optarg, "opengles") == 0) {
-					preferred_backend = RENDER_BACKEND_GLES;
-				} else if (strcasecmp(optarg, "auto") == 0) {
-					preferred_backend = RENDER_BACKEND_AUTO;
-				} else {
-					fprintf(stderr, "Warning: Unknown render backend '%s', using auto\n", optarg);
-				}
-				break;
 			case 'h':
 				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
 				fprintf(stderr, "  -v, --v4l2            Use V4L2 hardware decoder (RPi4 only)\n");
-#ifdef VULKAN_ENABLED
-				fprintf(stderr, "  -k, --vulkan          Use Vulkan renderer\n");
-#endif
-				fprintf(stderr, "  -g, --gles            Use OpenGL ES renderer\n");
-				fprintf(stderr, "  -r, --render-backend=<backend> Select renderer (auto, gles, vulkan)\n");
 				fprintf(stderr, "  -h, --help            Show this help message\n");
 				return 0;
 			default:
@@ -2255,10 +2579,6 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 		return 1;
 	}
-	
-	// Set the preferred render backend
-	render_backend_set_preferred(preferred_backend);
-	LOG_INFO("Preferred render backend: %s", render_backend_name(preferred_backend));
 
 	const char *file = argv[optind];
 	
@@ -2279,6 +2599,7 @@ int main(int argc, char **argv) {
 	}
 
 	signal(SIGINT, handle_sigint);
+	signal(SIGTERM, handle_sigterm);
 	signal(SIGSEGV, handle_sigsegv);
 
 	if (getenv("PICKLE_DEBUG")) g_debug = 1;
@@ -2329,7 +2650,45 @@ int main(int argc, char **argv) {
 	}
 
 	if (!init_drm(&drm)) RET("init_drm");
-	if (!init_gbm_egl(&drm, &eglc)) RET("init_gbm_egl");
+
+	// Check for render backend selection via environment
+	const char *backend_env = getenv("PICKLE_BACKEND");
+	bool use_vulkan = false;
+	
+#ifdef VULKAN_ENABLED
+	if (backend_env && strcasecmp(backend_env, "vulkan") == 0) {
+		fprintf(stderr, "[INFO] Using Vulkan render backend\n");
+		use_vulkan = true;
+	} else {
+		fprintf(stderr, "[INFO] Using OpenGL ES render backend (default)\n");
+	}
+#else
+	if (backend_env && strcasecmp(backend_env, "vulkan") == 0) {
+		fprintf(stderr, "[WARN] Vulkan backend requested but not compiled in, falling back to OpenGL ES\n");
+	} else {
+		fprintf(stderr, "[INFO] Using OpenGL ES render backend\n");
+	}
+#endif
+
+	if (use_vulkan) {
+#ifdef VULKAN_ENABLED
+		// Initialize Vulkan
+		vulkan_ctx_t vulkan_ctx = {0};
+		pickle_result_t vk_result = vulkan_init(&vulkan_ctx, &drm);
+		if (vk_result != PICKLE_OK) {
+			fprintf(stderr, "[ERROR] Failed to initialize Vulkan, falling back to OpenGL ES\n");
+			if (!init_gbm_egl(&drm, &eglc)) RET("init_gbm_egl");
+		} else {
+			fprintf(stderr, "[INFO] Vulkan initialized successfully\n");
+			// Store Vulkan context for later use
+			// TODO: Implement Vulkan rendering loop
+			// For now, still initialize OpenGL ES for compatibility
+			if (!init_gbm_egl(&drm, &eglc)) RET("init_gbm_egl");
+		}
+#endif
+	} else {
+		if (!init_gbm_egl(&drm, &eglc)) RET("init_gbm_egl");
+	}
 	// Optional preallocation of FB ring (env PICKLE_FB_RING, default 3)
 	int fb_ring_n = 3; {
 		const char *re = getenv("PICKLE_FB_RING");
@@ -2340,9 +2699,10 @@ int main(int argc, char **argv) {
 	
 	// Initialize keystone correction
 	keystone_init();
-	
-	// Initialize hardware HVS keystone if supported
-	if (hvs_keystone_is_supported()) {
+		keystone_init();
+		
+		// Initialize hardware HVS keystone if supported
+		if (hvs_keystone_is_supported()) {
 		if (hvs_keystone_init()) {
 			LOG_INFO("Hardware HVS keystone initialized successfully");
 		} else {
@@ -2390,6 +2750,7 @@ int main(int argc, char **argv) {
             }
         }
     }
+
 	
 	// Initialize either MPV or V4L2 decoder based on flag
 	if (g_use_v4l2_decoder) {
@@ -2444,11 +2805,15 @@ int main(int argc, char **argv) {
 	}
 	
 	// Configure terminal for raw input mode to capture keystrokes
-	struct termios old_term, new_term;
-	tcgetattr(STDIN_FILENO, &old_term);
-	new_term = old_term;
+	struct termios new_term;
+	tcgetattr(STDIN_FILENO, &g_original_term);
+	new_term = g_original_term;
 	new_term.c_lflag &= (tcflag_t)~(ICANON | ECHO); // Disable canonical mode and echo
 	tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
+	g_terminal_modified = true;
+	
+	// Register terminal restoration on exit
+	atexit(restore_terminal_state);
 	
 	// Set stdin to non-blocking mode
 	int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
@@ -2789,7 +3154,7 @@ int main(int argc, char **argv) {
 	}
 	
 	// Restore terminal settings
-	tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+	restore_terminal_state();
 	
 	// Clean up joystick resources
 	cleanup_joystick();
@@ -2813,7 +3178,7 @@ int main(int argc, char **argv) {
 	return 0;
 fail:
 	// Restore terminal settings in case of failure
-	tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+	restore_terminal_state();
 	
 	// Clean up joystick resources
 	cleanup_joystick();
