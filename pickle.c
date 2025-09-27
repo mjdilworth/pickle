@@ -3447,8 +3447,14 @@ int main(int argc, char **argv) {
 			if (fps_elapsed > 5.0) { // Query every 5 seconds
 				double container_fps = 0.0;
 				if (mpv_get_property(player.mpv, "container-fps", MPV_FORMAT_DOUBLE, &container_fps) >= 0 && container_fps > 0) {
-					g_video_fps = container_fps;
-					LOG_INFO("Updated video FPS from MPV: %.2f fps", g_video_fps);
+					static double last_reported_fps = 0.0;
+					if (g_video_fps != container_fps) { // Only log when FPS actually changes
+						g_video_fps = container_fps;
+						if (container_fps != last_reported_fps) {
+							LOG_INFO("Updated video FPS from MPV: %.2f fps", g_video_fps);
+							last_reported_fps = container_fps;
+						}
+					}
 				}
 				last_fps_query = now_fps;
 			}

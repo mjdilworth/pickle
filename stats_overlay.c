@@ -37,8 +37,11 @@ static void update_fps(stats_overlay_t *stats) {
     
     if (elapsed >= 1.0f) {
         stats->current_fps = (float)stats->frame_count / elapsed;
-        fprintf(stderr, "[DEBUG] FPS Update: %d frames in %.2fs = %.1f fps\n", 
-                stats->frame_count, elapsed, stats->current_fps);
+        static int fps_debug_counter = 0;
+        if (++fps_debug_counter % 10 == 0) { // Log every 10 seconds instead of every second
+            fprintf(stderr, "[DEBUG] FPS Update: %d frames in %.2fs = %.1f fps (logged every 10s)\n", 
+                    stats->frame_count, elapsed, stats->current_fps);
+        }
         stats->frame_count = 0;
         stats->last_fps_update = now;
     }
@@ -480,8 +483,8 @@ void stats_overlay_render_text(stats_overlay_t *stats, int screen_width, int scr
     
     // Debug: Print FPS calculation periodically
     static int debug_counter = 0;
-    if (++debug_counter % 60 == 0) { // Every ~60 frames
-        fprintf(stderr, "[DEBUG] Stats overlay FPS: %.1f (frame_count=%d)\n", display_fps, stats->frame_count);
+    if (++debug_counter % 300 == 0) { // Every ~300 frames (5 seconds at 60fps)
+        fprintf(stderr, "[DEBUG] Stats overlay FPS: %.1f (frame_count=%d) (logged every 5s)\n", display_fps, stats->frame_count);
     }
     
     // Calculate maximum text width for background
