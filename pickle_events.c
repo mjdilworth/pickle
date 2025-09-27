@@ -15,6 +15,7 @@ extern int g_pending_flip;
 extern int g_use_v4l2_decoder;
 extern int g_scanout_disabled;
 extern uint64_t g_frames;
+extern double g_video_fps;
 
 // Define logging macros similar to other Pickle components
 #define LOG_EVENT(fmt, ...) fprintf(stderr, "[EVENT] " fmt "\n", ##__VA_ARGS__)
@@ -76,8 +77,12 @@ event_ctx_t *pickle_event_init(kms_ctx_t *drm, mpv_player_t *player, v4l2_player
     
     // If using V4L2 decoder, create a timer for frame updates
     if (g_use_v4l2_decoder && v4l2_player) {
-        // Update at ~25fps (40ms interval)
-        int timer_fd = event_create_timer(ctx, 40, v4l2_timer_callback, v4l2_player);
+        // Adaptive frame interval based on detected video FPS (default 60fps if not yet detected)
+        double fps = (g_video_fps > 0) ? g_video_fps : 60.0;
+        int frame_interval_ms = (int)(1000.0 / fps);
+        if (frame_interval_ms < 1) frame_interval_ms = 1; // Minimum 1ms (max 1000fps)
+        LOG_EVENT("Creating V4L2 timer with %dms interval (%.1f fps)", frame_interval_ms, fps);
+        int timer_fd = event_create_timer(ctx, frame_interval_ms, v4l2_timer_callback, v4l2_player);
         if (timer_fd < 0) {
             LOG_ERROR("Failed to create V4L2 timer");
             event_cleanup(ctx);

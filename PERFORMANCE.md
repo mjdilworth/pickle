@@ -76,6 +76,19 @@ Use one of these hardware decoder options specifically optimized for Raspberry P
 - `PICKLE_HWDEC=vaapi` - For systems with VA-API support
 - `PICKLE_HWDEC=disabled` - Disable hardware decoding entirely (fallback)
 
+### Advanced Performance Tuning
+
+```bash
+# V4L2 buffer configuration (1-32 buffers each)
+PICKLE_V4L2_INPUT_BUFFERS=16 PICKLE_V4L2_OUTPUT_BUFFERS=16 ./pickle video.mp4
+
+# V4L2 buffer sizes (1-64MB read buffer, 1KB-1MB chunk size)
+PICKLE_V4L2_BUFFER_SIZE_MB=4 PICKLE_V4L2_CHUNK_SIZE_KB=128 ./pickle video.mp4
+
+# Combined high-performance V4L2 settings
+PICKLE_V4L2_INPUT_BUFFERS=16 PICKLE_V4L2_OUTPUT_BUFFERS=16 PICKLE_V4L2_BUFFER_SIZE_MB=8 PICKLE_V4L2_CHUNK_SIZE_KB=256 ./pickle video.mp4
+```
+
 ### Diagnostics
 
 ```bash

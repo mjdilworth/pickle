@@ -37,6 +37,8 @@ static void update_fps(stats_overlay_t *stats) {
     
     if (elapsed >= 1.0f) {
         stats->current_fps = (float)stats->frame_count / elapsed;
+        fprintf(stderr, "[DEBUG] FPS Update: %d frames in %.2fs = %.1f fps\n", 
+                stats->frame_count, elapsed, stats->current_fps);
         stats->frame_count = 0;
         stats->last_fps_update = now;
     }
@@ -123,7 +125,9 @@ void stats_overlay_render_frame_end(stats_overlay_t *stats) {
     }
     
     // Estimate GPU usage based on render time vs frame time
-    float target_frame_time = 1000.0f / 60.0f; // Assuming 60 FPS target
+    // Use actual measured FPS, fallback to 60 FPS if not available
+    float actual_fps = (stats->current_fps > 0) ? stats->current_fps : 60.0f;
+    float target_frame_time = 1000.0f / actual_fps;
     stats->gpu_usage = fminf(100.0f, (stats->avg_render_time_ms / target_frame_time) * 100.0f);
 }
 
@@ -467,11 +471,18 @@ void stats_overlay_render_text(stats_overlay_t *stats, int screen_width, int scr
     int num_lines = 5;
     
     // Prepare text lines
-    snprintf(text_lines[0], sizeof(text_lines[0]), "FPS: %.1f", stats->current_fps > 0 ? stats->current_fps : 60.0f);
+    float display_fps = stats->current_fps > 0 ? stats->current_fps : 60.0f;
+    snprintf(text_lines[0], sizeof(text_lines[0]), "FPS: %.1f", display_fps);
     snprintf(text_lines[1], sizeof(text_lines[1]), "CPU: %.1f%%", stats->cpu_usage);
     snprintf(text_lines[2], sizeof(text_lines[2]), "GPU: %.1f%%", stats->gpu_usage);
     snprintf(text_lines[3], sizeof(text_lines[3]), "RAM: %.0f MB", stats->memory_usage_mb);
     snprintf(text_lines[4], sizeof(text_lines[4]), "Render: %.2f ms", stats->avg_render_time_ms);
+    
+    // Debug: Print FPS calculation periodically
+    static int debug_counter = 0;
+    if (++debug_counter % 60 == 0) { // Every ~60 frames
+        fprintf(stderr, "[DEBUG] Stats overlay FPS: %.1f (frame_count=%d)\n", display_fps, stats->frame_count);
+    }
     
     // Calculate maximum text width for background
     int max_text_width = 0;

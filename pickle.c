@@ -300,6 +300,9 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
 // Forward declaration for vsync toggle used before its definition
 static int g_vsync_enabled;
 
+// Forward declaration for display clearing function
+static void clear_display_buffer(kms_ctx_t *d, egl_ctx_t *e);
+
 // --- Preallocated FB ring (optional) ---
 struct fb_ring_entry { struct gbm_bo *bo; uint32_t fb_id; };
 struct fb_ring {
@@ -318,6 +321,7 @@ typedef struct fb_ring_entry fb_ring_entry_t;
 static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
 int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
+double g_video_fps = 60.0; // Detected video frame rate (default to 60fps)
 
 // These keystone settings are defined in keystone.c through pickle_keystone adapter
 // Removed static variables and using extern from pickle_keystone.h
@@ -750,6 +754,7 @@ static void mpv_wakeup_cb(void *ctx) {
 	}
 }
 volatile uint64_t g_mpv_update_flags = 0; // bitmask from mpv_render_context_update
+volatile int g_clear_display = 0; // Flag to clear display on next render
 static void on_mpv_events(void *data) { (void)data; g_mpv_wakeup = 1; }
 
 // Performance controls
@@ -804,9 +809,9 @@ static struct {
 static void stats_log_periodic(mpv_player_t *p) {
 	if (!g_stats_enabled) return;
 	struct timeval now; gettimeofday(&now, NULL);
-	double since_last = tv_diff(&now, &g_stats_last);
+	double since_last = tv_diff(&g_stats_last, &now);
 	if (since_last < g_stats_interval_sec) return;
-	double total = tv_diff(&now, &g_stats_start);
+	double total = tv_diff(&g_stats_start, &now);
 	uint64_t frames_now = g_stats_frames;
 	uint64_t delta_frames = frames_now - g_stats_last_frames;
 	double inst_fps = (since_last > 0.0) ? (double)delta_frames / since_last : 0.0;
@@ -827,7 +832,7 @@ static void stats_log_periodic(mpv_player_t *p) {
 static void stats_log_final(mpv_player_t *p) {
 	if (!g_stats_enabled) return;
 	struct timeval now; gettimeofday(&now, NULL);
-	double total = tv_diff(&now, &g_stats_start);
+	double total = tv_diff(&g_stats_start, &now);
 	double avg_fps = (total > 0.0) ? (double)g_stats_frames / total : 0.0;
 	int64_t drop_dec = 0, drop_vo = 0;
 	if (p && p->mpv) {
@@ -1084,6 +1089,10 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	mpv_set_wakeup_callback(p->mpv, mpv_wakeup_cb, NULL);
 	const char *cmd[] = {"loadfile", file, NULL};
 	if (mpv_command(p->mpv, cmd) < 0) { fprintf(stderr, "Failed to load file %s\n", file); return false; }
+	
+	// Signal that display should be cleared before next render
+	g_clear_display = 1;
+	
 	fprintf(stderr, "[mpv] Initialized successfully (vo=%s)\n", vo_used);
 	return true;
 }
@@ -1177,6 +1186,8 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 				return false;
 		}
 		
+		// Store the detected FPS globally for adaptive frame timing
+		g_video_fps = fps;
 		LOG_INFO("Using MP4 demuxer: %s %dx%d @ %.2f fps", codec_name, p->width, p->height, fps);
 	} else {
 #endif
@@ -1226,8 +1237,20 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		p->codec == V4L2_CODEC_VP9 ? "VP9" : "Unknown",
 		p->width, p->height);
 	
-	// Allocate buffers
-	if (!v4l2_decoder_allocate_buffers(p->decoder, 8, 8)) {
+	// Allocate buffers (configurable via environment variables)
+	int input_buffers = 8, output_buffers = 8;
+	const char *env_input_bufs = getenv("PICKLE_V4L2_INPUT_BUFFERS");
+	const char *env_output_bufs = getenv("PICKLE_V4L2_OUTPUT_BUFFERS");
+	if (env_input_bufs) {
+		int val = atoi(env_input_bufs);
+		if (val > 0 && val <= 32) input_buffers = val; // Reasonable bounds
+	}
+	if (env_output_bufs) {
+		int val = atoi(env_output_bufs);
+		if (val > 0 && val <= 32) output_buffers = val; // Reasonable bounds
+	}
+	
+	if (!v4l2_decoder_allocate_buffers(p->decoder, input_buffers, output_buffers)) {
 		LOG_ERROR("Failed to allocate V4L2 decoder buffers");
 		v4l2_decoder_destroy(p->decoder);
 		fclose(p->input_file);
@@ -1246,8 +1269,15 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		return false;
 	}
 	
-	// Allocate read buffer
-	p->buffer_size = 1024 * 1024;  // 1MB buffer
+	// Allocate read buffer (configurable via environment variable)
+	p->buffer_size = 1024 * 1024;  // Default 1MB buffer
+	const char *env_buffer_size = getenv("PICKLE_V4L2_BUFFER_SIZE_MB");
+	if (env_buffer_size) {
+		int mb = atoi(env_buffer_size);
+		if (mb > 0 && mb <= 64) { // Reasonable bounds: 1-64MB
+			p->buffer_size = (size_t)mb * 1024 * 1024;
+		}
+	}
 	p->buffer = malloc(p->buffer_size);
 	if (!p->buffer) {
 		LOG_ERROR("Failed to allocate read buffer");
@@ -1434,12 +1464,17 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 #endif
 		// Fallback: raw file reading for elementary streams
 		if (p->input_file && !feof(p->input_file)) {
-			// Use a safe chunk size for V4L2 decoder to avoid buffer issues
-			size_t max_chunk_size = 65536;  // 64KB - safe for most V4L2 drivers
-			
-			LOG_DEBUG("Using V4L2 chunk size: %zu bytes", max_chunk_size);
-			
-			// Read a chunk of data, but limit to safe chunk size
+		// Use configurable chunk size for V4L2 decoder
+		size_t max_chunk_size = 65536;  // Default 64KB - safe for most V4L2 drivers
+		const char *env_chunk_size = getenv("PICKLE_V4L2_CHUNK_SIZE_KB");
+		if (env_chunk_size) {
+			int kb = atoi(env_chunk_size);
+			if (kb > 0 && kb <= 1024) { // Reasonable bounds: 1KB-1MB
+				max_chunk_size = (size_t)kb * 1024;
+			}
+		}
+		
+		LOG_DEBUG("Using V4L2 chunk size: %zu bytes", max_chunk_size);			// Read a chunk of data, but limit to safe chunk size
 			size_t bytes_to_read = max_chunk_size < p->buffer_size ? max_chunk_size : p->buffer_size;
 			size_t bytes_read = fread(p->buffer, 1, bytes_to_read, p->input_file);
 			LOG_DEBUG("Read %zu bytes from input file", bytes_read);
@@ -1452,7 +1487,10 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 				} else {
 					LOG_DEBUG("Successfully sent %zu bytes to V4L2 decoder", bytes_read);
 				}
-				p->timestamp += 40000;  // Increment by 40ms (25fps)
+				// Increment timestamp based on detected video FPS (adaptive timing)
+				double frame_interval_us = 1000000.0 / g_video_fps;
+				int64_t interval_us = (int64_t)frame_interval_us;
+				p->timestamp += interval_us;
 			}
 		}
 #ifdef USE_V4L2_DECODER
@@ -1871,8 +1909,17 @@ void bo_destroy_handler(struct gbm_bo *bo, void *data) {
  * @return true if rendering succeeded, false otherwise
  */
 bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
+	// Start stats timing (was missing for V4L2 path)
+	stats_overlay_render_frame_start(&g_stats_overlay);
+	
 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
+	}
+	
+	// Check if we need to clear the display (when new file is loaded)
+	if (g_clear_display) {
+		clear_display_buffer(d, e);
+		g_clear_display = 0; // Reset the flag
 	}
 	
 	// Initialize keystone shader if needed and enabled
@@ -1979,10 +2026,48 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	// Release the buffer
 	gbm_surface_release_buffer(e->gbm_surf, bo);
 	
-	// Release the buffer
-	gbm_surface_release_buffer(e->gbm_surf, bo);
+	// End stats timing (was missing for V4L2 path)
+	stats_overlay_render_frame_end(&g_stats_overlay);
 	
 	return ret;
+}
+
+/**
+ * Clear the display to black and force a buffer swap
+ * Used when loading new videos to prevent old content from showing
+ *
+ * @param d Pointer to initialized DRM context 
+ * @param e Pointer to initialized EGL context
+ */
+static void clear_display_buffer(kms_ctx_t *d, egl_ctx_t *e) {
+	if (!d || !e) return;
+	
+	// Make sure EGL context is current
+	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
+		return; // Can't clear if context setup fails
+	}
+	
+	// Clear to black
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	
+	// Force buffer swap to make the clear visible
+	if (eglSwapBuffers(e->dpy, e->surf)) {
+		struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
+		if (bo) {
+			struct fb_holder *h = gbm_bo_get_user_data(bo);
+			uint32_t fb_id = h ? h->fb : 0;
+			if (fb_id) {
+				// Present the cleared framebuffer
+				if (d->atomic_supported) {
+					atomic_present_framebuffer(d, fb_id, false); // No vsync for clearing
+				} else {
+					drmModePageFlip(d->fd, d->crtc_id, fb_id, 0, d);
+				}
+			}
+			gbm_surface_release_buffer(e->gbm_surf, bo);
+		}
+	}
 }
 
 static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
@@ -1991,6 +2076,12 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	
 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
+	}
+	
+	// Check if we need to clear the display (when new file is loaded)
+	if (g_clear_display) {
+		clear_display_buffer(d, e);
+		g_clear_display = 0; // Reset the flag
 	}
 	
 	// Check if we should use hardware-accelerated DRM keystone instead of software keystone
@@ -2907,6 +2998,23 @@ int main(int argc, char **argv) {
 					g_mpv_update_flags |= flags;
 				}
 			}
+			
+			// Periodically update video FPS from MPV
+			static struct timeval last_fps_query = {0, 0};
+			struct timeval now_fps;
+			gettimeofday(&now_fps, NULL);
+			if (last_fps_query.tv_sec == 0) {
+				last_fps_query = now_fps;
+			}
+			double fps_elapsed = tv_diff(&last_fps_query, &now_fps);
+			if (fps_elapsed > 5.0) { // Query every 5 seconds
+				double container_fps = 0.0;
+				if (mpv_get_property(player.mpv, "container-fps", MPV_FORMAT_DOUBLE, &container_fps) >= 0 && container_fps > 0) {
+					g_video_fps = container_fps;
+					LOG_INFO("Updated video FPS from MPV: %.2f fps", g_video_fps);
+				}
+				last_fps_query = now_fps;
+			}
 		} else {
 			// V4L2 decoder specific handling
 			// Periodically force a frame update for V4L2 decoder
@@ -2917,7 +3025,8 @@ int main(int argc, char **argv) {
 				last_v4l2_update = now;
 			}
 			double elapsed = tv_diff(&now, &last_v4l2_update) * 1000.0; // ms
-			if (elapsed > 40.0) { // ~25fps
+			double frame_interval_ms = 1000.0 / g_video_fps; // Adaptive frame interval
+			if (elapsed > frame_interval_ms) {
 				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 				last_v4l2_update = now;
 			}
@@ -2980,17 +3089,20 @@ int main(int argc, char **argv) {
 				(double)drm.mode.vrefresh : 
 				(double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal);
 			
-			// Use a more aggressive timeout for better responsiveness
-			// Aim for half the frame interval to ensure we don't miss vsync
-			if (refresh_rate > 0) {
-				timeout_ms = (int)(500.0 / refresh_rate); // half frame time in ms
-				
-				// Clamp to reasonable bounds
-				if (timeout_ms < 4) timeout_ms = 4;       // min 4ms (250fps max)
-				if (timeout_ms > 100) timeout_ms = 100;   // max 100ms (10fps min)
-			} else {
-				timeout_ms = 16; // Default to 60Hz (16.6ms) if refresh rate unknown
-			}
+			// Use adaptive timeout based on video FPS for better responsiveness
+			// Aim for half the frame interval to ensure we don't miss frames
+			double fps_for_timing = (g_video_fps > 0) ? g_video_fps : refresh_rate;
+			if (fps_for_timing <= 0) fps_for_timing = 60.0; // Default 60fps
+			
+			timeout_ms = (int)(500.0 / fps_for_timing); // half frame time in ms
+			
+			// More aggressive bounds for high-FPS content
+			if (timeout_ms < 1) timeout_ms = 1;       // min 1ms (1000fps max)
+			// Adaptive max timeout based on video FPS - no artificial caps
+			int max_timeout = (g_video_fps >= 50.0) ? 8 :   // 8ms for 50+ fps (125fps max)
+			                  (g_video_fps >= 30.0) ? 16 :  // 16ms for 30+ fps (62fps max) 
+			                  33;                            // 33ms for lower fps (30fps max)
+			if (timeout_ms > max_timeout) timeout_ms = max_timeout;
 		}
 		
 		// Add a max timeout to avoid being stuck in poll forever even if no events come

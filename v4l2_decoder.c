@@ -18,6 +18,9 @@
 #include <linux/videodev2.h>
 #include <linux/media.h>
 
+// Access to global video FPS for adaptive timeouts
+extern double g_video_fps;
+
 // Helper macros
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
@@ -701,7 +704,13 @@ bool v4l2_decoder_flush(v4l2_decoder_t *dec) {
     fds[0].events = POLLIN;
     
     while (true) {
-        int ret = poll(fds, 1, 100);  // 100ms timeout
+        // Adaptive timeout based on video FPS (2 frame intervals, min 10ms, max 100ms)
+        double fps = (g_video_fps > 0) ? g_video_fps : 30.0; // Default 30fps if not detected
+        int timeout_ms = (int)(2000.0 / fps); // 2 frame intervals
+        if (timeout_ms < 10) timeout_ms = 10;   // Min 10ms
+        if (timeout_ms > 100) timeout_ms = 100; // Max 100ms
+        
+        int ret = poll(fds, 1, timeout_ms);
         if (ret <= 0) {
             break;  // Timeout or error
         }
