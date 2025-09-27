@@ -32,11 +32,11 @@ static void update_fps(stats_overlay_t *stats) {
     struct timeval now;
     gettimeofday(&now, NULL);
     
-    float elapsed = (now.tv_sec - stats->last_fps_update.tv_sec) + 
-                   (now.tv_usec - stats->last_fps_update.tv_usec) / 1000000.0f;
+    float elapsed = (float)(now.tv_sec - stats->last_fps_update.tv_sec) + 
+                   (float)(now.tv_usec - stats->last_fps_update.tv_usec) / 1000000.0f;
     
     if (elapsed >= 1.0f) {
-        stats->current_fps = stats->frame_count / elapsed;
+        stats->current_fps = (float)stats->frame_count / elapsed;
         stats->frame_count = 0;
         stats->last_fps_update = now;
     }
@@ -47,8 +47,8 @@ static void update_cpu_usage(stats_overlay_t *stats) {
     struct timeval now;
     gettimeofday(&now, NULL);
     
-    float elapsed = (now.tv_sec - stats->last_cpu_update.tv_sec) + 
-                   (now.tv_usec - stats->last_cpu_update.tv_usec) / 1000000.0f;
+    float elapsed = (float)(now.tv_sec - stats->last_cpu_update.tv_sec) + 
+                   (float)(now.tv_usec - stats->last_cpu_update.tv_usec) / 1000000.0f;
     
     // Update CPU usage every 0.5 seconds to reduce overhead
     if (elapsed < 0.5f) return;
@@ -99,7 +99,7 @@ static void update_memory_usage(stats_overlay_t *stats) {
     
     if (total_kb > 0) {
         unsigned long used_kb = total_kb - free_kb - buffers_kb - cached_kb;
-        stats->memory_usage_mb = used_kb / 1024.0f;
+        stats->memory_usage_mb = (float)used_kb / 1024.0f;
     }
 }
 
@@ -112,8 +112,8 @@ void stats_overlay_render_frame_start(stats_overlay_t *stats) {
 void stats_overlay_render_frame_end(stats_overlay_t *stats) {
     gettimeofday(&stats->last_render_end, NULL);
     
-    float render_time = (stats->last_render_end.tv_sec - stats->last_render_start.tv_sec) * 1000.0f +
-                       (stats->last_render_end.tv_usec - stats->last_render_start.tv_usec) / 1000.0f;
+    float render_time = (float)(stats->last_render_end.tv_sec - stats->last_render_start.tv_sec) * 1000.0f +
+                       (float)(stats->last_render_end.tv_usec - stats->last_render_start.tv_usec) / 1000.0f;
     
     // Simple moving average for render time
     if (stats->avg_render_time_ms == 0.0f) {
@@ -356,10 +356,10 @@ static void render_char(char c, int x, int y, int screen_width, int screen_heigh
                 int py = y + row;
                 
                 // Convert to normalized coordinates  
-                float x1 = (2.0f * px) / screen_width - 1.0f;
-                float y1 = 1.0f - (2.0f * py) / screen_height;
-                float x2 = (2.0f * (px + 1)) / screen_width - 1.0f;
-                float y2 = 1.0f - (2.0f * (py + 1)) / screen_height;
+                float x1 = (2.0f * (float)px) / (float)screen_width - 1.0f;
+                float y1 = 1.0f - (2.0f * (float)py) / (float)screen_height;
+                float x2 = (2.0f * (float)(px + 1)) / (float)screen_width - 1.0f;
+                float y2 = 1.0f - (2.0f * (float)(py + 1)) / (float)screen_height;
                 
                 float vertices[] = {
                     x1, y1, x2, y1, x2, y2, x1, y2
@@ -376,12 +376,12 @@ static void render_char(char c, int x, int y, int screen_width, int screen_heigh
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
                 glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
                 
-                glVertexAttribPointer(g_text_a_position_loc, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-                glEnableVertexAttribArray(g_text_a_position_loc);
+                glVertexAttribPointer((GLuint)g_text_a_position_loc, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray((GLuint)g_text_a_position_loc);
                 
                 glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
                 
-                glDisableVertexAttribArray(g_text_a_position_loc);
+                glDisableVertexAttribArray((GLuint)g_text_a_position_loc);
                 glBindBuffer(GL_ARRAY_BUFFER, 0);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
                 glDeleteBuffers(1, &vbo);
@@ -409,10 +409,10 @@ static void render_background(int x, int y, int width, int height, int screen_wi
     if (!init_text_shader()) return;
     
     // Convert screen coordinates to normalized device coordinates
-    float x1 = (2.0f * x) / screen_width - 1.0f;
-    float y1 = 1.0f - (2.0f * y) / screen_height;
-    float x2 = (2.0f * (x + width)) / screen_width - 1.0f;
-    float y2 = 1.0f - (2.0f * (y + height)) / screen_height;
+    float x1 = (2.0f * (float)x) / (float)screen_width - 1.0f;
+    float y1 = 1.0f - (2.0f * (float)y) / (float)screen_height;
+    float x2 = (2.0f * (float)(x + width)) / (float)screen_width - 1.0f;
+    float y2 = 1.0f - (2.0f * (float)(y + height)) / (float)screen_height;
     
     // Create background rectangle
     float vertices[] = {
@@ -444,14 +444,14 @@ static void render_background(int x, int y, int width, int height, int screen_wi
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
     
     // Set up vertex attributes
-    glVertexAttribPointer(g_text_a_position_loc, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(g_text_a_position_loc);
+    glVertexAttribPointer((GLuint)g_text_a_position_loc, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray((GLuint)g_text_a_position_loc);
     
     // Draw background
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     
     // Clean up
-    glDisableVertexAttribArray(g_text_a_position_loc);
+    glDisableVertexAttribArray((GLuint)g_text_a_position_loc);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glDeleteBuffers(1, &vbo);

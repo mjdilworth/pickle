@@ -55,7 +55,7 @@ PICKLE_DIRECT_RENDERING=1 ./pickle video.mp4
 PICKLE_DISABLE_KEYSTONE=1 ./pickle video.mp4
 
 # Set specific hardware decoder (important for Raspberry Pi 4)
-PICKLE_HWDEC=v4l2m2m ./pickle video.mp4
+git bracn video.mp4
 ```
 
 ### Hardware Decoding Options

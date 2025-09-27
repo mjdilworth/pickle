@@ -1323,7 +1323,6 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	}
 	
 	// Frame rate limiting to prevent overwhelming the decoder
-	static struct timespec last_frame_time = {0, 0};
 	struct timespec current_time;
 	clock_gettime(CLOCK_MONOTONIC, &current_time);
 	
@@ -1379,7 +1378,7 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	}
 	struct timespec current_time_check;
 	clock_gettime(CLOCK_MONOTONIC, &current_time_check);
-	double elapsed_seconds = (current_time_check.tv_sec - start_time.tv_sec);
+	double elapsed_seconds = (double)(current_time_check.tv_sec - start_time.tv_sec);
 	if (elapsed_seconds > 30.0) {  // Auto-exit after 30 seconds for testing
 		LOG_INFO("Emergency timeout reached (%.1f seconds), exiting V4L2 frame processing", elapsed_seconds);
 		return false;
@@ -1491,19 +1490,19 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 		}
 		
 		// Try to get a decoded frame
-		v4l2_decoded_frame_t frame;
+		v4l2_decoded_frame_t decoded_frame;
 		LOG_DEBUG("Attempting to get decoded frame...");
-		if (v4l2_decoder_get_frame(p->decoder, &frame)) {
+		if (v4l2_decoder_get_frame(p->decoder, &decoded_frame)) {
 			// Store frame information in the player struct
             p->current_frame.valid = true;
-            p->current_frame.dmabuf_fd = frame.dmabuf_fd;
-            p->current_frame.width = frame.width;
-            p->current_frame.height = frame.height;
-            p->current_frame.format = frame.format;
-            p->current_frame.buf_index = frame.buf_index;
+            p->current_frame.dmabuf_fd = decoded_frame.dmabuf_fd;
+            p->current_frame.width = decoded_frame.width;
+            p->current_frame.height = decoded_frame.height;
+            p->current_frame.format = decoded_frame.format;
+            p->current_frame.buf_index = decoded_frame.buf_index;
             
             LOG_INFO("Got frame: %dx%d timestamp: %ld, dmabuf_fd: %d", 
-                     frame.width, frame.height, frame.timestamp, frame.dmabuf_fd);
+                     decoded_frame.width, decoded_frame.height, decoded_frame.timestamp, decoded_frame.dmabuf_fd);
             
             // Log memory usage when successfully getting frames
 			static int successful_frame_count = 0;

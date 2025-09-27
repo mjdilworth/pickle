@@ -203,9 +203,9 @@ bool init_drm(kms_ctx_t *d) {
     
     // Look for a primary plane that can be used with our CRTC
     uint32_t crtc_index = 0;
-    for (uint32_t i = 0; i < d->res->count_crtcs; i++) {
+    for (int i = 0; i < (int)d->res->count_crtcs; i++) {
         if (d->res->crtcs[i] == d->crtc) {
-            crtc_index = i;
+            crtc_index = (uint32_t)i;
             break;
         }
     }
@@ -268,7 +268,7 @@ bool init_drm(kms_ctx_t *d) {
         }
         
         LOG_DRM("Plane %u: type=%llu, crtc_id=%u, possible_crtcs=0x%x, compatible=%s", 
-               plane->plane_id, plane_type, plane->crtc_id, plane->possible_crtcs,
+               plane->plane_id, (unsigned long long)plane_type, plane->crtc_id, plane->possible_crtcs,
                (plane->possible_crtcs & (1 << crtc_index)) ? "YES" : "NO");
         
         drmModeFreePlane(plane);
