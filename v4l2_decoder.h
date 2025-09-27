@@ -102,6 +102,7 @@ bool v4l2_decoder_flush(v4l2_decoder_t *dec);
 // Decode operations
 bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int64_t timestamp);
 bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame);
+bool v4l2_decoder_return_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame);
 bool v4l2_decoder_poll(v4l2_decoder_t *dec, int timeout_ms);
 
 // Event handling

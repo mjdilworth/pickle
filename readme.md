@@ -231,10 +231,10 @@ On Raspberry Pi 4, Pickle can use the Hardware Video Scaler (HVS) for hardware-a
 - Uses the same keystone settings and controls as the software implementation
 - Seamlessly falls back to software implementation on non-RPi platforms
 
-The HVS keystone feature requires:
-- Raspberry Pi 4 or newer
-- Proper DispmanX support enabled in the firmware
-- Running with `dtoverlay=vc4-kms-v3d` in config.txt
+The HVS keystone feature has been removed (DispmanX deprecated).
+Hardware keystone now uses DRM/KMS which requires:
+- Modern Linux kernel with DRM/KMS support
+- Running with `dtoverlay=vc4-kms-v3d` in config.txt (on Raspberry Pi)
 
 To get the best performance with HVS keystone:
 ```

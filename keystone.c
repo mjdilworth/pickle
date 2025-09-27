@@ -1,7 +1,7 @@
 #include "keystone.h"
 #include "utils.h"
 #include "shader.h"
-#include "hvs_keystone.h"  // Legacy DispmanX implementation (deprecated)
+
 #include "drm_keystone.h"  // New DRM/KMS implementation
 #include "log.h"
 #include <stdio.h>
@@ -199,29 +199,15 @@ void keystone_init(void) {
         }
     }
     
-    // Initialize hardware keystone (DRM first, then DispmanX as fallback)
+    // Initialize hardware keystone (DRM only - DispmanX has been removed)
     if (drm_keystone_is_supported()) {
         if (!drm_keystone_init()) {
-            LOG_WARN("Failed to initialize DRM keystone, will try DispmanX or fall back to software");
-            
-            // Try DispmanX as fallback (deprecated)
-            if (hvs_keystone_is_supported()) {
-                if (!hvs_keystone_init()) {
-                    LOG_WARN("Failed to initialize HVS keystone, will use software implementation");
-                } else {
-                    LOG_INFO("Initialized HVS keystone (DispmanX - deprecated)");
-                }
-            }
+            LOG_WARN("Failed to initialize DRM keystone, will fall back to software");
         } else {
             LOG_INFO("Initialized DRM keystone");
         }
-    } else if (hvs_keystone_is_supported()) {
-        // Legacy fallback to DispmanX (deprecated)
-        if (!hvs_keystone_init()) {
-            LOG_WARN("Failed to initialize HVS keystone, will use software implementation");
-        } else {
-            LOG_INFO("Initialized HVS keystone (DispmanX - deprecated)");
-        }
+    } else {
+        LOG_INFO("Hardware keystone not supported, using software implementation");
     }
 }
 
@@ -234,11 +220,6 @@ void keystone_cleanup(void) {
     // Clean up hardware keystone resources
     if (drm_keystone_is_active()) {
         drm_keystone_cleanup();
-    }
-    
-    // Also clean up legacy DispmanX if needed
-    if (hvs_keystone_is_supported()) {
-        hvs_keystone_cleanup();
     }
 }
 
@@ -449,13 +430,10 @@ void keystone_update_matrix(void) {
     // This is a placeholder for the matrix update function
     // In the real implementation, this would update any matrices needed for rendering
     
-    // Update hardware keystone if enabled and supported (DRM preferred over DispmanX)
+    // Update hardware keystone if enabled and supported (DRM only - DispmanX removed)
     if (g_keystone.enabled) {
         if (drm_keystone_is_supported()) {
             drm_keystone_update(&g_keystone);
-        } else if (hvs_keystone_is_supported()) {
-            // Legacy fallback to DispmanX (deprecated)
-            hvs_keystone_update(&g_keystone);
         }
     }
 }
@@ -604,40 +582,21 @@ bool keystone_load_config(const char* path) {
 void keystone_toggle_enabled(void) {
     g_keystone.enabled = !g_keystone.enabled;
     
-    // Apply hardware keystone if enabled (DRM preferred over DispmanX)
+    // Apply hardware keystone if enabled (DRM only - DispmanX removed)
     if (g_keystone.enabled) {
         if (drm_keystone_is_supported()) {
             if (!drm_keystone_update(&g_keystone)) {
-                LOG_WARN("Failed to apply DRM keystone, trying DispmanX or falling back to software");
-                
-                // Try DispmanX as fallback (deprecated)
-                if (hvs_keystone_is_supported()) {
-                    if (!hvs_keystone_update(&g_keystone)) {
-                        LOG_WARN("Failed to apply HVS keystone, falling back to software implementation");
-                    } else {
-                        LOG_INFO("Applied HVS keystone transformation (DispmanX - deprecated)");
-                    }
-                }
+                LOG_WARN("Failed to apply DRM keystone, falling back to software implementation");
             } else {
                 LOG_INFO("Applied DRM keystone transformation");
             }
-        } else if (hvs_keystone_is_supported()) {
-            // Legacy fallback to DispmanX (deprecated)
-            if (!hvs_keystone_update(&g_keystone)) {
-                LOG_WARN("Failed to apply HVS keystone, falling back to software implementation");
-            } else {
-                LOG_INFO("Applied HVS keystone transformation (DispmanX - deprecated)");
-            }
+        } else {
+            LOG_INFO("Hardware keystone not supported, using software implementation");
         }
     } else {
         // Clean up hardware keystone when disabled
         if (drm_keystone_is_active()) {
             drm_keystone_cleanup();
-        }
-        
-        // Also clean up legacy DispmanX if active
-        if (hvs_keystone_is_supported()) {
-            hvs_keystone_cleanup();
         }
     }
     
@@ -662,10 +621,7 @@ void keystone_reset(void) {
     
     keystone_update_matrix();
     
-    // Update HVS keystone if active
-    if (g_keystone.enabled && hvs_keystone_is_supported()) {
-        hvs_keystone_update(&g_keystone);
-    }
+    // Hardware keystone handled by DRM/KMS
     
     LOG_INFO("Keystone reset to default");
 }

@@ -4,7 +4,17 @@
 # DRM/KMS + GBM + EGL + libmpv for hardware accelerated playback.
 #
 # Main build targets:
-#   make        - Build the default pickle# RPi4 optimized build
+#   make release - Build optimized RPi4 release version (default)
+#   make rpi4    - Build with Raspberry Pi 4 optimizations
+#   make run VIDEO=video.mp4 - Build and run with specified video
+#   make help    - Show all build options
+#
+# For more information, run 'make help' or see the documentation in docs/
+#
+
+# Modularization Todo:
+
+# RPi4 optimized build
 rpi4:
 	@$(MAKE) clean
 	@$(MAKE) $(APP) RPI4_OPT=1 V4L2=1
@@ -20,14 +30,7 @@ maxperf:
 rpi4-maxperf:
 	@$(MAKE) clean
 	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 V4L2=1
-	@echo "Built RPi4 optimized binary with max performance: $(APP)"rpi4   - Build with Raspberry Pi 4 optimizations
-#   make run VIDEO=video.mp4 - Build and run with specified video
-#   make help   - Show all build options
-#
-# For more information, run 'make help' or see the documentation in docs/
-#
-
-# Modularization Todo:
+	@echo "Built RPi4 optimized binary with max performance: $(APP)"
 # ✅ Create keystone module (keystone.c/keystone.h)
 # ✅ Create utils module (utils.c/utils.h)
 # ✅ Create shader module (shader.c/shader.h)
@@ -39,7 +42,7 @@ rpi4-maxperf:
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c dispmanx.c v4l2_decoder.c hvs_keystone.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c v4l2_decoder.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c
 
 # Add Vulkan modules when enabled
 ifeq ($(VULKAN),1)
@@ -52,7 +55,7 @@ SOURCES += mp4_demuxer.c
 endif
 
 OBJECTS  := $(SOURCES:.c=.o)
-HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h dispmanx.h v4l2_decoder.h v4l2_player.h hvs_keystone.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h stats_overlay.h
+HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h v4l2_decoder.h v4l2_player.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h stats_overlay.h
 
 # Add Vulkan headers when enabled
 ifeq ($(VULKAN),1)
@@ -80,7 +83,6 @@ ZEROCOPY ?= 1  # Enable zero-copy by default
 NO_MPV  ?= 0   # build with -DPICKLE_NO_MPV_DEFAULT so runtime can skip mpv init
 PERF    ?= 0   # high-performance build tweaks (e.g. make PERF=1)
 EVENT   ?= 1   # Enable event-driven architecture
-DISPMANX ?= 1  # Enable DispmanX support for RPi (e.g. make DISPMANX=1)
 V4L2    ?= 1   # Enable V4L2 hardware decoding support
 
 PKGS       := mpv gbm egl glesv2 libdrm libv4l2
@@ -90,10 +92,7 @@ ifeq ($(V4L2),1)
 PKGS += libavformat libavcodec libavutil
 endif
 
-# Add bcm_host package for Raspberry Pi with DispmanX
-ifeq ($(DISPMANX),1)
-	PKGS += bcm_host
-endif
+
 
 # Allow overriding pkg-config binary
 PKG_CONFIG ?= pkg-config
@@ -113,8 +112,8 @@ endif
 
 # Apply toggles
 ifeq ($(LTO),1)
-	CFLAGS  += -flto
-	LDFLAGS += -flto
+	CFLAGS  += -flto=auto
+	LDFLAGS += -flto=auto
 endif
 ifeq ($(NO_MPV),1)
 	CFLAGS  += -DPICKLE_NO_MPV_DEFAULT=1
@@ -128,8 +127,8 @@ ifeq ($(PERF),1)
 	CFLAGS += -ffast-math -fno-math-errno -fno-trapping-math
 	# Enable LTO automatically if not already set
 	ifeq ($(strip $(LTO)),0)
-		CFLAGS  += -flto
-		LDFLAGS += -flto
+		CFLAGS  += -flto=auto
+		LDFLAGS += -flto=auto
 	endif
 	# Prefer mold or lld if available
 	ifneq (,$(shell command -v mold 2>/dev/null))
@@ -149,10 +148,7 @@ ifeq ($(EVENT),1)
 	CFLAGS += -DEVENT_DRIVEN_ENABLED=1
 endif
 
-# Check for DispmanX support
-ifeq ($(DISPMANX),1)
-	CFLAGS += -DDISPMANX_ENABLED=1
-endif
+
 
 # Check for V4L2 decoder support
 ifeq ($(V4L2),1)
@@ -179,11 +175,8 @@ ifeq ($(RPI4_OPT),1)
 		CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 	endif
 	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
-	CFLAGS += -DRPI4_OPTIMIZED=1 -DDISPMANX_ENABLED=1 -DUSE_V4L2_DECODER=1
-	# Check if bcm_host library is available before linking
-	ifneq (,$(wildcard /usr/lib/*/libbcm_host.so /usr/local/lib/libbcm_host.so))
-		LIBS += -lbcm_host
-	endif
+	CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1
+
 endif
 
 # Maximum performance mode (combines all optimizations)
@@ -192,9 +185,9 @@ ifeq ($(MAXPERF),1)
 	CFLAGS := -O3 -DNDEBUG -fomit-frame-pointer -march=native -mtune=native
 	CFLAGS += -ffast-math -fno-math-errno -fno-trapping-math
 	CFLAGS += -funroll-loops -fprefetch-loop-arrays -ftree-vectorize
-	CFLAGS += -flto -fuse-linker-plugin
+	CFLAGS += -flto=auto -fuse-linker-plugin
 	CFLAGS += $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
-	LDFLAGS += -flto -Wl,-O3 -Wl,--as-needed
+	LDFLAGS += -flto=auto -Wl,-O3 -Wl,--as-needed
 	ifneq (,$(shell command -v mold 2>/dev/null))
 		LDFLAGS += -fuse-ld=mold
 	else ifneq (,$(shell command -v ld.lld 2>/dev/null))
@@ -209,10 +202,7 @@ ifeq ($(MAXPERF),1)
 		else ifneq (,$(filter arm%,$(ARCH)))
 			CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 		endif
-		CFLAGS += -DRPI4_OPTIMIZED=1 -DDISPMANX_ENABLED=1 -DUSE_V4L2_DECODER=1
-		ifneq (,$(wildcard /usr/lib/*/libbcm_host.so /usr/local/lib/libbcm_host.so))
-			LIBS += -lbcm_host
-		endif
+		CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1
 	endif
 endif
 
@@ -250,11 +240,11 @@ try-run: $(APP)
 	./$(APP) "$(VIDEO)" $(MPV_ARGS) || { echo "Hint: use 'sudo make run VIDEO=...' if permission denied."; exit 1; }
 
 # Build mode convenience targets
-release: CFLAGS := -O3 -DNDEBUG -flto $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
-release: LDFLAGS += -flto
-release: clean $(APP)
-	strip $(APP)
-	@echo "Built and stripped release binary: $(APP)"
+release:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 V4L2=1
+	strip -s $(APP)
+	@echo "Built and stripped RPi4 optimized binary with max performance: $(APP)"
 	@ls -lh $(APP)
 
 debug: CFLAGS := -O0 -g3 $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
@@ -265,32 +255,6 @@ sanitize: CFLAGS := -O1 -g -fsanitize=address,undefined $(WARN) -std=$(CSTD) $(P
 sanitize: LDFLAGS += -fsanitize=address,undefined
 sanitize: clean $(APP)
 	@echo "Built sanitize (ASAN+UBSAN) binary: $(APP)"
-
-# Raspberry Pi 4 optimized build
-rpi4:
-	@$(MAKE) clean
-	@$(MAKE) $(APP) RPI4_OPT=1
-	@echo "Built RPi4 optimized binary: $(APP)"
-
-# Maximum performance build
-maxperf:
-	@$(MAKE) clean
-	@$(MAKE) $(APP) MAXPERF=1
-	@echo "Built maximum performance binary: $(APP)"
-
-# RPi4 optimized with maximum performance
-rpi4-maxperf:
-	@$(MAKE) clean
-	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1
-	@echo "Built RPi4 optimized binary with max performance: $(APP)"
-
-# Release build for RPi4 with maximum performance and stripped binary
-rpi4-release:
-	@$(MAKE) clean
-	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 V4L2=1
-	strip -s $(APP)
-	@echo "Built and stripped RPi4 optimized binary with max performance: $(APP)"
-	@ls -lh $(APP)
 
 strip: $(APP)
 	strip -s $(APP)
@@ -335,13 +299,12 @@ help:
 	echo "  clean                Remove build artifacts"; \
 	echo ""; \
 	echo "Build Configuration:"; \
-	echo "  release              Optimized build with -O3"; \
+	echo "  release              RPi4 optimized release build (default)"; \
 	echo "  debug                Debug build with symbols"; \
 	echo "  sanitize             ASAN+UBSAN instrumented build"; \
 	echo "  rpi4                 Optimized for Raspberry Pi 4"; \
 	echo "  maxperf              Maximum performance build"; \
 	echo "  rpi4-maxperf         Combined RPi4 + maximum performance"; \
-	echo "  rpi4-release         RPi4 + maxperf + stripped (best for deployment)"; \
 	echo "  strip                Strip binary for smaller size"; \
 	echo ""; \
 	echo "Feature Flags (1=enable, 0=disable):"; \
@@ -370,9 +333,8 @@ help:
 	echo "  PREFIX               Installation prefix (default: /usr/local)"; \
 	echo ""; \
 	echo "Examples:"; \
-	echo "  make release                    # Build optimized version"; \
+	echo "  make release                    # Build RPi4 optimized release version"; \
 	echo "  make ZEROCOPY=0 EVENT=0         # Build without zero-copy or event system"; \
-	echo "  make rpi4-release               # Build for RPi4 with all optimizations"; \
 	echo "  make rpi4 && sudo make install  # Build for RPi4 and install"; \
 	echo "  make run VIDEO=my_video.mp4     # Build and run with a video file"
 
@@ -432,4 +394,4 @@ diagnostics: v4l2_diagnostic v4l2_test
 distclean: clean
 	rm -f *.o *.a *.so *.bak *~ *.orig
 
-.PHONY: all run try-run preflight release debug sanitize rpi4 maxperf rpi4-maxperf rpi4-release strip deps help run-help clean distclean install uninstall
+.PHONY: all run try-run preflight release debug sanitize rpi4 maxperf rpi4-maxperf strip deps help run-help clean distclean install uninstall

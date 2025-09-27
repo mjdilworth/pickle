@@ -50,7 +50,7 @@
 #include "shader.h"
 #include "keystone.h"
 #include "input.h"
-#include "hvs_keystone.h"
+
 #include "compute_keystone.h"
 #include "drm.h"
 #include "egl.h"
@@ -153,6 +153,7 @@ static const char *mpv_end_reason_str(int r) {
 #define RETURN_ERROR_IF(cond, msg) do { if (cond) { RETURN_ERROR(msg); } } while (0)
 
 // Memory monitoring functions
+#ifdef USE_V4L2_DECODER
 static void log_memory_usage(const char *context) {
     FILE *status = fopen("/proc/self/status", "r");
     if (!status) return;
@@ -199,6 +200,91 @@ static void log_system_memory(void) {
         LOG_WARN("[SYS-MEM] Low system memory available: %lu KB", mem_available);
     }
 }
+
+// Convert NV12 frame to RGB texture
+static bool convert_nv12_to_rgb_texture(v4l2_decoded_frame_t *frame, GLuint *texture) {
+    if (!frame || !texture || !frame->data) {
+        LOG_ERROR("Invalid frame data for NV12 conversion");
+        return false;
+    }
+    
+    // NV12 format: Y plane (width x height) followed by interleaved UV plane (width x height/2)
+    uint32_t y_size = frame->width * frame->height;
+    uint32_t uv_size = frame->width * frame->height / 2;
+    
+    if (frame->bytesused < y_size + uv_size) {
+        LOG_ERROR("Frame data too small for NV12: %u < %u", frame->bytesused, y_size + uv_size);
+        return false;
+    }
+    
+    unsigned char *y_data = (unsigned char *)frame->data;
+    unsigned char *uv_data = y_data + y_size;
+    
+    // Create or reuse texture
+    if (*texture == 0) {
+        glGenTextures(1, texture);
+        LOG_DEBUG("Created new texture %u for NV12 conversion", *texture);
+    }
+    
+    glBindTexture(GL_TEXTURE_2D, *texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // For now, create a simple RGB texture from NV12 by doing basic YUV->RGB conversion on CPU
+    // This is not optimal but will work for testing. GPU conversion would be better.
+    unsigned char *rgb_data = malloc(frame->width * frame->height * 3);
+    if (!rgb_data) {
+        LOG_ERROR("Failed to allocate RGB conversion buffer");
+        return false;
+    }
+    
+    // Convert NV12 to RGB
+    for (uint32_t y = 0; y < frame->height; y++) {
+        for (uint32_t x = 0; x < frame->width; x++) {
+            uint32_t y_idx = y * frame->width + x;
+            uint32_t uv_idx = (y / 2U) * frame->width + (x & ~1U);
+            
+            int Y = (int)y_data[y_idx];
+            int U = (int)uv_data[uv_idx] - 128;
+            int V = (int)uv_data[uv_idx + 1] - 128;
+            
+            // YUV to RGB conversion (simplified)
+            int R = Y + (int)(1.402f * (float)V);
+            int G = Y - (int)(0.344f * (float)U) - (int)(0.714f * (float)V);
+            int B = Y + (int)(1.772f * (float)U);
+            
+            // Clamp to valid range
+            R = (R < 0) ? 0 : (R > 255) ? 255 : R;
+            G = (G < 0) ? 0 : (G > 255) ? 255 : G;
+            B = (B < 0) ? 0 : (B > 255) ? 255 : B;
+            
+            uint32_t rgb_idx = y_idx * 3;
+            rgb_data[rgb_idx] = (unsigned char)R;
+            rgb_data[rgb_idx + 1] = (unsigned char)G;
+            rgb_data[rgb_idx + 2] = (unsigned char)B;
+        }
+    }
+    
+    // Upload RGB data to texture
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei)frame->width, (GLsizei)frame->height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb_data);
+    
+    free(rgb_data);
+    
+    GLenum gl_error = glGetError();
+    if (gl_error != GL_NO_ERROR) {
+        LOG_ERROR("OpenGL error in NV12 conversion: 0x%x", gl_error);
+        return false;
+    }
+    
+    LOG_DEBUG("Successfully converted %dx%d NV12 frame to RGB texture", frame->width, frame->height);
+    return true;
+}
+
+// Forward declaration for GPU-based NV12 conversion (implemented later after variable declarations)
+static bool convert_nv12_to_rgb_texture_gpu(const v4l2_decoded_frame_t *frame, GLuint *rgb_texture);
+#endif  // USE_V4L2_DECODER
 
 // Exported globals for use in other modules
 volatile sig_atomic_t g_stop = 0;
@@ -321,6 +407,7 @@ typedef struct fb_ring_entry fb_ring_entry_t;
 static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
 int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
+int g_v4l2_fallback_requested = 0; // Set when V4L2 fails and should fall back to MPV
 double g_video_fps = 60.0; // Detected video frame rate (default to 60fps)
 
 // These keystone settings are defined in keystone.c through pickle_keystone adapter
@@ -334,6 +421,17 @@ static GLuint g_border_vertex_shader = 0;
 static GLuint g_border_fragment_shader = 0;
 static GLint  g_border_a_position_loc = -1;
 static GLint  g_border_u_color_loc = -1;
+
+// GPU-based NV12 to RGB conversion shader
+static GLuint g_nv12_shader_program = 0;
+static GLuint g_nv12_vertex_shader = 0;
+static GLuint g_nv12_fragment_shader = 0;
+static GLint  g_nv12_a_position_loc = -1;
+static GLint  g_nv12_a_tex_coord_loc = -1;
+static GLint  g_nv12_u_texture_y_loc = -1;
+static GLint  g_nv12_u_texture_uv_loc = -1;
+static GLuint g_nv12_vao = 0;
+static GLuint g_nv12_vbo = 0;
 
 // Joystick/gamepad support
 // Note: All joystick-related variables and functions are now in input.c
@@ -1116,6 +1214,7 @@ static void destroy_mpv(mpv_player_t *p) {
 	}
 }
 
+#ifdef USE_V4L2_DECODER
 /**
  * Initialize the V4L2 decoder
  * 
@@ -1125,6 +1224,15 @@ static void destroy_mpv(mpv_player_t *p) {
  */
 static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	if (!p) return false;
+	
+	// Check file extension - use MPV directly for container formats
+	const char *ext = strrchr(file, '.');
+	if (ext && (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".mkv") == 0 || 
+	            strcasecmp(ext, ".avi") == 0 || strcasecmp(ext, ".mov") == 0 || 
+	            strcasecmp(ext, ".webm") == 0)) {
+		LOG_INFO("Container format detected (%s), skipping V4L2 and using MPV directly", ext);
+		return false; // Force fallback to MPV
+	}
 	
 	// Check if V4L2 decoder is supported
 	if (!v4l2_decoder_is_supported()) {
@@ -1141,7 +1249,9 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	
 #ifdef USE_V4L2_DECODER
 	// Try to initialize MP4 demuxer first
+	fprintf(stderr, "[DEBUG] Attempting MP4 demuxer init for file: %s\n", file);
 	if (mp4_demuxer_init(&p->demuxer, file)) {
+		fprintf(stderr, "[DEBUG] MP4 demuxer init SUCCESS\n");
 		p->use_demuxer = true;
 		
 		// Get stream information from demuxer
@@ -1191,6 +1301,7 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		LOG_INFO("Using MP4 demuxer: %s %dx%d @ %.2f fps", codec_name, p->width, p->height, fps);
 	} else {
 #endif
+		fprintf(stderr, "[DEBUG] MP4 demuxer init FAILED, falling back to raw file\n");
 		// Fallback to raw file reading
 #ifdef USE_V4L2_DECODER
 		p->use_demuxer = false;
@@ -1294,7 +1405,9 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	
 	return true;
 }
+#endif  // USE_V4L2_DECODER
 
+#ifdef USE_V4L2_DECODER
 /**
  * Clean up V4L2 decoder resources
  * 
@@ -1328,7 +1441,9 @@ static void destroy_v4l2_decoder(v4l2_player_t *p) {
 	
 	p->is_active = 0;
 }
+#endif  // USE_V4L2_DECODER
 
+#ifdef USE_V4L2_DECODER
 /**
  * Process one frame from the V4L2 decoder
  * 
@@ -1336,7 +1451,9 @@ static void destroy_v4l2_decoder(v4l2_player_t *p) {
  * @return true if processing should continue, false to stop playback
  */
 static bool process_v4l2_frame(v4l2_player_t *p) {
-	if (!p || !p->is_active) return false;
+	if (!p || !p->is_active) {
+		return false;
+	}
 	
 	// Check for stop signal immediately
 	if (g_stop) {
@@ -1363,8 +1480,8 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 		
 		if (g_last_frame_time.tv_sec != 0) {
 			// Calculate time since last frame
-			double elapsed_ms = (current_time.tv_sec - g_last_frame_time.tv_sec) * 1000.0 +
-								(current_time.tv_usec - g_last_frame_time.tv_usec) / 1000.0;
+			double elapsed_ms = (double)(current_time.tv_sec - g_last_frame_time.tv_sec) * 1000.0 +
+								(double)(current_time.tv_usec - g_last_frame_time.tv_usec) / 1000.0;
 			
 			// If we're processing too fast, add a small delay
 			if (elapsed_ms < target_interval_ms) {
@@ -1474,10 +1591,13 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 			}
 		}
 		
-		LOG_DEBUG("Using V4L2 chunk size: %zu bytes", max_chunk_size);			// Read a chunk of data, but limit to safe chunk size
+		static int chunk_log_counter = 0;
+		if (++chunk_log_counter % 1000 == 1) {
+			LOG_DEBUG("Using V4L2 chunk size: %zu bytes (logged every 1000 reads)", max_chunk_size);
+		}
+			// Read a chunk of data, but limit to safe chunk size
 			size_t bytes_to_read = max_chunk_size < p->buffer_size ? max_chunk_size : p->buffer_size;
 			size_t bytes_read = fread(p->buffer, 1, bytes_to_read, p->input_file);
-			LOG_DEBUG("Read %zu bytes from input file", bytes_read);
 			
 			if (bytes_read > 0) {
 				// Send to decoder
@@ -1485,7 +1605,10 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 					LOG_ERROR("V4L2 decoder decode failed");
 					log_memory_usage("V4L2-DECODE-FAIL");
 				} else {
-					LOG_DEBUG("Successfully sent %zu bytes to V4L2 decoder", bytes_read);
+					static int send_log_counter = 0;
+					if (++send_log_counter % 100 == 1) {
+						LOG_DEBUG("Successfully sent %zu bytes to V4L2 decoder (logged every 100 sends)", bytes_read);
+					}
 				}
 				// Increment timestamp based on detected video FPS (adaptive timing)
 				double frame_interval_us = 1000000.0 / g_video_fps;
@@ -1507,17 +1630,23 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 		// Normally we would render the frame here
 		got_frame_this_cycle = true;
 		no_frame_cycles = 0;  // Reset counter when we get a frame
+		
+		// Return the buffer back to the decoder for reuse
+		if (!v4l2_decoder_return_frame(p->decoder, &frame)) {
+			LOG_ERROR("Failed to return frame buffer to decoder");
+		}
 	} else {
 		LOG_DEBUG("No decoded frame available yet");
 	}
 	
 	// Poll for decoded frames with timeout and signal checking
-	LOG_DEBUG("Polling V4L2 decoder for frames...");
+	static int poll_log_counter = 0;
+	if (++poll_log_counter % 200 == 1) {
+		LOG_DEBUG("Polling V4L2 decoder for frames... (logged every 200 calls)");
+	}
 	int poll_result = v4l2_decoder_poll(p->decoder, 0);  // Non-blocking poll
-	LOG_DEBUG("V4L2 poll result: %d", poll_result);
 	
 	if (poll_result > 0) {
-		LOG_DEBUG("Processing V4L2 decoder events...");
 		// Process events
 		v4l2_decoder_process_events(p->decoder);
 		
@@ -1529,7 +1658,6 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 		
 		// Try to get a decoded frame
 		v4l2_decoded_frame_t decoded_frame;
-		LOG_DEBUG("Attempting to get decoded frame...");
 		if (v4l2_decoder_get_frame(p->decoder, &decoded_frame)) {
 			// Store frame information in the player struct
             p->current_frame.valid = true;
@@ -1550,7 +1678,8 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 			}
             
             // Create/update OpenGL texture with frame data
-            if (frame.dmabuf_fd >= 0) {
+            if (decoded_frame.dmabuf_fd >= 0) {
+                LOG_INFO("V4L2: Processing DMA-BUF frame (fd=%d)", decoded_frame.dmabuf_fd);
                 // We have a DMA-BUF frame, create an EGL texture from it
                 // This code would depend on your EGL/DMA-BUF implementation
                 // Use the create_dmabuf_texture function if available
@@ -1558,31 +1687,32 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
                 // For now, just set the texture ID (placeholder)
                 // In a real implementation, you would create an actual texture
                 p->current_frame.texture = p->texture;
-            } else if (frame.data) {
-                // We have memory-mapped data, update the texture
-                if (p->texture == 0) {
-                    // Create a new texture if we don't have one
-                    glGenTextures(1, &p->texture);
-                    glBindTexture(GL_TEXTURE_2D, p->texture);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            } else if (decoded_frame.data) {
+                LOG_INFO("V4L2: Processing memory-mapped NV12 frame (data=%p, size=%u)", decoded_frame.data, decoded_frame.bytesused);
+                
+                // Convert NV12 to RGB texture using GPU
+                if (convert_nv12_to_rgb_texture_gpu(&decoded_frame, &p->texture)) {
+                    p->current_frame.texture = p->texture;
+                    static int convert_log_counter = 0;
+                    if (++convert_log_counter % 100 == 1) {
+                        LOG_DEBUG("Successfully converted NV12 frame to RGB texture %u (logged every 100 conversions)", p->texture);
+                    }
                 } else {
-                    // Bind existing texture
-                    glBindTexture(GL_TEXTURE_2D, p->texture);
+                    LOG_ERROR("Failed to convert NV12 frame to RGB texture");
                 }
-                
-                // Update texture with new frame data
-                // This would depend on the pixel format
-                // For now, assume a simple format like RGB/RGBA
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)frame.width, (GLsizei)frame.height, 
-                             0, GL_RGBA, GL_UNSIGNED_BYTE, frame.data);
-                
-                p->current_frame.texture = p->texture;
+            }
+            
+            // Return the buffer back to the decoder for reuse
+            if (!v4l2_decoder_return_frame(p->decoder, &decoded_frame)) {
+                LOG_ERROR("Failed to return frame buffer to decoder");
             }
             
 			return true;
+		} else {
+			static int no_frame_log_counter = 0;
+			if (++no_frame_log_counter % 500 == 1) {
+				LOG_DEBUG("No decoded frame available from V4L2 decoder (logged every 500 calls)");
+			}
 		}
 	}
 	
@@ -1602,16 +1732,20 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	if (!got_frame_this_cycle) {
 		no_frame_cycles++;
 		if (no_frame_cycles > 1000) {  // Exit if no frames for 1000 consecutive cycles
-			LOG_INFO("No frames received for %d consecutive cycles, potential infinite loop - exiting", no_frame_cycles);
+			LOG_WARN("No frames received for %d consecutive cycles, V4L2 decoder appears to have failed", no_frame_cycles);
+			LOG_INFO("Requesting fallback to MPV decoder");
+			extern int g_v4l2_fallback_requested;
+			g_v4l2_fallback_requested = 1;
 			return false;
 		}
-		if (no_frame_cycles % 100 == 0) {  // Log every 100 cycles
+		if (no_frame_cycles % 200 == 0) {  // Log every 200 cycles (reduced frequency)
 			LOG_DEBUG("No frames for %d consecutive cycles", no_frame_cycles);
 		}
 	}
 	
 	return true;
 }
+#endif  // USE_V4L2_DECODER
 
 void drain_mpv_events(mpv_handle *h) {
 	while (1) {
@@ -1783,6 +1917,7 @@ static void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
 
 // Forward declaration for border shader initialization
 static bool init_border_shader();
+static bool init_nv12_shader();
 
 static bool init_border_shader() {
     g_border_vertex_shader = compile_shader(GL_VERTEX_SHADER, g_border_vs_src);
@@ -1805,6 +1940,200 @@ static bool init_border_shader() {
     }
     g_border_a_position_loc = glGetAttribLocation(g_border_shader_program, "a_position");
     g_border_u_color_loc = glGetUniformLocation(g_border_shader_program, "u_color");
+    return true;
+}
+
+// Initialize NV12 to RGB conversion shader
+static bool init_nv12_shader() {
+    g_nv12_vertex_shader = compile_shader(GL_VERTEX_SHADER, g_nv12_vs_src);
+    if (!g_nv12_vertex_shader) return false;
+    
+    g_nv12_fragment_shader = compile_shader(GL_FRAGMENT_SHADER, g_nv12_fs_src);
+    if (!g_nv12_fragment_shader) {
+        glDeleteShader(g_nv12_vertex_shader);
+        g_nv12_vertex_shader = 0;
+        return false;
+    }
+    
+    g_nv12_shader_program = glCreateProgram();
+    if (!g_nv12_shader_program) {
+        glDeleteShader(g_nv12_vertex_shader);
+        glDeleteShader(g_nv12_fragment_shader);
+        g_nv12_vertex_shader = 0;
+        g_nv12_fragment_shader = 0;
+        return false;
+    }
+    
+    glAttachShader(g_nv12_shader_program, g_nv12_vertex_shader);
+    glAttachShader(g_nv12_shader_program, g_nv12_fragment_shader);
+    glLinkProgram(g_nv12_shader_program);
+    
+    GLint linked = 0;
+    glGetProgramiv(g_nv12_shader_program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint info_len = 0;
+        glGetProgramiv(g_nv12_shader_program, GL_INFO_LOG_LENGTH, &info_len);
+        if (info_len > 1) {
+            char* buf = malloc((size_t)info_len);
+            glGetProgramInfoLog(g_nv12_shader_program, info_len, NULL, buf);
+            LOG_ERROR("NV12 shader link: %s", buf);
+            free(buf);
+        }
+        glDeleteProgram(g_nv12_shader_program);
+        g_nv12_shader_program = 0;
+        glDeleteShader(g_nv12_vertex_shader);
+        g_nv12_vertex_shader = 0;
+        glDeleteShader(g_nv12_fragment_shader);
+        g_nv12_fragment_shader = 0;
+        return false;
+    }
+    
+    // Get attribute and uniform locations
+    g_nv12_a_position_loc = glGetAttribLocation(g_nv12_shader_program, "a_position");
+    g_nv12_a_tex_coord_loc = glGetAttribLocation(g_nv12_shader_program, "a_tex_coord");
+    g_nv12_u_texture_y_loc = glGetUniformLocation(g_nv12_shader_program, "u_texture_y");
+    g_nv12_u_texture_uv_loc = glGetUniformLocation(g_nv12_shader_program, "u_texture_uv");
+    
+    // Create VAO and VBO for fullscreen quad
+    glGenVertexArrays(1, &g_nv12_vao);
+    glGenBuffers(1, &g_nv12_vbo);
+    
+    // Setup fullscreen quad vertices (position + texture coordinates)
+    float quad_vertices[] = {
+        // Position   // TexCoord
+        -1.0f, -1.0f, 0.0f, 1.0f,  // Bottom-left
+         1.0f, -1.0f, 1.0f, 1.0f,  // Bottom-right
+        -1.0f,  1.0f, 0.0f, 0.0f,  // Top-left
+         1.0f,  1.0f, 1.0f, 0.0f,  // Top-right
+    };
+    
+    glBindVertexArray(g_nv12_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_nv12_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_vertices), quad_vertices, GL_STATIC_DRAW);
+    
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    // Texture coordinate attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glBindVertexArray(0);
+    
+    return true;
+}
+
+// GPU-based NV12 to RGB conversion using shaders (high performance)
+static bool convert_nv12_to_rgb_texture_gpu(const v4l2_decoded_frame_t *frame, GLuint *rgb_texture) {
+    if (!frame || !frame->data || !rgb_texture) return false;
+    
+    // Initialize NV12 shader if needed
+    if (g_nv12_shader_program == 0) {
+        if (!init_nv12_shader()) {
+            LOG_ERROR("Failed to initialize NV12 shader, falling back to CPU conversion");
+            return convert_nv12_to_rgb_texture((v4l2_decoded_frame_t*)frame, rgb_texture);
+        }
+        LOG_INFO("GPU-based NV12 conversion initialized");
+    }
+    
+    // Create Y and UV textures if needed
+    static GLuint y_texture = 0, uv_texture = 0;
+    static GLuint rgb_fbo = 0;
+    static uint32_t prev_width = 0, prev_height = 0;
+    
+    if (y_texture == 0 || prev_width != frame->width || prev_height != frame->height) {
+        // Clean up old textures if size changed
+        if (y_texture) {
+            glDeleteTextures(1, &y_texture);
+            glDeleteTextures(1, &uv_texture);
+            glDeleteFramebuffers(1, &rgb_fbo);
+        }
+        
+        // Create Y plane texture (full resolution, single channel)
+        glGenTextures(1, &y_texture);
+        glBindTexture(GL_TEXTURE_2D, y_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        
+        // Create UV plane texture (half resolution, two channel)
+        glGenTextures(1, &uv_texture);
+        glBindTexture(GL_TEXTURE_2D, uv_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        
+        // Create output RGB texture
+        if (*rgb_texture == 0) {
+            glGenTextures(1, rgb_texture);
+        }
+        glBindTexture(GL_TEXTURE_2D, *rgb_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei)frame->width, (GLsizei)frame->height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+        
+        // Create framebuffer for rendering to RGB texture
+        glGenFramebuffers(1, &rgb_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, rgb_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *rgb_texture, 0);
+        
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            LOG_ERROR("Failed to create framebuffer for NV12 conversion");
+            return false;
+        }
+        
+        prev_width = frame->width;
+        prev_height = frame->height;
+    }
+    
+    // Upload Y plane data (full resolution)
+    const unsigned char *y_data = (const unsigned char *)frame->data;
+    glBindTexture(GL_TEXTURE_2D, y_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei)frame->width, (GLsizei)frame->height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
+    
+    // Upload UV plane data (half resolution interleaved)
+    const unsigned char *uv_data = y_data + (frame->width * frame->height);
+    glBindTexture(GL_TEXTURE_2D, uv_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei)(frame->width / 2U), (GLsizei)(frame->height / 2U), 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_data);
+    
+    // Set up render state for conversion
+    glBindFramebuffer(GL_FRAMEBUFFER, rgb_fbo);
+    glViewport(0, 0, (GLsizei)frame->width, (GLsizei)frame->height);
+    
+    glUseProgram(g_nv12_shader_program);
+    
+    // Bind Y and UV textures
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, y_texture);
+    glUniform1i(g_nv12_u_texture_y_loc, 0);
+    
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, uv_texture);
+    glUniform1i(g_nv12_u_texture_uv_loc, 1);
+    
+    // Render fullscreen quad to perform conversion
+    glBindVertexArray(g_nv12_vao);
+    glBindAttribLocation(g_nv12_shader_program, 0, "a_position");
+    glBindAttribLocation(g_nv12_shader_program, 1, "a_tex_coord");
+    
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    
+    // Restore default framebuffer
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindVertexArray(0);
+    glUseProgram(0);
+    
+    GLenum gl_error = glGetError();
+    if (gl_error != GL_NO_ERROR) {
+        LOG_ERROR("OpenGL error in GPU NV12 conversion: 0x%x", gl_error);
+        return false;
+    }
+    
     return true;
 }
 
@@ -1900,6 +2229,73 @@ void bo_destroy_handler(struct gbm_bo *bo, void *data) {
 	}
 }
 
+#ifdef USE_V4L2_DECODER
+
+/**
+ * Render texture directly to screen without keystone correction
+ */
+static void render_direct_quad(GLuint texture) {
+    if (texture == 0) return;
+    
+    // Simple direct texture rendering to fullscreen quad
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    
+    // Disable depth testing and enable blending for video
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    // Define fullscreen quad vertices (clip space coordinates)
+    float vertices[] = {
+        -1.0f, -1.0f,  // Bottom left
+         1.0f, -1.0f,  // Bottom right  
+        -1.0f,  1.0f,  // Top left
+         1.0f,  1.0f   // Top right
+    };
+    
+    // Define texture coordinates
+    float texcoords[] = {
+        0.0f, 1.0f,  // Bottom left (flipped Y)
+        1.0f, 1.0f,  // Bottom right (flipped Y)
+        0.0f, 0.0f,  // Top left (flipped Y)
+        1.0f, 0.0f   // Top right (flipped Y)
+    };
+    
+    // Use basic shader program (assume it's already set up)
+    // Render as triangle strip: 4 vertices forming 2 triangles
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+}
+
+/**
+ * Render texture with keystone correction
+ */
+static void render_keystone_quad(GLuint texture) {
+    if (texture == 0) return;
+    
+    // First copy the texture to the keystone FBO, then render with keystone correction
+    // This integrates with the existing keystone correction pipeline
+    
+    // Set the texture as the keystone FBO texture (this is a simplification)
+    // In a full implementation, we'd copy the V4L2 texture to the keystone FBO first
+    g_keystone_fbo_texture = texture;
+    
+    // Now render using the existing keystone pipeline
+    // The keystone rendering code will use g_keystone_fbo_texture
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    
+    LOG_DEBUG("V4L2 texture set for keystone rendering: %u", texture);
+}
+
 /**
  * Render a frame using the V4L2 decoder
  * 
@@ -1950,7 +2346,7 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
     
     // Check for active frame
     if (!p->current_frame.valid) {
-        return false;
+        return true; // Continue normally, frames will come later
     }
     
     // Create/update OpenGL texture from V4L2 decoded frame
@@ -1975,12 +2371,26 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
         }
     }
 	
-	// Apply keystone correction if enabled
-	if (g_keystone.enabled && g_keystone_shader_program) {
-		// Render keystone-corrected quad (similar to render_frame_fixed)
-		// For now, just rendering a black screen with keystone shape
-		glUseProgram(g_keystone_shader_program);
-		// Set keystone uniforms...
+	// Debug: Check if we have a valid frame and texture
+	if (p->current_frame.valid) {
+		fprintf(stderr, "[DEBUG] V4L2: Valid frame available, texture=%u\n", p->texture);
+		if (p->texture > 0) {
+			// Render the V4L2 texture to screen using the appropriate pipeline
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, p->texture);
+			fprintf(stderr, "[DEBUG] V4L2: Texture %u bound for rendering\n", p->texture);
+			
+			// Use keystone correction if enabled, otherwise render directly
+			if (g_keystone.enabled && g_keystone_shader_program > 0) {
+				render_keystone_quad(p->texture);
+				LOG_DEBUG("V4L2 frame rendered with keystone correction");
+			} else {
+				render_direct_quad(p->texture);
+				LOG_DEBUG("V4L2 frame rendered directly");
+			}
+		}
+	} else {
+		fprintf(stderr, "[DEBUG] V4L2: No valid frame available\n");
 	}
 	
 	// Swap buffers
@@ -2032,6 +2442,7 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	
 	return ret;
 }
+#endif  // USE_V4L2_DECODER
 
 /**
  * Clear the display to black and force a buffer swap
@@ -2834,18 +3245,6 @@ int main(int argc, char **argv) {
 	
 	// Initialize keystone correction
 	keystone_init();
-		keystone_init();
-		
-		// Initialize hardware HVS keystone if supported
-		if (hvs_keystone_is_supported()) {
-		if (hvs_keystone_init()) {
-			LOG_INFO("Hardware HVS keystone initialized successfully");
-		} else {
-			LOG_WARN("Failed to initialize hardware HVS keystone, falling back to software implementation");
-		}
-	} else {
-		LOG_INFO("Hardware HVS keystone not supported on this platform, using software implementation");
-	}
 	
 	// Initialize compute shader keystone if supported
 	if (compute_keystone_is_supported()) {
@@ -2957,6 +3356,12 @@ int main(int argc, char **argv) {
 	// Watchdog: if no frame submitted within WD_FIRST_MS, force a render attempt even if mpv flags missing.
 	int frames = 0;
 	int force_loop = getenv("PICKLE_FORCE_RENDER_LOOP") ? 1 : 0;
+	
+	// V4L2 decoder requires continuous polling, so always enable force_loop mode
+	if (g_use_v4l2_decoder) {
+		force_loop = 1;
+		LOG_DEBUG("V4L2 decoder enabled, forcing continuous render loop for active polling");
+	}
 	struct timeval wd_last_activity; gettimeofday(&wd_last_activity, NULL);
 	gettimeofday(&g_last_frame_time, NULL); // Initialize last frame time
 	int wd_forced_first = 0;
@@ -3301,6 +3706,43 @@ int main(int argc, char **argv) {
 			bool render_success = false;
 			if (g_use_v4l2_decoder) {
 				render_success = render_v4l2_frame(&drm, &eglc, &v4l2_player);
+				
+				// Check if V4L2 decoder has requested fallback to MPV
+				if (g_v4l2_fallback_requested) {
+					LOG_WARN("V4L2 decoder failed, switching to MPV fallback");
+					
+					// Cleanup V4L2 decoder resources
+					if (v4l2_player.decoder) {
+						v4l2_decoder_destroy(v4l2_player.decoder);
+						v4l2_player.decoder = NULL;
+					}
+					if (v4l2_player.input_file) {
+						fclose(v4l2_player.input_file);
+						v4l2_player.input_file = NULL;
+					}
+					if (v4l2_player.buffer) {
+						free(v4l2_player.buffer);
+						v4l2_player.buffer = NULL;
+					}
+					
+					// Initialize MPV as fallback
+					LOG_INFO("Initializing MPV decoder as fallback");
+					if (!init_mpv(&player, file)) {
+						LOG_ERROR("Failed to initialize MPV fallback decoder");
+						break;
+					}
+					
+					// Switch to MPV mode
+					g_use_v4l2_decoder = 0;
+					g_v4l2_fallback_requested = 0;
+					g_mpv_wakeup = 1;
+					
+					LOG_INFO("Successfully switched to MPV decoder");
+					fprintf(stderr, "Switched to MPV decoder due to V4L2 failure\n");
+					
+					// Continue with MPV rendering
+					render_success = render_frame_fixed(&drm, &eglc, &player);
+				}
 			} else {
 				render_success = render_frame_fixed(&drm, &eglc, &player);
 			}
@@ -3357,8 +3799,6 @@ int main(int argc, char **argv) {
 	// Clean up joystick resources
 	cleanup_joystick();
 	
-	// Clean up HVS keystone if initialized
-	hvs_keystone_cleanup();
 	
 	// Clean up compute shader keystone if initialized
 	compute_keystone_cleanup();
@@ -3381,8 +3821,6 @@ fail:
 	// Clean up joystick resources
 	cleanup_joystick();
 	
-	// Clean up HVS keystone if initialized
-	hvs_keystone_cleanup();
 	
 	// Clean up compute shader keystone if initialized
 	compute_keystone_cleanup();

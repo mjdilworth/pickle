@@ -1,10 +1,10 @@
 pickle.o: pickle.c drm_keystone.h keystone.h drm.h pickle_globals.h egl.h \
- v4l2_player.h v4l2_decoder.h utils.h shader.h input.h hvs_keystone.h \
- compute_keystone.h stats_overlay.h
+ v4l2_player.h v4l2_decoder.h utils.h shader.h input.h compute_keystone.h \
+ stats_overlay.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
-keystone.o: keystone.c keystone.h utils.h shader.h hvs_keystone.h \
- drm_keystone.h drm.h log.h
+keystone.o: keystone.c keystone.h utils.h shader.h drm_keystone.h drm.h \
+ log.h
 keystone_funcs.o: keystone_funcs.c keystone.h utils.h
 keystone_get_config.o: keystone_get_config.c keystone.h
 drm.o: drm.c drm.h utils.h
@@ -26,9 +26,7 @@ render.o: render.c render.h drm.h egl.h error.h frame_pacing.h \
  render_backend.h
 render_backend.o: render_backend.c render_backend.h error.h log.h
 mpv.o: mpv.c mpv.h error.h utils.h
-dispmanx.o: dispmanx.c dispmanx.h log.h egl.h drm.h
 v4l2_decoder.o: v4l2_decoder.c v4l2_decoder.h log.h
-hvs_keystone.o: hvs_keystone.c hvs_keystone.h keystone.h dispmanx.h log.h
 compute_keystone.o: compute_keystone.c compute_keystone.h keystone.h \
  shader.h utils.h log.h
 event.o: event.c event.h

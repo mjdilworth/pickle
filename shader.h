@@ -19,5 +19,7 @@ extern const char *g_vertex_shader_src;
 extern const char *g_fragment_shader_src;
 extern const char *g_border_vs_src;
 extern const char *g_border_fs_src;
+extern const char *g_nv12_vs_src;
+extern const char *g_nv12_fs_src;
 
 #endif // PICKLE_SHADER_H

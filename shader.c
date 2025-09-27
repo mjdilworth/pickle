@@ -40,6 +40,39 @@ const char* g_border_fs_src =
     "    gl_FragColor = u_color;\n"
     "}\n";
 
+// NV12 to RGB conversion shader (GPU-based YUV conversion)
+const char* g_nv12_vs_src =
+    "attribute vec2 a_position;\n"
+    "attribute vec2 a_tex_coord;\n"
+    "varying vec2 v_tex_coord;\n"
+    "void main() {\n"
+    "    v_tex_coord = a_tex_coord;\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "}\n";
+
+const char* g_nv12_fs_src =
+    "precision highp float;\n"
+    "varying vec2 v_tex_coord;\n"
+    "uniform sampler2D u_texture_y;\n"
+    "uniform sampler2D u_texture_uv;\n"
+    "void main() {\n"
+    "    // Sample Y component at full resolution\n"
+    "    float y = texture2D(u_texture_y, v_tex_coord).r;\n"
+    "    // Sample UV components at half resolution (NV12 is 4:2:0 subsampled)\n"
+    "    vec2 uv = texture2D(u_texture_uv, v_tex_coord).rg;\n"
+    "    // Convert from [0,1] to proper YUV ranges\n"
+    "    y = (y * 255.0 - 16.0) / 219.0;\n"
+    "    float u = (uv.r * 255.0 - 128.0) / 224.0;\n"
+    "    float v = (uv.g * 255.0 - 128.0) / 224.0;\n"
+    "    // BT.709 YUV to RGB conversion matrix (HD standard)\n"
+    "    vec3 rgb;\n"
+    "    rgb.r = y + 1.5748 * v;\n"
+    "    rgb.g = y - 0.1873 * u - 0.4681 * v;\n"
+    "    rgb.b = y + 1.8556 * u;\n"
+    "    // Clamp to valid range and output\n"
+    "    gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);\n"
+    "}\n";
+
 GLuint compile_shader(GLenum type, const char *source) {
     GLuint shader = glCreateShader(type);
     if (!shader) {

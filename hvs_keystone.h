@@ -5,42 +5,38 @@
 #include <stdint.h>
 #include "keystone.h"
 
-// Include DispmanX definitions when enabled
-#if defined(DISPMANX_ENABLED)
-#include <bcm_host.h>
-#endif
+// DispmanX has been removed - no longer supported
 
 /**
  * Check if HVS keystone transformation is supported on this platform
  * 
- * This function checks if the hardware supports HVS keystone transformation
- * by verifying that we're running on Raspberry Pi hardware with DispmanX.
+ * This function always returns false since DispmanX has been removed.
+ * Hardware keystone correction is no longer available.
  * 
- * @return true if supported, false otherwise
+ * @return false (no longer supported)
  */
 bool hvs_keystone_is_supported(void);
 
 /**
  * Initialize the HVS keystone transformation
  * 
- * This function initializes the DispmanX API and prepares it for use with
- * keystone correction. It must be called before any other HVS keystone functions.
+ * This function now always returns false since DispmanX has been removed.
+ * Hardware keystone correction is no longer available.
  * 
- * @return true if initialization succeeded, false otherwise
+ * @return false (no longer supported)
  */
 bool hvs_keystone_init(void);
 
 /**
  * Apply the keystone transformation to the current display using HVS
  * 
- * This function applies a keystone transformation to the display using the
- * Hardware Video Scaler (HVS) through the DispmanX API. It maps a rectangular
- * source to a quadrilateral destination defined by the keystone parameters.
+ * This function now always returns false since DispmanX has been removed.
+ * Hardware keystone correction is no longer available.
  * 
- * @param keystone Pointer to the keystone configuration to apply
- * @param display_width The width of the display
- * @param display_height The height of the display
- * @return true if transformation succeeded, false otherwise
+ * @param keystone Unused parameter
+ * @param display_width Unused parameter  
+ * @param display_height Unused parameter
+ * @return false (no longer supported)
  */
 bool hvs_keystone_apply(keystone_t *keystone, int display_width, int display_height);
 
@@ -65,20 +61,6 @@ bool hvs_keystone_update(keystone_t *keystone);
  */
 void hvs_keystone_cleanup(void);
 
-#if defined(DISPMANX_ENABLED)
-/**
- * Create a DispmanX resource from a buffer
- * 
- * Helper function to create a DispmanX resource from an RGBA buffer,
- * useful for applying keystone to a specific framebuffer.
- * 
- * @param buffer The source buffer (RGBA)
- * @param width Width of the buffer
- * @param height Height of the buffer
- * @param stride Stride of the buffer in bytes
- * @return The resource handle or DISPMANX_NO_HANDLE on failure
- */
-DISPMANX_RESOURCE_HANDLE_T hvs_keystone_create_resource(void *buffer, int width, int height, int stride);
-#endif
+// DispmanX-specific functions have been removed
 
 #endif // PICKLE_HVS_KEYSTONE_H

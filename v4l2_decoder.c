@@ -322,7 +322,13 @@ bool v4l2_decoder_set_format(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t w
     struct v4l2_format fmt;
     CLEAR(fmt);
     
-    fmt.type = dec->output_type;
+    fmt.type = (__u32)dec->output_type;
+    // Calculate reasonable maximum frame size for compressed data
+    uint32_t max_frame_size = width * height / 2;  // Conservative estimate for compressed data
+    if (max_frame_size < 1024 * 1024) {
+        max_frame_size = 1024 * 1024;  // Minimum 1MB per frame
+    }
+    
     if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
         // Multi-planar API
         fmt.fmt.pix_mp.pixelformat = v4l2_format;
@@ -330,12 +336,16 @@ bool v4l2_decoder_set_format(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t w
         fmt.fmt.pix_mp.height = height;
         fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
         fmt.fmt.pix_mp.num_planes = 1;
+        fmt.fmt.pix_mp.plane_fmt[0].sizeimage = max_frame_size;
+        fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 0;  // Not applicable for compressed formats
     } else {
         // Single-planar API
         fmt.fmt.pix.pixelformat = v4l2_format;
         fmt.fmt.pix.width = width;
         fmt.fmt.pix.height = height;
         fmt.fmt.pix.field = V4L2_FIELD_NONE;
+        fmt.fmt.pix.sizeimage = max_frame_size;
+        fmt.fmt.pix.bytesperline = 0;  // Not applicable for compressed formats
     }
     
     if (ioctl(dec->fd, VIDIOC_S_FMT, &fmt) < 0) {
@@ -361,7 +371,7 @@ bool v4l2_decoder_set_output_format(v4l2_decoder_t *dec, uint32_t pixel_format) 
     struct v4l2_format fmt;
     CLEAR(fmt);
     
-    fmt.type = dec->capture_type;
+    fmt.type = (__u32)dec->capture_type;
     if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
         // Multi-planar API
         fmt.fmt.pix_mp.pixelformat = pixel_format;
@@ -394,9 +404,9 @@ bool v4l2_decoder_set_output_format(v4l2_decoder_t *dec, uint32_t pixel_format) 
         dec->pixel_format = fmt.fmt.pix.pixelformat;
     }
     
-    LOG_INFO("V4L2", "Output format: %dx%d, stride=%d, format=%4.4s",
+    LOG_INFO("V4L2 Output format: %dx%d, stride=%d, format=%.4s",
              dec->width, dec->height, dec->stride,
-             (char*)&dec->pixel_format);
+             (const char*)&dec->pixel_format);
     
     return true;
 }
@@ -425,8 +435,8 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
     struct v4l2_requestbuffers req;
     CLEAR(req);
     
-    req.count = num_output;
-    req.type = dec->output_type;
+    req.count = (__u32)num_output;
+    req.type = (__u32)dec->output_type;
     req.memory = V4L2_MEMORY_MMAP;
     
     if (ioctl(dec->fd, VIDIOC_REQBUFS, &req) < 0) {
@@ -440,7 +450,7 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
     }
     
     // Allocate buffer structures
-    dec->num_output_buffers = req.count;
+    dec->num_output_buffers = (int)req.count;
     dec->output_buffers = calloc(req.count, sizeof(struct v4l2_buffer));
     dec->output_mmap = calloc(req.count, sizeof(void*));
     
@@ -454,14 +464,14 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
     }
     
     // Map output buffers
-    for (int i = 0; i < req.count; i++) {
+    for (int i = 0; i < (int)req.count; i++) {
         struct v4l2_buffer buf;
         struct v4l2_plane planes[1];
         CLEAR(buf);
         CLEAR(planes);
         
-        buf.index = i;
-        buf.type = dec->output_type;
+        buf.index = (__u32)i;
+        buf.type = (__u32)dec->output_type;
         buf.memory = V4L2_MEMORY_MMAP;
         
         if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
@@ -506,8 +516,8 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
     // Request capture (decoded) buffers
     CLEAR(req);
     
-    req.count = num_capture;
-    req.type = dec->capture_type;
+    req.count = (__u32)num_capture;
+    req.type = (__u32)dec->capture_type;
     req.memory = V4L2_MEMORY_MMAP;  // Will be overridden if using DMABUF
     
     if (ioctl(dec->fd, VIDIOC_REQBUFS, &req) < 0) {
@@ -521,7 +531,7 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
     }
     
     // Allocate buffer structures
-    dec->num_capture_buffers = req.count;
+    dec->num_capture_buffers = (int)req.count;
     dec->capture_buffers = calloc(req.count, sizeof(struct v4l2_buffer));
     dec->capture_mmap = calloc(req.count, sizeof(void*));
     dec->dmabuf_fds = calloc(req.count, sizeof(int));
@@ -538,19 +548,19 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
     }
     
     // Initialize file descriptors to -1
-    for (int i = 0; i < req.count; i++) {
+    for (int i = 0; i < (int)req.count; i++) {
         dec->dmabuf_fds[i] = -1;
     }
     
     // Map capture buffers
-    for (int i = 0; i < req.count; i++) {
+    for (int i = 0; i < (int)req.count; i++) {
         struct v4l2_buffer buf;
         struct v4l2_plane planes[1];
         CLEAR(buf);
         CLEAR(planes);
         
-        buf.index = i;
-        buf.type = dec->capture_type;
+        buf.index = (__u32)i;
+        buf.type = (__u32)dec->capture_type;
         buf.memory = V4L2_MEMORY_MMAP;
         
         if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
@@ -623,8 +633,8 @@ bool v4l2_decoder_start(v4l2_decoder_t *dec) {
         CLEAR(buf);
         CLEAR(planes);
         
-        buf.index = i;
-        buf.type = dec->capture_type;
+        buf.index = (__u32)i;
+        buf.type = (__u32)dec->capture_type;
         buf.memory = V4L2_MEMORY_MMAP;
         
         if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
@@ -752,13 +762,21 @@ bool v4l2_decoder_flush(v4l2_decoder_t *dec) {
 // Decode a frame
 bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int64_t timestamp) {
     if (!dec || !dec->initialized || !dec->streaming) {
-        LOG_ERROR("Decoder not initialized or not streaming");
+        LOG_ERROR("Decoder not initialized or not streaming (dec=%p, init=%d, stream=%d)", 
+                  dec, dec ? dec->initialized : 0, dec ? dec->streaming : 0);
         return false;
     }
     
     if (!data || size == 0) {
-        LOG_ERROR("Invalid data or size");
+        LOG_ERROR("Invalid data or size (data=%p, size=%zu)", data, size);
         return false;
+    }
+    
+    // Reduced logging frequency - only log occasionally to avoid spam
+    static int decode_log_counter = 0;
+    if (++decode_log_counter % 50 == 1) {
+        LOG_DEBUG("V4L2 decode: data=%p, size=%zu, timestamp=%lld (logged every 50 frames)", 
+                 data, size, (long long)timestamp);
     }
     
     // Find an available output buffer
@@ -772,8 +790,8 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
         CLEAR(buf);
         CLEAR(planes);
         
-        buf.index = index;
-        buf.type = dec->output_type;
+        buf.index = (__u32)index;
+        buf.type = (__u32)dec->output_type;
         buf.memory = V4L2_MEMORY_MMAP;
         
         if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
@@ -800,7 +818,7 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
         CLEAR(buf);
         CLEAR(planes);
         
-        buf.type = dec->output_type;
+        buf.type = (__u32)dec->output_type;
         buf.memory = V4L2_MEMORY_MMAP;
         
         if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
@@ -813,15 +831,35 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
             return false;
         }
         
-        buf_index = buf.index;
+        buf_index = (int)buf.index;
     }
     
     // Copy data to the buffer
+    // Query current buffer size dynamically to handle size changes
+    struct v4l2_buffer query_buf;
+    struct v4l2_plane query_planes[1];
+    CLEAR(query_buf);
+    CLEAR(query_planes);
+    
+    query_buf.index = (__u32)buf_index;
+    query_buf.type = (__u32)dec->output_type;
+    query_buf.memory = V4L2_MEMORY_MMAP;
+    
+    if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+        query_buf.m.planes = query_planes;
+        query_buf.length = 1;
+    }
+    
+    if (ioctl(dec->fd, VIDIOC_QUERYBUF, &query_buf) < 0) {
+        LOG_ERROR("Failed to query buffer size: %s", strerror(errno));
+        return false;
+    }
+    
     size_t buffer_size;
     if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-        buffer_size = dec->output_buffers[buf_index].m.planes[0].length;
+        buffer_size = query_buf.m.planes[0].length;
     } else {
-        buffer_size = dec->output_buffers[buf_index].length;
+        buffer_size = query_buf.length;
     }
     
     if (size > buffer_size) {
@@ -838,8 +876,8 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
     CLEAR(buf);
     CLEAR(planes);
     
-    buf.index = buf_index;
-    buf.type = dec->output_type;
+    buf.index = (__u32)buf_index;
+    buf.type = (__u32)dec->output_type;
     buf.memory = V4L2_MEMORY_MMAP;
     buf.timestamp.tv_sec = timestamp / 1000000;
     buf.timestamp.tv_usec = timestamp % 1000000;
@@ -847,11 +885,16 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
     if (dec->output_type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
         buf.m.planes = planes;
         buf.length = 1;
-        buf.m.planes[0].bytesused = size;
-        buf.m.planes[0].length = buffer_size;
+        buf.m.planes[0].bytesused = (__u32)size;
+        buf.m.planes[0].length = (__u32)buffer_size;
     } else {
-        buf.bytesused = size;
-        buf.length = buffer_size;
+        buf.bytesused = (__u32)size;
+        buf.length = (__u32)buffer_size;
+    }
+    
+    static int queue_debug_counter = 0;
+    if (++queue_debug_counter % 100 == 0) {
+        LOG_DEBUG("Queueing buffer %d with %zu bytes (logged every 100 buffers)", buf_index, size);
     }
     
     if (ioctl(dec->fd, VIDIOC_QBUF, &buf) < 0) {
@@ -859,6 +902,10 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
         return false;
     }
     
+    static int queue_success_counter = 0;
+    if (++queue_success_counter % 100 == 0) {
+        LOG_DEBUG("Successfully queued buffer %d (logged every 100 buffers)", buf_index);
+    }
     dec->next_output_buffer = (buf_index + 1) % dec->num_output_buffers;
     
     return true;
@@ -877,7 +924,7 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
     CLEAR(buf);
     CLEAR(planes);
     
-    buf.type = dec->capture_type;
+    buf.type = (__u32)dec->capture_type;
     buf.memory = V4L2_MEMORY_MMAP;
     
     if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
@@ -911,20 +958,60 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
     // TODO: Handle DMA-BUF export
     frame->dmabuf_fd = -1;
     
-    // Keep track of the buffer index for re-queueing
-    int buf_index = buf.index;
+    // For memory-mapped buffers, get a pointer to the buffer data
+    if (dec->capture_mmap && buf.index < (unsigned int)dec->num_capture_buffers) {
+        frame->data = dec->capture_mmap[buf.index];
+    } else {
+        frame->data = NULL;
+    }
+    
+    // Remember the buffer index for returning it later  
+    frame->buf_index = (int)buf.index;
     
     // If using a frame callback, call it
     if (dec->frame_cb) {
         dec->frame_cb(frame, dec->user_data);
     }
-    
-    // Re-queue the buffer
+
+    // DON'T re-queue the buffer automatically - let the application handle it
+    // The application must call v4l2_decoder_return_frame() when done with the frame
+
+    return true;
+}
+
+// Return a frame buffer back to the decoder for reuse
+bool v4l2_decoder_return_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
+    if (!dec || !dec->initialized || !dec->streaming || !frame) {
+        LOG_ERROR("Invalid decoder or frame");
+        return false;
+    }
+
+    if (frame->buf_index < 0 || frame->buf_index >= dec->num_capture_buffers) {
+        LOG_ERROR("Invalid buffer index: %d", frame->buf_index);
+        return false;
+    }
+
+    // Re-queue the buffer for reuse
+    struct v4l2_buffer buf;
+    struct v4l2_plane planes[1];
+    CLEAR(buf);
+    CLEAR(planes);
+
+    buf.index = (__u32)frame->buf_index;
+    buf.type = (__u32)dec->capture_type;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        buf.m.planes = planes;
+        buf.length = 1;
+    }
+
     if (ioctl(dec->fd, VIDIOC_QBUF, &buf) < 0) {
         LOG_ERROR("Failed to re-queue capture buffer: %s", strerror(errno));
         return false;
     }
-    
+
+    LOG_DEBUG("Returned buffer %d to decoder", frame->buf_index);
     return true;
 }
 
@@ -965,20 +1052,16 @@ bool v4l2_decoder_process_events(v4l2_decoder_t *dec) {
         return false;
     }
     
-    bool frame_available = false;
+    // Don't consume frames here - just indicate that events may be available
+    // The main loop should call v4l2_decoder_get_frame() to actually retrieve frames
+    // This function is called after polling indicates activity on the device
     
-    // Process available frames
-    while (true) {
-        v4l2_decoded_frame_t frame;
-        
-        if (!v4l2_decoder_get_frame(dec, &frame)) {
-            break;
-        }
-        
-        frame_available = true;
+    // Reduced logging frequency - only log occasionally to avoid spam
+    static int event_log_counter = 0;
+    if (++event_log_counter % 100 == 1) {
+        LOG_DEBUG("V4L2 events available (logged every 100 calls)");
     }
-    
-    return frame_available;
+    return true;  // Always return true after successful poll
 }
 #else // !defined(USE_V4L2_DECODER)
 
@@ -1140,7 +1223,7 @@ bool v4l2_decoder_flush(v4l2_decoder_t *dec) {
             // Try to dequeue a buffer
             struct v4l2_buffer dqbuf;
             CLEAR(dqbuf);
-            dqbuf.type = dec->output_type;
+            dqbuf.type = (__u32)dec->output_type;
             dqbuf.memory = V4L2_MEMORY_MMAP;
             
             if (ioctl(dec->fd, VIDIOC_DQBUF, &dqbuf) < 0) {
@@ -1152,7 +1235,7 @@ bool v4l2_decoder_flush(v4l2_decoder_t *dec) {
         }
     }
     
-    buf.type = dec->output_type;
+    buf.type = (__u32)dec->output_type;
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = idx;
     buf.flags = V4L2_BUF_FLAG_LAST; // Signal last buffer
@@ -1194,7 +1277,7 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
     CLEAR(buf);
     CLEAR(planes);
     
-    buf.type = dec->output_type;
+    buf.type = (__u32)dec->output_type;
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = dec->next_output_buffer;
     
@@ -1265,7 +1348,7 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
     CLEAR(buf);
     CLEAR(planes);
     
-    buf.type = dec->capture_type;
+    buf.type = (__u32)dec->capture_type;
     
     // Use DMA-BUF memory type if DMA-BUF export is enabled
     if (dec->dmabuf_fds) {
@@ -1308,7 +1391,7 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
         struct v4l2_exportbuffer expbuf;
         CLEAR(expbuf);
         
-        expbuf.type = dec->capture_type;
+        expbuf.type = (__u32)dec->capture_type;
         expbuf.index = buf.index;
         expbuf.flags = O_RDONLY;
         
