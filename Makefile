@@ -4,8 +4,23 @@
 # DRM/KMS + GBM + EGL + libmpv for hardware accelerated playback.
 #
 # Main build targets:
-#   make        - Build the default pickle binary
-#   make rpi4   - Build with Raspberry Pi 4 optimizations
+#   make        - Build the default pickle# RPi4 optimized build
+rpi4:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) RPI4_OPT=1 V4L2=1
+	@echo "Built RPi4 optimized binary: $(APP)"
+
+# Maximum performance build
+maxperf:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) MAXPERF=1
+	@echo "Built maximum performance binary: $(APP)"
+
+# RPi4 optimized with maximum performance
+rpi4-maxperf:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 V4L2=1
+	@echo "Built RPi4 optimized binary with max performance: $(APP)"rpi4   - Build with Raspberry Pi 4 optimizations
 #   make run VIDEO=video.mp4 - Build and run with specified video
 #   make help   - Show all build options
 #
@@ -152,11 +167,23 @@ endif
 # RPi4-specific optimizations
 RPI4_OPT ?= 0
 ifeq ($(RPI4_OPT),1)
-	# Cortex-A72 specific flags for RPi4
-	CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+	# Enable V4L2 hardware decoding for RPi4
+	V4L2 = 1
+	# Check if we're on ARM architecture for RPi4 specific flags
+	ARCH := $(shell uname -m)
+	ifeq ($(ARCH),aarch64)
+		# Cortex-A72 specific flags for RPi4 on ARM64
+		CFLAGS += -mcpu=cortex-a72
+	else ifneq (,$(filter arm%,$(ARCH)))
+		# 32-bit ARM specific flags
+		CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+	endif
 	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
 	CFLAGS += -DRPI4_OPTIMIZED=1 -DDISPMANX_ENABLED=1 -DUSE_V4L2_DECODER=1
-	LIBS += -lbcm_host
+	# Check if bcm_host library is available before linking
+	ifneq (,$(wildcard /usr/lib/*/libbcm_host.so /usr/local/lib/libbcm_host.so))
+		LIBS += -lbcm_host
+	endif
 endif
 
 # Maximum performance mode (combines all optimizations)
@@ -172,6 +199,20 @@ ifeq ($(MAXPERF),1)
 		LDFLAGS += -fuse-ld=mold
 	else ifneq (,$(shell command -v ld.lld 2>/dev/null))
 		LDFLAGS += -fuse-ld=lld
+	endif
+	# Preserve RPI4 flags if RPI4_OPT is enabled
+	ifeq ($(RPI4_OPT),1)
+		V4L2 = 1
+		ARCH := $(shell uname -m)
+		ifeq ($(ARCH),aarch64)
+			CFLAGS += -mcpu=cortex-a72
+		else ifneq (,$(filter arm%,$(ARCH)))
+			CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+		endif
+		CFLAGS += -DRPI4_OPTIMIZED=1 -DDISPMANX_ENABLED=1 -DUSE_V4L2_DECODER=1
+		ifneq (,$(wildcard /usr/lib/*/libbcm_host.so /usr/local/lib/libbcm_host.so))
+			LIBS += -lbcm_host
+		endif
 	endif
 endif
 
@@ -226,23 +267,27 @@ sanitize: clean $(APP)
 	@echo "Built sanitize (ASAN+UBSAN) binary: $(APP)"
 
 # Raspberry Pi 4 optimized build
-rpi4: RPI4_OPT=1
-rpi4: clean $(APP)
+rpi4:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) RPI4_OPT=1
+	@echo "Built RPi4 optimized binary: $(APP)"
 
 # Maximum performance build
-maxperf: MAXPERF=1
-maxperf: clean $(APP)
+maxperf:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) MAXPERF=1
+	@echo "Built maximum performance binary: $(APP)"
 
 # RPi4 optimized with maximum performance
-rpi4-maxperf: RPI4_OPT=1
-rpi4-maxperf: MAXPERF=1
-rpi4-maxperf: clean $(APP)
+rpi4-maxperf:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1
 	@echo "Built RPi4 optimized binary with max performance: $(APP)"
 
 # Release build for RPi4 with maximum performance and stripped binary
-rpi4-release: RPI4_OPT=1
-rpi4-release: MAXPERF=1
-rpi4-release: clean $(APP)
+rpi4-release:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 V4L2=1
 	strip -s $(APP)
 	@echo "Built and stripped RPi4 optimized binary with max performance: $(APP)"
 	@ls -lh $(APP)

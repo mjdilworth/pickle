@@ -8,6 +8,8 @@
 #include <stddef.h>
 
 #if defined(USE_V4L2_DECODER)
+#define _GNU_SOURCE
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -90,12 +92,14 @@ bool v4l2_decoder_check_format(v4l2_codec_t codec) {
 
 // Check if any V4L2 M2M decoder is available
 bool v4l2_decoder_is_supported(void) {
+    fprintf(stderr, "[DEBUG] V4L2 decoder support check starting...\n");
     // Try all common V4L2 M2M device paths
     const char *dev_paths[] = {
         "/dev/video0",
         "/dev/video1",
         "/dev/video10",
         "/dev/video11",
+        "/dev/video19", // Add HEVC decoder
         NULL
     };
     
@@ -107,17 +111,22 @@ bool v4l2_decoder_is_supported(void) {
         
         struct v4l2_capability cap;
         if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+            fprintf(stderr, "[DEBUG] Device %s: capabilities=0x%08x\n", dev_paths[i], cap.capabilities);
             if ((cap.capabilities & V4L2_CAP_VIDEO_M2M_MPLANE) || 
                 (cap.capabilities & V4L2_CAP_VIDEO_M2M)) {
                 LOG_INFO("Found M2M device: %s", dev_paths[i]);
+                fprintf(stderr, "[DEBUG] V4L2 hardware decoder FOUND and SUPPORTED!\n");
                 close(fd);
                 return true;
             }
+        } else {
+            fprintf(stderr, "[DEBUG] Device %s: ioctl failed\n", dev_paths[i]);
         }
         
         close(fd);
     }
     
+    fprintf(stderr, "[DEBUG] V4L2 decoder support check completed - NO DEVICES FOUND\n");
     LOG_INFO("No V4L2 M2M devices found");
     return false;
 }
@@ -143,7 +152,7 @@ bool v4l2_decoder_init(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t width, 
     
     bool found = false;
     for (int i = 0; dev_paths[i] != NULL; i++) {
-        dec->fd = open(dev_paths[i], O_RDWR);
+        dec->fd = open(dev_paths[i], O_RDWR | O_NONBLOCK);
         if (dec->fd < 0) {
             continue;
         }
@@ -181,6 +190,7 @@ bool v4l2_decoder_init(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t width, 
             }
         }
         
+        // Only close if we didn't find a suitable device
         close(dec->fd);
         dec->fd = -1;
     }
@@ -216,9 +226,13 @@ bool v4l2_decoder_init(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t width, 
         return false;
     }
     
+    // Set initialized flag before configuring formats
+    dec->initialized = true;
+    
     // Configure input and output formats
     if (!v4l2_decoder_set_format(dec, codec, width, height)) {
         LOG_ERROR("Failed to set input format");
+        dec->initialized = false;
         close(dec->fd);
         dec->fd = -1;
         return false;
@@ -227,12 +241,11 @@ bool v4l2_decoder_init(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t width, 
     // Set default output format to NV12 (widely supported)
     if (!v4l2_decoder_set_output_format(dec, V4L2_PIX_FMT_NV12)) {
         LOG_ERROR("Failed to set output format");
+        dec->initialized = false;
         close(dec->fd);
         dec->fd = -1;
         return false;
     }
-    
-    dec->initialized = true;
     
     return true;
 }
@@ -290,8 +303,12 @@ void v4l2_decoder_destroy(v4l2_decoder_t *dec) {
 
 // Set input format for the decoder
 bool v4l2_decoder_set_format(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t width, uint32_t height) {
-    if (!dec || !dec->initialized) {
-        LOG_ERROR("Decoder not initialized");
+    if (!dec) {
+        LOG_ERROR("Decoder is NULL");
+        return false;
+    }
+    if (!dec->initialized) {
+        LOG_ERROR("Decoder not initialized (initialized=%d, fd=%d)", dec->initialized, dec->fd);
         return false;
     }
     

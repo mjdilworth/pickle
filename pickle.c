@@ -1353,18 +1353,18 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	}
 	
 	// Frame rate limiting to prevent overwhelming the decoder
-	struct timespec current_time;
-	clock_gettime(CLOCK_MONOTONIC, &current_time);
-	
+	struct timeval current_time;
+	gettimeofday(&current_time, NULL);
+
 #ifdef USE_V4L2_DECODER
 	if (p->use_demuxer && p->demuxer.fps > 0) {
 		// Calculate target frame interval based on demuxer FPS
 		double target_interval_ms = 1000.0 / p->demuxer.fps;
 		
-		if (last_frame_time.tv_sec != 0) {
+		if (g_last_frame_time.tv_sec != 0) {
 			// Calculate time since last frame
-			double elapsed_ms = (current_time.tv_sec - last_frame_time.tv_sec) * 1000.0 +
-								(current_time.tv_nsec - last_frame_time.tv_nsec) / 1000000.0;
+			double elapsed_ms = (current_time.tv_sec - g_last_frame_time.tv_sec) * 1000.0 +
+								(current_time.tv_usec - g_last_frame_time.tv_usec) / 1000.0;
 			
 			// If we're processing too fast, add a small delay
 			if (elapsed_ms < target_interval_ms) {
@@ -1382,7 +1382,7 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 			}
 		}
 		
-		last_frame_time = current_time;
+		g_last_frame_time = current_time;
 	} else {
 	// Add minimum delay to prevent overwhelming the terminal/system
 	struct timespec min_sleep = {0, 5000000}; // 5ms minimum (reduced for better responsiveness)
@@ -1943,8 +1943,9 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	
 	// Process a frame from the V4L2 decoder
 	if (!process_v4l2_frame(p)) {
-        // No new frame available
-        return false;
+        // No new frame available - this is normal, just return success
+        // so the main loop continues with proper timeout handling
+        return true;
     }
     
     // Check for active frame
@@ -2664,20 +2665,20 @@ int main(int argc, char **argv) {
 	static struct option long_options[] = {
 		{"loop", no_argument, NULL, 'l'},
 		{"help", no_argument, NULL, 'h'},
-		{"v4l2", no_argument, NULL, 'v'},
+		{"no-v4l2", no_argument, NULL, 'm'},
 		{"no-vsync", no_argument, NULL, 'n'},
 		{"high-performance", no_argument, NULL, 'p'},
 		{0, 0, 0, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "lhvnp", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "lhmnp", long_options, NULL)) != -1) {
 		switch (opt) {
 			case 'l':
 				g_loop_playback = 1;
 				break;
-			case 'v':
-				g_use_v4l2_decoder = 1;
+			case 'm':
+				g_use_v4l2_decoder = -1;  // Explicitly disable V4L2
 				break;
 			case 'n':
 				g_vsync_enabled = 0;
@@ -2693,10 +2694,11 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
-				fprintf(stderr, "  -v, --v4l2            Use V4L2 hardware decoder (RPi4 only)\n");
+				fprintf(stderr, "  -m, --no-v4l2         Force MPV decoder (disable V4L2 hardware acceleration)\n");
 				fprintf(stderr, "  -n, --no-vsync        Disable VSync for maximum framerate\n");
 				fprintf(stderr, "  -p, --high-performance Enable high-performance mode (no VSync, continuous render)\n");
 				fprintf(stderr, "  -h, --help            Show this help message\n");
+				fprintf(stderr, "\nNote: V4L2 hardware acceleration is used automatically when available.\n");
 				return 0;
 			default:
 				fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
@@ -2885,22 +2887,52 @@ int main(int argc, char **argv) {
     }
 
 	
-	// Initialize either MPV or V4L2 decoder based on flag
+	// Try V4L2 hardware decoder first (if built with V4L2 support), fallback to MPV
+#ifdef USE_V4L2_DECODER
+	bool v4l2_attempted = false;
+	if (g_use_v4l2_decoder == 0) {
+		// Auto-enable V4L2 when available, unless explicitly disabled
+		if (v4l2_decoder_is_supported()) {
+			LOG_INFO("V4L2 hardware decoder available, using it for better performance");
+			g_use_v4l2_decoder = 1;
+		}
+	} else if (g_use_v4l2_decoder == -1) {
+		// Explicitly disabled via command line
+		LOG_INFO("V4L2 hardware decoder disabled via command line flag");
+		g_use_v4l2_decoder = 0;
+	}
+	
 	if (g_use_v4l2_decoder) {
+		v4l2_attempted = true;
 		// Check if V4L2 decoder is supported
 		if (!v4l2_decoder_is_supported()) {
-			LOG_ERROR("V4L2 decoder not supported on this platform. Falling back to MPV.");
+			LOG_WARN("V4L2 decoder not supported on this platform. Falling back to MPV.");
 			g_use_v4l2_decoder = 0;
-			if (!init_mpv(&player, file)) RET("init_mpv");
-			g_mpv_wakeup = 1;
 		} else {
-			if (!init_v4l2_decoder(&v4l2_player, file)) RET("init_v4l2_decoder");
+			if (!init_v4l2_decoder(&v4l2_player, file)) {
+				LOG_WARN("V4L2 decoder initialization failed. Falling back to MPV.");
+				g_use_v4l2_decoder = 0;
+			}
 		}
-	} else {
+	}
+	
+	// Fall back to MPV if V4L2 is not used or failed
+	if (!g_use_v4l2_decoder) {
+		if (v4l2_attempted) {
+			LOG_INFO("Initializing MPV decoder as fallback");
+		} else {
+			LOG_INFO("Initializing MPV decoder");
+		}
 		if (!init_mpv(&player, file)) RET("init_mpv");
 		// Prime event processing in case mpv already queued wakeups before pipe creation.
 		g_mpv_wakeup = 1;
 	}
+#else
+	// No V4L2 support compiled in, use MPV directly
+	LOG_INFO("Initializing MPV decoder (V4L2 support not compiled in)");
+	if (!init_mpv(&player, file)) RET("init_mpv");
+	g_mpv_wakeup = 1;
+#endif
 
 	fprintf(stderr, "Playing %s at %dx%d %.2f Hz using %s\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
 			(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal)),
@@ -3017,7 +3049,7 @@ int main(int argc, char **argv) {
 			}
 		} else {
 			// V4L2 decoder specific handling
-			// Periodically force a frame update for V4L2 decoder
+			// Periodic frame processing at video frame rate, but not constant polling
 			struct timeval now;
 			gettimeofday(&now, NULL);
 			static struct timeval last_v4l2_update = {0, 0};
@@ -3027,7 +3059,15 @@ int main(int argc, char **argv) {
 			double elapsed = tv_diff(&now, &last_v4l2_update) * 1000.0; // ms
 			double frame_interval_ms = 1000.0 / g_video_fps; // Adaptive frame interval
 			if (elapsed > frame_interval_ms) {
-				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+				// Only check for frames at the video frame rate, not constantly
+				if (v4l2_player.decoder) {
+					// Quick non-blocking check if V4L2 decoder has frames ready
+					int poll_result = v4l2_decoder_poll(v4l2_player.decoder, 0);
+					if (poll_result > 0) {
+						// V4L2 decoder has frames available, request a render
+						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
+					}
+				}
 				last_v4l2_update = now;
 			}
 		}

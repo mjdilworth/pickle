@@ -7,6 +7,8 @@
 
 // Only include videodev2.h when V4L2 is enabled
 #if defined(USE_V4L2_DECODER)
+#define _GNU_SOURCE
+#include <time.h>
 #include <linux/videodev2.h>
 #endif
 

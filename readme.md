@@ -238,7 +238,7 @@ The HVS keystone feature requires:
 
 To get the best performance with HVS keystone:
 ```
-make RELEASE=1 MAXPERF=1 RPI4_OPT=1
+make RELEASE=1 MAXPERF=1 RPI4_OPT=1 rpi4-release
 PICKLE_KEYSTONE=1 ./pickle video.mp4
 ```
 
@@ -400,3 +400,13 @@ connect <MAC_ADDRESS>
 
 
 sudo ddrescue -b 32M -v /dev/sda /home/dilly/Projects/pickle/images/rpi4_backup.img /home/dilly/Projects/pickle/images/rpi4_backup.log
+
+
+
+ffmpeg -i vid.mp4 -c:v h264_videotoolbox -profile:v baseline -pix_fmt yuv420p -c:a copy rpi4-a.mp4
+
+ ffmpeg -i vid.mp4 -c:v libx264 -b:v 8M -profile:v main -level 4.2 -pix_fmt yuv420p -crf 20 -bf 0 -c:a copy rpi4-e.mp4
+
+best
+
+ffmpeg -i vid.mp4   -c:v libx264 -profile:v baseline -level:v 4.2 -preset slow -crf 18   -maxrate 8M -bufsize 16M -r 60 -g 60 -bf 2 -pix_fmt yuv420p   -colorspace unknown -color_primaries unknown -color_trc unknown   -movflags +faststart   vid-a.mp4
