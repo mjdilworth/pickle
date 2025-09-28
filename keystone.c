@@ -662,20 +662,30 @@ int get_keystone_selected_corner(void) {
 bool keystone_handle_key(char key) {
     LOG_INFO("Keystone handler received key: %d (0x%02x) '%c'", 
              (int)key, (int)key, (key >= 32 && key < 127) ? key : '?');
-             
-    if (!g_keystone.enabled) {
-        // Special case to enable keystone mode with 'k'
-        if (key == 'k') {
-            g_keystone.enabled = true;
-            g_keystone.active_corner = 0;
-            // Border remains hidden by default
-            keystone_update_matrix();
-            LOG_INFO("Keystone correction enabled, adjusting corner %d", 
-                    g_keystone.active_corner + 1);
-            fprintf(stderr, "\rKeystone correction enabled, use arrow keys to adjust corner %d", 
-                   g_keystone.active_corner + 1);
+    
+    // Handle keys that work regardless of keystone mode
+    switch (key) {
+        case 'v': // Toggle stats overlay (available always)
+            g_show_stats_overlay = !g_show_stats_overlay;
+            fprintf(stderr, "\rStats overlay %s\n", g_show_stats_overlay ? "enabled" : "disabled");
             return true;
-        }
+        case 'k': // Toggle keystone mode
+            g_keystone.enabled = !g_keystone.enabled;
+            if (g_keystone.enabled) {
+                g_keystone.active_corner = 0;
+                keystone_update_matrix();
+                LOG_INFO("Keystone correction enabled, adjusting corner %d", 
+                        g_keystone.active_corner + 1);
+                fprintf(stderr, "\rKeystone correction enabled, use arrow keys to adjust corner %d", 
+                       g_keystone.active_corner + 1);
+            } else {
+                fprintf(stderr, "\rKeystone correction disabled\n");
+            }
+            return true;
+    }
+    
+    // Handle keystone-specific keys only when keystone mode is enabled
+    if (!g_keystone.enabled) {
         return false;
     }
     
@@ -757,14 +767,6 @@ bool keystone_handle_key(char key) {
                     fprintf(stderr, "\rKeystone configuration also saved to %s\n", config_path);
                 }
             }
-            return true;
-        case 'k': // Toggle keystone mode
-            g_keystone.enabled = !g_keystone.enabled;
-            fprintf(stderr, "\rKeystone correction %s\n", g_keystone.enabled ? "enabled" : "disabled");
-            return true;
-        case 'v': // Toggle stats overlay
-            g_show_stats_overlay = !g_show_stats_overlay;
-            fprintf(stderr, "\rStats overlay %s\n", g_show_stats_overlay ? "enabled" : "disabled");
             return true;
         // Remove handling of raw ESC key here since it's part of arrow key sequences
         // and is already properly handled in event_callbacks.c

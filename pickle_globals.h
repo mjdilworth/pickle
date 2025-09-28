@@ -29,6 +29,7 @@ extern int g_mpv_pipe[2];
 void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data);
 void drain_mpv_events(mpv_handle *h);
 bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ctx_t *drm, egl_ctx_t *eglc);
+GLuint get_mpv_texture(void);
 bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p);
 void show_help_overlay(mpv_handle *mpv);
 void hide_help_overlay(mpv_handle *mpv);

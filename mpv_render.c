@@ -13,6 +13,13 @@ static int g_mpv_texture_width = 0;
 static int g_mpv_texture_height = 0;
 
 /**
+ * Get the current MPV texture (for keystone rendering)
+ */
+GLuint get_mpv_texture(void) {
+    return g_mpv_texture;
+}
+
+/**
  * Create or resize MPV render texture
  */
 static bool ensure_mpv_texture(int width, int height) {
@@ -112,16 +119,9 @@ bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ctx_t *dr
     if (result >= 0) {
         // Check if keystone correction is enabled
         if (g_keystone.enabled) {
-            // When keystone is enabled, provide the MPV texture to the keystone pipeline
-            // instead of rendering directly to screen
-            g_keystone_fbo_texture = g_mpv_texture;
-            
-            // The keystone rendering will happen later in the main render loop
-            // Just clear the screen here and let keystone handle the transformed rendering
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            
-            return true; // Success - keystone pipeline will handle the actual rendering
+            // For keystone mode, we still need to render to our texture first
+            // The keystone pipeline will read from g_mpv_texture
+            return true; // Success - MPV has rendered to g_mpv_texture
         } else {
             // No keystone - render directly to screen using our video pipeline
             float src_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full texture

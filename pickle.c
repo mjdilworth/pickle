@@ -58,6 +58,8 @@ extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ct
 #include "drm.h"
 #include "egl.h"
 #include "stats_overlay.h"
+#include "gl_optimize.h"
+#include "decoder_pacing.h"
 
 // For event-driven architecture
 #ifdef EVENT_DRIVEN_ENABLED
@@ -925,6 +927,10 @@ static void stats_log_periodic(mpv_player_t *p) {
 	fprintf(stderr, "[stats] total=%.2fs frames=%llu avg_fps=%.2f inst_fps=%.2f dropped_dec=%lld dropped_vo=%lld\n",
 			total, (unsigned long long)frames_now, avg_fps, inst_fps,
 			(long long)drop_dec, (long long)drop_vo);
+	
+	// Update adaptive frame pacing
+	decoder_pacing_update(avg_fps, (uint64_t)drop_vo);
+	
 	g_stats_last = now;
 	g_stats_last_frames = frames_now;
 }
@@ -1087,13 +1093,27 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 		log_opt_result("cache-secs", r);
 	} else {
 		// Smaller cache for lower latency when performance mode
-		r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "16MiB");
+		r = mpv_set_option_string(p->mpv, "demuxer-max-bytes", "8MiB");
 		log_opt_result("demuxer-max-bytes (perf)", r);
-		r = mpv_set_option_string(p->mpv, "cache-secs", "2");
+		r = mpv_set_option_string(p->mpv, "cache-secs", "1");
 		log_opt_result("cache-secs (perf)", r);
-		// Enable aggressive frame dropping for maximum performance
-		r = mpv_set_option_string(p->mpv, "framedrop", "decoder+vo");
-		log_opt_result("framedrop", r);
+		
+		// Limit decoder queue to prevent overruns
+		r = mpv_set_option_string(p->mpv, "vd-queue-max-bytes", "4MiB");
+		log_opt_result("vd-queue-max-bytes", r);
+		r = mpv_set_option_string(p->mpv, "vd-queue-max-samples", "3");
+		log_opt_result("vd-queue-max-samples", r);
+		
+		// Use smart frame dropping - only VO drops, not decoder drops
+		// This reduces waste while maintaining performance
+		r = mpv_set_option_string(p->mpv, "framedrop", "vo");
+		log_opt_result("framedrop (smart)", r);
+		
+		// Optimize threading for performance
+		r = mpv_set_option_string(p->mpv, "vd-lavc-threads", "4");
+		log_opt_result("vd-lavc-threads", r);
+		r = mpv_set_option_string(p->mpv, "ad-lavc-threads", "2");
+		log_opt_result("ad-lavc-threads", r);
 	}
 	
 	// Set a larger audio buffer for smoother audio output
@@ -1185,6 +1205,14 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	}
 	if (cr < 0) { fprintf(stderr, "mpv_render_context_create failed (%d)\n", cr); return false; }
 	fprintf(stderr, "[mpv] Render context OK\n");
+	
+	// Initialize GL state cache for optimizations
+	gl_state_init();
+	
+	// Initialize adaptive frame pacing
+	double initial_fps = g_vsync_enabled ? 30.0 : 50.0; // Conservative targets
+	decoder_pacing_init(initial_fps);
+	
 	mpv_render_context_set_update_callback(p->rctx, on_mpv_events, NULL);
 	mpv_set_wakeup_callback(p->mpv, mpv_wakeup_cb, NULL);
 	const char *cmd[] = {"loadfile", file, NULL};
@@ -1251,9 +1279,13 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	
 #ifdef USE_V4L2_DECODER
 	// Try to initialize MP4 demuxer first
-	fprintf(stderr, "[DEBUG] Attempting MP4 demuxer init for file: %s\n", file);
+	if (g_debug) {
+		fprintf(stderr, "[DEBUG] Attempting MP4 demuxer init for file: %s\n", file);
+	}
 	if (mp4_demuxer_init(&p->demuxer, file)) {
-		fprintf(stderr, "[DEBUG] MP4 demuxer init SUCCESS\n");
+		if (g_debug) {
+			fprintf(stderr, "[DEBUG] MP4 demuxer init SUCCESS\n");
+		}
 		p->use_demuxer = true;
 		
 		// Get stream information from demuxer
@@ -1303,7 +1335,9 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		LOG_INFO("Using MP4 demuxer: %s %dx%d @ %.2f fps", codec_name, p->width, p->height, fps);
 	} else {
 #endif
-		fprintf(stderr, "[DEBUG] MP4 demuxer init FAILED, falling back to raw file\n");
+		if (g_debug) {
+			fprintf(stderr, "[DEBUG] MP4 demuxer init FAILED, falling back to raw file\n");
+		}
 		// Fallback to raw file reading
 #ifdef USE_V4L2_DECODER
 		p->use_demuxer = false;
@@ -2397,12 +2431,16 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	
 	// Debug: Check if we have a valid frame and texture
 	if (p->current_frame.valid) {
-		fprintf(stderr, "[DEBUG] V4L2: Valid frame available, texture=%u\n", p->texture);
+		if (g_debug) {
+			fprintf(stderr, "[DEBUG] V4L2: Valid frame available, texture=%u\n", p->texture);
+		}
 		if (p->texture > 0) {
 			// Render the V4L2 texture to screen using the appropriate pipeline
 			glActiveTexture(GL_TEXTURE0);
 			glBindTexture(GL_TEXTURE_2D, p->texture);
-			fprintf(stderr, "[DEBUG] V4L2: Texture %u bound for rendering\n", p->texture);
+			if (g_debug) {
+				fprintf(stderr, "[DEBUG] V4L2: Texture %u bound for rendering\n", p->texture);
+			}
 			
 			// Use keystone correction if enabled, otherwise render directly
 			if (g_keystone.enabled && g_keystone_shader_program > 0) {
@@ -2414,7 +2452,9 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 			}
 		}
 	} else {
-		fprintf(stderr, "[DEBUG] V4L2: No valid frame available\n");
+		if (g_debug) {
+			fprintf(stderr, "[DEBUG] V4L2: No valid frame available\n");
+		}
 	}
 	
 	// Swap buffers
@@ -2440,9 +2480,15 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	}
 	
 	if (fb_id == 0) {
-		fprintf(stderr, "Failed to find framebuffer for BO\n");
+		if (g_debug) {
+			fprintf(stderr, "[DEBUG] Failed to find framebuffer for BO (ring count=%d)\n", g_fb_ring.count);
+		}
 		gbm_surface_release_buffer(e->gbm_surf, bo);
 		return false;
+	}
+	
+	if (g_debug) {
+		fprintf(stderr, "[DEBUG] Using framebuffer ID %u for page flip\n", fb_id);
 	}
 	
 	// Present the framebuffer using KMS
@@ -2450,7 +2496,11 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	if (d->atomic_supported) {
 		ret = atomic_present_framebuffer(d, fb_id, g_vsync_enabled);
 	} else {
-		drmModePageFlip(d->fd, d->crtc_id, fb_id, g_vsync_enabled ? DRM_MODE_PAGE_FLIP_EVENT : 0, d);
+		int flip_ret = drmModePageFlip(d->fd, d->crtc_id, fb_id, g_vsync_enabled ? DRM_MODE_PAGE_FLIP_EVENT : 0, d);
+		if (flip_ret != 0) {
+			fprintf(stderr, "[ERROR] drmModePageFlip failed: %d (%s)\n", flip_ret, strerror(errno));
+			ret = false;
+		}
 	}
 	
 	// Wait for page flip to complete if using vsync
@@ -2525,7 +2575,9 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	bool use_drm_keystone = false; // Disabled until framebuffer integration is fixed
 	
 	// Initialize keystone shader if needed and enabled (only for software keystone)
-	if (g_keystone.enabled && !use_drm_keystone && g_keystone_shader_program == 0) {
+	// Skip keystone in performance mode if configured to do so
+	bool skip_keystone = should_skip_feature_for_performance("keystone");
+	if (g_keystone.enabled && !skip_keystone && !use_drm_keystone && g_keystone_shader_program == 0) {
 		if (!init_keystone_shader()) {
 			LOG_ERROR("Failed to initialize keystone shader, disabling keystone correction");
 			g_keystone.enabled = false;
@@ -2544,7 +2596,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	glClear(GL_COLOR_BUFFER_BIT);
 	
 	// Ensure reusable FBO exists when software keystone is enabled, sized to current mode
-	if (g_keystone.enabled && !use_drm_keystone) {
+	// Skip FBO management if keystone is disabled for performance
+	if (g_keystone.enabled && !skip_keystone && !use_drm_keystone) {
 		int want_w = (int)d->mode.hdisplay;
 		int want_h = (int)d->mode.vdisplay;
 		bool need_recreate = (g_keystone_fbo == 0) || (g_keystone_fbo_w != want_w) || (g_keystone_fbo_h != want_h);
@@ -2640,8 +2693,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Clear with opaque black
 		glClear(GL_COLOR_BUFFER_BIT);
 		
-		// Force default viewport settings for the FBO rendering
-		glViewport(0, 0, g_keystone_fbo_w, g_keystone_fbo_h);
+		// Force default viewport settings for the FBO rendering (cached)
+		gl_viewport_cached(0, 0, g_keystone_fbo_w, g_keystone_fbo_h);
 		
 		mpv_fbo = (mpv_opengl_fbo){ .fbo = (int)g_keystone_fbo, .w = g_keystone_fbo_w, .h = g_keystone_fbo_h, .internal_format = 0 };
 	} else {
@@ -2670,23 +2723,67 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	}
 	
-	// Render the mpv frame using our video pipeline
-	bool mpv_render_ok = render_frame_mpv(p->mpv, p->rctx, d, e);
-	if (!mpv_render_ok) {
-		// Fallback to direct rendering if our pipeline fails
-		mpv_render_context_render(p->rctx, r_params);
+	// Render the mpv frame
+	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo) {
+		// First let MPV render to its own texture via render_frame_mpv
+		bool mpv_render_ok = render_frame_mpv(p->mpv, p->rctx, d, e);
+		if (!mpv_render_ok) {
+			if (g_debug) fprintf(stderr, "[DEBUG] Keystone: MPV render failed\n");
+			return false;
+		}
+		
+		// Get the MPV texture
+		GLuint mpv_texture = get_mpv_texture();
+		if (mpv_texture == 0) {
+			if (g_debug) fprintf(stderr, "[DEBUG] Keystone: No MPV texture available\n");
+			return false;
+		}
+		
+		// Bind keystone FBO for rendering
+		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
+		
+		// Copy MPV texture to keystone FBO using a simple blit
+		glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
+		glViewport(0, 0, g_keystone_fbo_w, g_keystone_fbo_h);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		
+		// Simple full-screen blit of MPV texture to keystone FBO
+		// This uses the existing video rendering infrastructure
+		float src_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full MPV texture
+		float dst_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full keystone FBO
+		
+		// Render MPV texture to keystone FBO
+		bool blit_ok = render_video_frame(e, mpv_texture, src_rect, dst_rect);
+		if (!blit_ok && g_debug) {
+			fprintf(stderr, "[DEBUG] Keystone: Failed to copy MPV texture %u to FBO\n", mpv_texture);
+		}
+		
+		// Bind framebuffer back to default after copy
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		
+		// Verification complete - FBO ready for keystone rendering
+	} else {
+		// Use our video pipeline for non-keystone rendering
+		bool mpv_render_ok = render_frame_mpv(p->mpv, p->rctx, d, e);
+		if (!mpv_render_ok) {
+			// Fallback to direct rendering if our pipeline fails
+			mpv_render_context_render(p->rctx, r_params);
+		}
 	}
 	
 	// If software keystone is enabled, render the FBO texture with our shader
 	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo && g_keystone_fbo_texture) {
+		// Render keystone corrected video using shaders
+		
 		// Switch back to default framebuffer
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		
-		// Reset viewport to match screen size
-		glViewport(0, 0, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
+		// Reset viewport to match screen size (cached)
+		gl_viewport_cached(0, 0, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
 		
-		// Use our shader program
-		glUseProgram(g_keystone_shader_program);
+		// Use our shader program (cached)
+		gl_use_program_cached(g_keystone_shader_program);
 		
 		// Check for shader attribute locations before using them
 		if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
@@ -2695,8 +2792,10 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
 			g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
 			
-			fprintf(stderr, "DEBUG: Reacquired shader attributes: pos=%d tex=%d u_tex=%d\n", 
-				g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
+			if (g_debug) {
+				fprintf(stderr, "DEBUG: Reacquired shader attributes: pos=%d tex=%d u_tex=%d\n", 
+					g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
+			}
 				
 			if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
 				fprintf(stderr, "ERROR: Failed to get shader attributes\n");
@@ -2704,14 +2803,13 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			}
 		}
 		
-		// Set up texture
+		// Set up texture (cached)
 		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
+		gl_bind_texture_cached(GL_TEXTURE_2D, g_keystone_fbo_texture);
 		glUniform1i(g_keystone_u_texture_loc, 0);
 		
-		// Always enable blending for proper rendering regardless of border state
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		// Always enable blending for proper rendering regardless of border state (cached)
+		gl_enable_blend_cached(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		
 		// Ensure alpha blending is properly handled for video content
 		glDisable(GL_DEPTH_TEST);
@@ -2790,10 +2888,10 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	// Reset texture binding
 	glBindTexture(GL_TEXTURE_2D, 0);
 	
-	// Output debug info after drawing
+	// Check for OpenGL errors after drawing
 	GLenum error = glGetError();
 	if (error != GL_NO_ERROR) {
-		fprintf(stderr, "DEBUG: OpenGL error after drawing keystone texture: %d\n", error);
+		fprintf(stderr, "ERROR: OpenGL error after drawing keystone texture: %d\n", error);
 		// Print more details about the error
 		switch (error) {
 			case GL_INVALID_ENUM: fprintf(stderr, "GL_INVALID_ENUM: An unacceptable value is specified for an enumerated argument\n"); break;
@@ -2809,8 +2907,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
 		glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
-		glDisable(GL_BLEND); // Disable blending after drawing the video
-		glUseProgram(0);
+		gl_disable_blend_cached(); // Disable blending after drawing the video (cached)
+		gl_use_program_cached(0);
 		
 		// Reset texture flip flag after keystone rendering to avoid affecting other renders
 		g_tex_flip_y = 0;
@@ -2831,8 +2929,8 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			v3[0], v3[1], v2[0], v2[1], // bottom edge
 			v2[0], v2[1], v0[0], v0[1], // left edge
 		};
-		// Use border shader
-		glUseProgram(g_border_shader_program);
+		// Use border shader (cached)
+		gl_use_program_cached(g_border_shader_program);
 		glUniform4f(g_border_u_color_loc, 1.0f, 1.0f, 0.0f, 1.0f); // Yellow
 	// Upload a tiny VBO on existing vertex buffer to avoid creating a new one
 		if (g_keystone_vertex_buffer == 0) glGenBuffers(1, &g_keystone_vertex_buffer);
@@ -2890,9 +2988,21 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	}
 	
 	// Render stats overlay if enabled (before buffer swap)
-	if (g_show_stats_overlay) {
+	// Skip stats overlay in performance mode if configured to do so
+	if (g_show_stats_overlay && !should_skip_feature_for_performance("stats_overlay")) {
+		static int debug_stats_counter = 0;
+		if (++debug_stats_counter % 60 == 0) { // Every 60 frames (~1 second)
+			fprintf(stderr, "[STATS-DEBUG] Rendering stats overlay: enabled=%d, screen=%dx%d\n", 
+					g_show_stats_overlay, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
+		}
 		stats_overlay_update(&g_stats_overlay);
 		stats_overlay_render_text(&g_stats_overlay, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
+	} else {
+		static int debug_skip_counter = 0;
+		if (g_show_stats_overlay && ++debug_skip_counter % 60 == 0) { // Every 60 frames (~1 second)
+			fprintf(stderr, "[STATS-DEBUG] Skipping stats overlay: enabled=%d, should_skip=%d\n", 
+					g_show_stats_overlay, should_skip_feature_for_performance("stats_overlay"));
+		}
 	}
 	
 	// Swap buffers to display the rendered frame
@@ -2939,6 +3049,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	}
 
 	// Standard (non-zero-copy) path
+	// Get front buffer for rendering
 	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
 	if (!bo) { fprintf(stderr, "gbm_surface_lock_front_buffer failed\n"); return false; }
 	struct fb_holder *h = gbm_bo_get_user_data(bo);
@@ -2959,7 +3070,9 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		gbm_bo_set_user_data(bo, nh, bo_destroy_handler);
 	}
 	static bool first=true;
+	if (g_debug) fprintf(stderr, "[DEBUG] MPV: first=%d, g_scanout_disabled=%d\n", first, g_scanout_disabled);
 	if (!g_scanout_disabled && first) {
+		if (g_debug) fprintf(stderr, "[DEBUG] MPV: Performing initial modeset with fb_id=%u\n", fb_id);
 		// Initial modeset; retain BO until next successful page flip to avoid premature release while scanning out.
 		bool success = false;
 		
@@ -2973,7 +3086,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		if (!success) {
 			int err = errno;
-			fprintf(stderr, "%s failed (%s)\n", 
+			fprintf(stderr, "[ERROR] MPV: %s failed (%s)\n", 
 				d->atomic_supported ? "atomic_present_framebuffer" : "drmModeSetCrtc", 
 				strerror(err));
 				
@@ -2986,6 +3099,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			}
 			return false;
 		}
+		if (g_debug) fprintf(stderr, "[DEBUG] MPV: Initial modeset successful, setting first=false\n");
 		first=false;
 		g_first_frame_bo = bo; // retain; release after we have performed one page flip on a new frame
 		return true; // do not release now
@@ -3028,15 +3142,20 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			}
 		} else {
 			// Legacy page flip
+			if (g_debug) fprintf(stderr, "[DEBUG] MPV: Calling drmModePageFlip with fb_id=%u\n", fb_id);
 			if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
+				if (g_debug) fprintf(stderr, "[DEBUG] MPV: drmModePageFlip failed: %s\n", strerror(errno));
 				gbm_surface_release_buffer(e->gbm_surf, bo);
 				return false;
+			} else {
+				if (g_debug) fprintf(stderr, "[DEBUG] MPV: drmModePageFlip succeeded\n");
 			}
 		}
 		g_pending_flip = 1; // will release in handler
 		g_pending_flips++;  // increment pending flip count
 	} else {
 		// Offscreen mode: just release BO immediately (no scanout usage).
+		if (g_debug) fprintf(stderr, "[DEBUG] MPV: In offscreen mode - g_scanout_disabled=%d\n", g_scanout_disabled);
 		gbm_surface_release_buffer(e->gbm_surf, bo);
 	}
 	
@@ -3134,7 +3253,8 @@ int main(int argc, char **argv) {
 				g_vsync_enabled = 0;
 				g_triple_buffer = 0;  // Reduce latency
 				setenv("PICKLE_FORCE_RENDER_LOOP", "1", 1);  // Force continuous rendering
-				fprintf(stderr, "High-performance mode: VSync off, continuous rendering enabled\n");
+				gl_optimize_for_performance();  // Enable GL optimizations
+				fprintf(stderr, "High-performance mode: VSync off, continuous rendering, GL optimizations enabled\n");
 				break;
 			case 'h':
 				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
@@ -3575,20 +3695,17 @@ int main(int argc, char **argv) {
 				(double)drm.mode.vrefresh : 
 				(double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal);
 			
-			// Use adaptive timeout based on video FPS for better responsiveness
-			// Aim for half the frame interval to ensure we don't miss frames
-			double fps_for_timing = (g_video_fps > 0) ? g_video_fps : refresh_rate;
-			if (fps_for_timing <= 0) fps_for_timing = 60.0; // Default 60fps
+			// Use adaptive frame pacing for optimal timeout
+			timeout_ms = decoder_pacing_get_timeout_ms();
 			
-			timeout_ms = (int)(500.0 / fps_for_timing); // half frame time in ms
-			
-			// More aggressive bounds for high-FPS content
-			if (timeout_ms < 1) timeout_ms = 1;       // min 1ms (1000fps max)
-			// Adaptive max timeout based on video FPS - no artificial caps
-			int max_timeout = (g_video_fps >= 50.0) ? 8 :   // 8ms for 50+ fps (125fps max)
-			                  (g_video_fps >= 30.0) ? 16 :  // 16ms for 30+ fps (62fps max) 
-			                  33;                            // 33ms for lower fps (30fps max)
-			if (timeout_ms > max_timeout) timeout_ms = max_timeout;
+			// Legacy fallback if adaptive pacing not available
+			if (timeout_ms <= 0) {
+				double fps_for_timing = (g_video_fps > 0) ? g_video_fps : refresh_rate;
+				if (fps_for_timing <= 0) fps_for_timing = 60.0;
+				timeout_ms = (int)(500.0 / fps_for_timing);
+				if (timeout_ms < 1) timeout_ms = 1;
+				if (timeout_ms > 33) timeout_ms = 33;
+			}
 		}
 		
 		// Add a max timeout to avoid being stuck in poll forever even if no events come

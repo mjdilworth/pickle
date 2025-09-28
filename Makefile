@@ -9,8 +9,17 @@
 #   make run VIDEO=video.mp4 - Build and run with specified video
 #   make help    - Show all build options
 #
+# For faster parallel compilation, use:
+#   make -j$(nproc)          - Use all CPU cores
+#   make -j4                 - Use 4 cores
+#   make -j$(nproc) rpi4     - Parallel build with RPi4 optimizations
+#
 # For more information, run 'make help' or see the documentation in docs/
 #
+
+# Parallel compilation support
+# Use make -j$(nproc) for fastest builds or make -j4 for 4 cores
+# This is left to the user to specify to avoid jobserver conflicts
 
 # Modularization Todo:
 
@@ -42,7 +51,7 @@ rpi4-maxperf:
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c v4l2_decoder.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c v4l2_decoder.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c gl_optimize.c decoder_pacing.c
 
 # Add Vulkan modules when enabled
 ifeq ($(VULKAN),1)
@@ -297,6 +306,11 @@ help:
 	echo "  run VIDEO=...        Run with sudo (DRM master)"; \
 	echo "  try-run VIDEO=...    Attempt run without sudo"; \
 	echo "  clean                Remove build artifacts"; \
+	echo ""; \
+	echo "Fast Parallel Builds:"; \
+	echo "  make -j\$$(nproc)       Use all CPU cores (automatic by default)"; \
+	echo "  make -j4             Use 4 cores"; \
+	echo "  make -j\$$(nproc) rpi4  Fast parallel RPi4 optimized build"; \
 	echo ""; \
 	echo "Build Configuration:"; \
 	echo "  release              RPi4 optimized release build (default)"; \

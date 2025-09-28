@@ -470,6 +470,12 @@ static void render_background(int x, int y, int width, int height, int screen_wi
 
 // Render the stats overlay
 void stats_overlay_render_text(stats_overlay_t *stats, int screen_width, int screen_height) {
+    static int debug_render_counter = 0;
+    if (++debug_render_counter % 120 == 0) { // Every 120 frames (~2 seconds)
+        fprintf(stderr, "[DEBUG] Stats overlay render called: screen=%dx%d, fps=%.1f\n", 
+                screen_width, screen_height, stats->current_fps);
+    }
+    
     char text_lines[5][64];
     int num_lines = 5;
     
