@@ -2,7 +2,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 #include <mpv/client.h>
 
 // Global debug flag (defined here)

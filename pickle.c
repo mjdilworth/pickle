@@ -45,6 +45,9 @@
 // Include our refactored modules
 #include "pickle_globals.h"
 
+// External function declarations
+extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ctx_t *drm, egl_ctx_t *eglc);
+
 // Include our refactored modules
 #include "utils.h"
 #include "shader.h"
@@ -87,8 +90,7 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
+#include <GLES3/gl31.h>
 #include <dlfcn.h>
 #include <math.h>
 
@@ -109,7 +111,7 @@
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
 #endif
 
-// OpenGL compatibility defines for matrix operations (not in GLES2 headers)
+// OpenGL compatibility defines for matrix operations (not in GLES3 headers)
 #ifndef GL_PROJECTION
 #define GL_PROJECTION 0x1701
 #endif
@@ -1225,13 +1227,13 @@ static void destroy_mpv(mpv_player_t *p) {
 static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	if (!p) return false;
 	
-	// Check file extension - use MPV directly for container formats
+	// Check file extension - use MPV directly for container formats since demuxer is not implemented
 	const char *ext = strrchr(file, '.');
 	if (ext && (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".mkv") == 0 || 
 	            strcasecmp(ext, ".avi") == 0 || strcasecmp(ext, ".mov") == 0 || 
 	            strcasecmp(ext, ".webm") == 0)) {
-		LOG_INFO("Container format detected (%s), skipping V4L2 and using MPV directly", ext);
-		return false; // Force fallback to MPV
+		LOG_INFO("Container format detected (%s), using MPV directly (V4L2 demuxer not yet implemented)", ext);
+		return false; // Force fallback to MPV until demuxer is implemented
 	}
 	
 	// Check if V4L2 decoder is supported
@@ -1413,14 +1415,22 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
  * 
  * @param p Pointer to V4L2 player structure to clean up
  */
-static void destroy_v4l2_decoder(v4l2_player_t *p) {
+static void destroy_v4l2_decoder(v4l2_player_t *p, egl_ctx_t *e) {
 	if (!p) return;
+	
+	// Clean up current DMA-BUF texture if it exists
+	if (p->current_frame.is_dmabuf_texture && p->current_frame.texture != 0) {
+		destroy_v4l2_dmabuf_texture(e, p->current_frame.texture, p->current_frame.egl_image);
+		p->current_frame.texture = 0;
+		p->current_frame.egl_image = EGL_NO_IMAGE_KHR;
+		p->current_frame.is_dmabuf_texture = false;
+	}
 	
 	if (p->buffer) {
 		free(p->buffer);
 		p->buffer = NULL;
 	}
-	
+
 #ifdef USE_V4L2_DECODER
 	if (p->use_demuxer) {
 		mp4_demuxer_cleanup(&p->demuxer);
@@ -1450,7 +1460,7 @@ static void destroy_v4l2_decoder(v4l2_player_t *p) {
  * @param p Pointer to V4L2 player structure
  * @return true if processing should continue, false to stop playback
  */
-static bool process_v4l2_frame(v4l2_player_t *p) {
+static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 	if (!p || !p->is_active) {
 		return false;
 	}
@@ -1620,24 +1630,8 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
 	}
 #endif
 	
-	// Check if we have any decoded frames available
-	v4l2_decoded_frame_t frame = {0};
-	bool frame_available = v4l2_decoder_get_frame(p->decoder, &frame);
-	
-	if (frame_available) {
-		LOG_DEBUG("Got decoded frame: size=%u, pts=%lld, width=%u, height=%u", 
-			frame.bytesused, (long long)frame.timestamp, frame.width, frame.height);
-		// Normally we would render the frame here
-		got_frame_this_cycle = true;
-		no_frame_cycles = 0;  // Reset counter when we get a frame
-		
-		// Return the buffer back to the decoder for reuse
-		if (!v4l2_decoder_return_frame(p->decoder, &frame)) {
-			LOG_ERROR("Failed to return frame buffer to decoder");
-		}
-	} else {
-		LOG_DEBUG("No decoded frame available yet");
-	}
+	// Remove redundant frame check - we'll check for frames in the poll section below
+	// This prevents unnecessary buffer thrashing that can cause starvation
 	
 	// Poll for decoded frames with timeout and signal checking
 	static int poll_log_counter = 0;
@@ -1665,7 +1659,10 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
             p->current_frame.width = decoded_frame.width;
             p->current_frame.height = decoded_frame.height;
             p->current_frame.format = decoded_frame.format;
+            p->current_frame.stride = p->decoder->stride;
             p->current_frame.buf_index = decoded_frame.buf_index;
+            p->current_frame.egl_image = EGL_NO_IMAGE_KHR;
+            p->current_frame.is_dmabuf_texture = false;
             
             LOG_INFO("Got frame: %dx%d timestamp: %ld, dmabuf_fd: %d", 
                      decoded_frame.width, decoded_frame.height, decoded_frame.timestamp, decoded_frame.dmabuf_fd);
@@ -1680,13 +1677,40 @@ static bool process_v4l2_frame(v4l2_player_t *p) {
             // Create/update OpenGL texture with frame data
             if (decoded_frame.dmabuf_fd >= 0) {
                 LOG_INFO("V4L2: Processing DMA-BUF frame (fd=%d)", decoded_frame.dmabuf_fd);
-                // We have a DMA-BUF frame, create an EGL texture from it
-                // This code would depend on your EGL/DMA-BUF implementation
-                // Use the create_dmabuf_texture function if available
                 
-                // For now, just set the texture ID (placeholder)
-                // In a real implementation, you would create an actual texture
-                p->current_frame.texture = p->texture;
+                // Create OpenGL texture directly from V4L2 DMA-BUF (zero-copy)
+                GLuint dmabuf_texture = 0;
+                EGLImageKHR dmabuf_image = EGL_NO_IMAGE_KHR;
+                
+                if (create_texture_from_v4l2_dmabuf(e, decoded_frame.dmabuf_fd,
+                                                    decoded_frame.width, decoded_frame.height,
+                                                    p->decoder->stride, decoded_frame.format,
+                                                    &dmabuf_texture, &dmabuf_image)) {
+                    // Successfully created zero-copy texture from DMA-BUF
+                    static int zero_copy_success_counter = 0;
+                    if (++zero_copy_success_counter % 100 == 1) {
+                        LOG_INFO("V4L2: Created zero-copy DMA-BUF texture %u from fd %d (count: %d)",
+                                 dmabuf_texture, decoded_frame.dmabuf_fd, zero_copy_success_counter);
+                    }
+                    
+                    // Clean up previous texture if it was a DMA-BUF texture
+                    if (p->current_frame.is_dmabuf_texture && p->current_frame.texture != 0) {
+                        destroy_v4l2_dmabuf_texture(e, p->current_frame.texture, p->current_frame.egl_image);
+                    }
+                    
+                    p->current_frame.texture = dmabuf_texture;
+                    p->current_frame.egl_image = dmabuf_image;
+                    p->current_frame.is_dmabuf_texture = true;
+                } else {
+                    LOG_ERROR("V4L2: Failed to create texture from DMA-BUF fd %d, falling back to memory copy", decoded_frame.dmabuf_fd);
+                    // Fall back to memory-mapped data if available
+                    if (decoded_frame.data) {
+                        if (convert_nv12_to_rgb_texture_gpu(&decoded_frame, &p->texture)) {
+                            p->current_frame.texture = p->texture;
+                            p->current_frame.is_dmabuf_texture = false;
+                        }
+                    }
+                }
             } else if (decoded_frame.data) {
                 LOG_INFO("V4L2: Processing memory-mapped NV12 frame (data=%p, size=%u)", decoded_frame.data, decoded_frame.bytesused);
                 
@@ -2338,7 +2362,7 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	glClear(GL_COLOR_BUFFER_BIT);
 	
 	// Process a frame from the V4L2 decoder
-	if (!process_v4l2_frame(p)) {
+	if (!process_v4l2_frame(p, e)) {
         // No new frame available - this is normal, just return success
         // so the main loop continues with proper timeout handling
         return true;
@@ -2646,8 +2670,12 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	}
 	
-	// Render the mpv frame
-	mpv_render_context_render(p->rctx, r_params);
+	// Render the mpv frame using our video pipeline
+	bool mpv_render_ok = render_frame_mpv(p->mpv, p->rctx, d, e);
+	if (!mpv_render_ok) {
+		// Fallback to direct rendering if our pipeline fails
+		mpv_render_context_render(p->rctx, r_params);
+	}
 	
 	// If software keystone is enabled, render the FBO texture with our shader
 	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo && g_keystone_fbo_texture) {
@@ -2690,6 +2718,10 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		
 		// Clear any previous OpenGL errors
 		while (glGetError() != GL_NO_ERROR);
+		
+		// For video content rendered through keystone, we need to flip Y coordinates
+		// because MPV renders to FBO without flipping (mpv_flip_y = 0 when keystone enabled)
+		g_tex_flip_y = 1;
 		
 		// Correct warping approach: Draw a warped quad where vertices match the keystone corners
 		// Convert keystone points from normalized [0,1] space to clip space [-1,1]
@@ -2779,6 +2811,9 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glDisable(GL_BLEND); // Disable blending after drawing the video
 		glUseProgram(0);
+		
+		// Reset texture flip flag after keystone rendering to avoid affecting other renders
+		g_tex_flip_y = 0;
 	}
 	
 	// Draw border around the keystone quad if enabled (software keystone only)
@@ -2805,7 +2840,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glBufferData(GL_ARRAY_BUFFER, sizeof(lines), lines, GL_DYNAMIC_DRAW);
 		glEnableVertexAttribArray((GLuint)g_border_a_position_loc);
 		glVertexAttribPointer((GLuint)g_border_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-	// Set line width (may be clamped to 1 on some GLES2 drivers)
+	// Set line width (may be clamped to 1 on some GLES drivers)
 	glLineWidth((GLfloat)g_border_width);
 	// Draw 4 line segments (each pair of vertices forms a segment)
 		glDrawArrays(GL_LINES, 0, 8);
@@ -2816,7 +2851,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	}
 	
 	// Draw corner markers for keystone adjustment if enabled (software keystone only)
-	// This is simplistic and would need a shader-based approach for proper GLES2 implementation
+	// This is simplistic and would need a shader-based approach for proper GLES implementation
 	if (g_keystone.enabled && !use_drm_keystone && g_show_corner_markers) {
 		// Draw colored markers at each corner position to show their current locations
 		int corner_size = 10;
@@ -3813,7 +3848,7 @@ int main(int argc, char **argv) {
 	keystone_cleanup();
 	
 	if (g_use_v4l2_decoder) {
-		destroy_v4l2_decoder(&v4l2_player);
+		destroy_v4l2_decoder(&v4l2_player, &eglc);
 	} else {
 		destroy_mpv(&player);
 	}
@@ -3835,7 +3870,7 @@ fail:
 	keystone_cleanup();
 	
 	if (g_use_v4l2_decoder) {
-		destroy_v4l2_decoder(&v4l2_player);
+		destroy_v4l2_decoder(&v4l2_player, &eglc);
 	} else {
 		destroy_mpv(&player);
 	}

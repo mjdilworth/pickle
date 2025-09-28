@@ -3,7 +3,9 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include "v4l2_decoder.h"
 
 #ifdef USE_V4L2_DECODER
@@ -40,9 +42,12 @@ typedef struct {
         int dmabuf_fd;           // DMA-BUF file descriptor for current frame
         uint32_t width;          // Frame width
         uint32_t height;         // Frame height
+        uint32_t stride;         // Frame stride/pitch in bytes
         uint32_t format;         // Frame format
         GLuint texture;          // OpenGL texture for current frame
         int buf_index;           // Buffer index for returning to decoder
+        EGLImageKHR egl_image;   // EGL image handle for DMA-BUF texture cleanup
+        bool is_dmabuf_texture;  // True if texture was created from DMA-BUF
     } current_frame;
 } v4l2_player_t;
 

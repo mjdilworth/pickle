@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 #include <linux/limits.h>  // For PATH_MAX
 
 // Global state for keystone correction

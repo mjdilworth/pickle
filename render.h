@@ -2,7 +2,7 @@
 #define PICKLE_RENDER_H
 
 #include <stdbool.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 #include "drm.h"
 #include "egl.h"
 #include "error.h"

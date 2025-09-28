@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
-#include <GLES2/gl2.h>  // For GLubyte type
+#include <GLES3/gl31.h>  // For GLubyte type
 #include <unistd.h>     // For access() function
 #include <sys/utsname.h> // For uname to detect platform
 #include <stdio.h>      // For FILE operations

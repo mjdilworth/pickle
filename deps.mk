@@ -39,5 +39,5 @@ pickle_events.o: pickle_events.c pickle_events.h event.h mpv.h error.h \
 pickle_globals.o: pickle_globals.c pickle_globals.h drm.h egl.h \
  v4l2_player.h v4l2_decoder.h
 mpv_render.o: mpv_render.c pickle_globals.h drm.h egl.h v4l2_player.h \
- v4l2_decoder.h mpv.h error.h
+ v4l2_decoder.h mpv.h error.h keystone.h
 stats_overlay.o: stats_overlay.c stats_overlay.h

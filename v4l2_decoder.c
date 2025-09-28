@@ -349,9 +349,11 @@ bool v4l2_decoder_set_format(v4l2_decoder_t *dec, v4l2_codec_t codec, uint32_t w
     }
     
     if (ioctl(dec->fd, VIDIOC_S_FMT, &fmt) < 0) {
-        LOG_ERROR("Failed to set input format: %s", strerror(errno));
+        LOG_ERROR("Failed to set input format: %s (format=0x%08x, %dx%d)", strerror(errno), v4l2_format, width, height);
         return false;
     }
+    
+    LOG_INFO("Successfully set input format: 0x%08x (%dx%d)", v4l2_format, width, height);
     
     dec->codec = codec;
     dec->width = width;
@@ -387,9 +389,11 @@ bool v4l2_decoder_set_output_format(v4l2_decoder_t *dec, uint32_t pixel_format) 
     }
     
     if (ioctl(dec->fd, VIDIOC_S_FMT, &fmt) < 0) {
-        LOG_ERROR("Failed to set output format: %s", strerror(errno));
+        LOG_ERROR("Failed to set output format: %s (format=0x%08x, %dx%d)", strerror(errno), pixel_format, dec->width, dec->height);
         return false;
     }
+    
+    LOG_INFO("Successfully set output format: 0x%08x (%dx%d)", pixel_format, dec->width, dec->height);
     
     // Get the actual dimensions and format (might be adjusted by the driver)
     if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
@@ -430,6 +434,8 @@ bool v4l2_decoder_allocate_buffers(v4l2_decoder_t *dec, int num_output, int num_
         LOG_ERROR("Decoder not initialized");
         return false;
     }
+    
+    LOG_INFO("Allocating V4L2 buffers: %d output, %d capture", num_output, num_capture);
     
     // Request output (encoded) buffers
     struct v4l2_requestbuffers req;
@@ -611,12 +617,43 @@ bool v4l2_decoder_use_dmabuf(v4l2_decoder_t *dec) {
         LOG_ERROR("Decoder not initialized");
         return false;
     }
+
+#if defined(USE_V4L2_DECODER)
+    // Export all capture buffers as DMA-BUF file descriptors
+    for (int i = 0; i < dec->num_capture_buffers; i++) {
+        struct v4l2_exportbuffer expbuf;
+        CLEAR(expbuf);
+        
+        expbuf.type = dec->capture_type;
+        expbuf.index = i;
+        expbuf.flags = O_RDONLY; // Read-only for GPU texture creation
+        
+        if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            expbuf.plane = 0; // Export the Y plane (main video data)
+        }
+        
+        if (ioctl(dec->fd, VIDIOC_EXPBUF, &expbuf) < 0) {
+            LOG_ERROR("Failed to export buffer %d as DMA-BUF: %s", i, strerror(errno));
+            // Close any previously exported buffers
+            for (int j = 0; j < i; j++) {
+                if (dec->dmabuf_fds[j] >= 0) {
+                    close(dec->dmabuf_fds[j]);
+                    dec->dmabuf_fds[j] = -1;
+                }
+            }
+            return false;
+        }
+        
+        dec->dmabuf_fds[i] = expbuf.fd;
+        LOG_DEBUG("Exported buffer %d as DMA-BUF fd %d", i, expbuf.fd);
+    }
     
-    // TODO: Implement DMABUF export
-    // This requires using V4L2_MEMORY_DMABUF and creating/exporting DMABUFs
-    
-    LOG_WARN("DMABUF export not yet implemented");
+    LOG_INFO("DMA-BUF export enabled successfully for %d buffers", dec->num_capture_buffers);
+    return true;
+#else
+    LOG_ERROR("V4L2 decoder not compiled with DMA-BUF support");
     return false;
+#endif
 }
 
 // Start the decoder
@@ -678,7 +715,7 @@ bool v4l2_decoder_start(v4l2_decoder_t *dec) {
     dec->next_output_buffer = 0;
     dec->next_capture_buffer = 0;
     
-    LOG_INFO("Decoder streaming started");
+    LOG_INFO("Decoder streaming started successfully");
     
     return true;
 }
@@ -918,6 +955,15 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
         return false;
     }
     
+    // Static counter to track decoder warm-up
+    static int frames_attempted = 0;
+    frames_attempted++;
+    
+    // Give the decoder some time to process initial input before trying to get frames
+    if (frames_attempted < 10) {
+        return false;  // Skip early attempts to allow decoder to warm up
+    }
+    
     // Try to dequeue a capture buffer
     struct v4l2_buffer buf;
     struct v4l2_plane planes[1];
@@ -938,7 +984,13 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
             return false;
         }
         
-        LOG_ERROR("Failed to dequeue capture buffer: %s", strerror(errno));
+        LOG_ERROR("Failed to dequeue capture buffer: %s (errno=%d)", strerror(errno), errno);
+        
+        // For broken pipe, check if device is still valid
+        if (errno == EPIPE) {
+            LOG_ERROR("V4L2 device broken pipe - decoder may have failed internally");
+        }
+        
         return false;
     }
     
@@ -955,14 +1007,19 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
         frame->bytesused = buf.bytesused;
     }
     
-    // TODO: Handle DMA-BUF export
-    frame->dmabuf_fd = -1;
-    
-    // For memory-mapped buffers, get a pointer to the buffer data
-    if (dec->capture_mmap && buf.index < (unsigned int)dec->num_capture_buffers) {
-        frame->data = dec->capture_mmap[buf.index];
+    // Handle DMA-BUF export for zero-copy
+    if (dec->dmabuf_fds && buf.index < (unsigned int)dec->num_capture_buffers && dec->dmabuf_fds[buf.index] >= 0) {
+        frame->dmabuf_fd = dec->dmabuf_fds[buf.index];
+        frame->data = NULL; // No CPU mapping when using DMA-BUF
+        LOG_DEBUG("Frame %d using DMA-BUF fd %d for zero-copy", buf.index, frame->dmabuf_fd);
     } else {
-        frame->data = NULL;
+        frame->dmabuf_fd = -1;
+        // For memory-mapped buffers, get a pointer to the buffer data
+        if (dec->capture_mmap && buf.index < (unsigned int)dec->num_capture_buffers) {
+            frame->data = dec->capture_mmap[buf.index];
+        } else {
+            frame->data = NULL;
+        }
     }
     
     // Remember the buffer index for returning it later  

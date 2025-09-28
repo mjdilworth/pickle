@@ -9,15 +9,180 @@
 
 #include <gbm.h>
 #include <drm_fourcc.h>
+#include <time.h>
+#include <sys/time.h>
+#include <linux/videodev2.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 #include <GLES2/gl2ext.h>
 
 #include "drm.h"
 #include "egl.h"
 #include "log.h"
+
+// EGL DMA-BUF extension function pointers
+static PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = NULL;
+static PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = NULL;
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
+
+/**
+ * Initialize EGL DMA-BUF extension function pointers
+ * 
+ * @param e Pointer to EGL context
+ * @return true on success, false on failure
+ */
+static bool init_dmabuf_extensions(egl_ctx_t *e) {
+    if (!e || eglCreateImageKHR) {
+        return true; // Already initialized
+    }
+    
+    // Check for required extensions
+    const char *egl_extensions = eglQueryString(e->dpy, EGL_EXTENSIONS);
+    if (!egl_extensions || !strstr(egl_extensions, "EGL_EXT_image_dma_buf_import")) {
+        LOG_ERROR("EGL_EXT_image_dma_buf_import extension not supported");
+        return false;
+    }
+    
+    const char *gl_extensions = (const char*)glGetString(GL_EXTENSIONS);
+    if (!gl_extensions || !strstr(gl_extensions, "GL_OES_EGL_image")) {
+        LOG_ERROR("GL_OES_EGL_image extension not supported");
+        return false;
+    }
+    
+    // Get extension function pointers
+    eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    
+    if (!eglCreateImageKHR || !eglDestroyImageKHR || !glEGLImageTargetTexture2DOES) {
+        LOG_ERROR("Failed to get EGL DMA-BUF extension function pointers");
+        return false;
+    }
+    
+    LOG_INFO("EGL DMA-BUF extensions initialized successfully");
+    return true;
+}
+
+/**
+ * Create an OpenGL texture from a V4L2 DMA-BUF file descriptor
+ * 
+ * @param e Pointer to EGL context
+ * @param dmabuf_fd DMA-BUF file descriptor from V4L2
+ * @param width Width of the frame
+ * @param height Height of the frame
+ * @param stride Stride/pitch of the frame in bytes
+ * @param format V4L2 pixel format
+ * @param out_texture Pointer to store the created OpenGL texture ID
+ * @param out_image Pointer to store the EGL image (for cleanup)
+ * @return true on success, false on failure
+ */
+bool create_texture_from_v4l2_dmabuf(egl_ctx_t *e, int dmabuf_fd, uint32_t width, 
+                                      uint32_t height, uint32_t stride, uint32_t format,
+                                      GLuint *out_texture, EGLImageKHR *out_image) {
+    if (!e || dmabuf_fd < 0 || !out_texture || !out_image) {
+        return false;
+    }
+    
+    // Initialize DMA-BUF extensions if not already done
+    if (!init_dmabuf_extensions(e)) {
+        return false;
+    }
+    
+    // Convert V4L2 format to DRM fourcc format
+    uint32_t drm_format;
+    switch (format) {
+        case V4L2_PIX_FMT_NV12:
+            drm_format = DRM_FORMAT_NV12;
+            break;
+        case V4L2_PIX_FMT_YUV420:
+            drm_format = DRM_FORMAT_YUV420;
+            break;
+        case V4L2_PIX_FMT_YUYV:
+            drm_format = DRM_FORMAT_YUYV;
+            break;
+        case V4L2_PIX_FMT_RGB565:
+            drm_format = DRM_FORMAT_RGB565;
+            break;
+        case V4L2_PIX_FMT_XRGB32:
+        case V4L2_PIX_FMT_RGB32:
+            drm_format = DRM_FORMAT_XRGB8888;
+            break;
+        default:
+            LOG_ERROR("Unsupported V4L2 format for DMA-BUF import: 0x%x", format);
+            return false;
+    }
+    
+    // EGL image attributes for DMA-BUF import
+    EGLint attribs[] = {
+        EGL_WIDTH,                     (EGLint)width,
+        EGL_HEIGHT,                    (EGLint)height,
+        EGL_LINUX_DRM_FOURCC_EXT,     (EGLint)drm_format,
+        EGL_DMA_BUF_PLANE0_FD_EXT,    dmabuf_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)stride,
+        EGL_NONE
+    };
+    
+    // Create EGL image from DMA-BUF
+    EGLImageKHR image = eglCreateImageKHR(e->dpy, EGL_NO_CONTEXT,
+                                          EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+    if (image == EGL_NO_IMAGE_KHR) {
+        LOG_ERROR("Failed to create EGL image from V4L2 DMA-BUF fd %d", dmabuf_fd);
+        return false;
+    }
+    
+    // Generate OpenGL texture
+    GLuint texture;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    
+    // Create texture from EGL image
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Check for OpenGL errors
+    GLenum gl_error = glGetError();
+    if (gl_error != GL_NO_ERROR) {
+        LOG_ERROR("OpenGL error creating texture from V4L2 DMA-BUF: 0x%x", gl_error);
+        glDeleteTextures(1, &texture);
+        eglDestroyImageKHR(e->dpy, image);
+        return false;
+    }
+    
+    glBindTexture(GL_TEXTURE_2D, 0);
+    
+    *out_texture = texture;
+    *out_image = image;
+    
+    LOG_DEBUG("Created OpenGL texture %u from V4L2 DMA-BUF fd %d (%ux%u, stride=%u)", 
+              texture, dmabuf_fd, width, height, stride);
+    
+    return true;
+}
+
+/**
+ * Destroy a texture and EGL image created from V4L2 DMA-BUF
+ * 
+ * @param e Pointer to EGL context
+ * @param texture OpenGL texture ID
+ * @param image EGL image handle
+ */
+void destroy_v4l2_dmabuf_texture(egl_ctx_t *e, GLuint texture, EGLImageKHR image) {
+    if (texture != 0) {
+        glDeleteTextures(1, &texture);
+    }
+    
+    if (image != EGL_NO_IMAGE_KHR && e && eglDestroyImageKHR) {
+        eglDestroyImageKHR(e->dpy, image);
+    }
+}
 
 /**
  * Create a GBM buffer object with DMA-BUF export capability

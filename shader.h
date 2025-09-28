@@ -1,7 +1,7 @@
 #ifndef PICKLE_SHADER_H
 #define PICKLE_SHADER_H
 
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 #include <stdbool.h>
 
 // Shader compilation and program linking

@@ -1,7 +1,7 @@
 #ifndef PICKLE_KEYSTONE_H
 #define PICKLE_KEYSTONE_H
 
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 #include <stdbool.h>
 
 // Keystone data structure (contains the projection parameters)

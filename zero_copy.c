@@ -10,7 +10,7 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 
 #include "drm.h"
 #include "egl.h"

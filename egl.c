@@ -7,8 +7,9 @@
 #include <errno.h>
 #include <stdio.h>
 #include <unistd.h> // For close()
-#include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl31.h>
 
 // Define logging macros if not already defined
 #ifndef LOG_EGL

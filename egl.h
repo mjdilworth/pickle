@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>
 #include <GLES2/gl2ext.h>
 #include <gbm.h>
 #include "drm.h"
@@ -100,5 +100,11 @@ bool create_dmabuf_from_bo(egl_ctx_t *e, struct gbm_bo *bo, dmabuf_info_t *dmabu
 void destroy_dmabuf(egl_ctx_t *e, dmabuf_info_t *dmabuf);
 bool create_dmabuf_texture(egl_ctx_t *e, uint32_t width, uint32_t height, uint32_t format, dmabuf_info_t *dmabuf);
 bool render_to_dmabuf(egl_ctx_t *e, dmabuf_info_t *dmabuf, GLuint video_texture, const float src_rect[4], const float dst_rect[4]);
+
+// V4L2 DMA-BUF import functions for zero-copy video rendering
+bool create_texture_from_v4l2_dmabuf(egl_ctx_t *e, int dmabuf_fd, uint32_t width, 
+                                      uint32_t height, uint32_t stride, uint32_t format,
+                                      GLuint *out_texture, EGLImageKHR *out_image);
+void destroy_v4l2_dmabuf_texture(egl_ctx_t *e, GLuint texture, EGLImageKHR image);
 
 #endif // PICKLE_EGL_H
