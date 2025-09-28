@@ -43,6 +43,10 @@ static char g_joystick_name[128];     // Name of the connected joystick
 static struct timeval g_last_js_event_time = {0}; // For debouncing joystick events
 static gamepad_layout_t g_gamepad_layout = GP_LAYOUT_AUTO;
 
+// Periodic gamepad detection
+static struct timeval g_last_gamepad_poll = {0}; // Last time we checked for gamepad
+static const int GAMEPAD_POLL_INTERVAL_MS = 10000; // Check every 10 seconds
+
 // Corner selection
 static int g_selected_corner = -1;
 
@@ -210,6 +214,45 @@ bool init_joystick(void) {
 }
 
 /**
+ * Check if enough time has passed to poll for gamepad again
+ */
+static bool should_poll_gamepad() {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    
+    long elapsed_ms = (now.tv_sec - g_last_gamepad_poll.tv_sec) * 1000 +
+                      (now.tv_usec - g_last_gamepad_poll.tv_usec) / 1000;
+    
+    return elapsed_ms >= GAMEPAD_POLL_INTERVAL_MS;
+}
+
+/**
+ * Lightweight check and connection attempt for gamepad
+ * Called periodically when gamepad is not connected
+ */
+static void try_connect_gamepad() {
+    if (g_joystick_enabled) return; // Already connected
+    
+    if (!should_poll_gamepad()) return; // Too soon to check again
+    
+    // Update last poll time
+    gettimeofday(&g_last_gamepad_poll, NULL);
+    
+    // Try to connect
+    if (init_joystick()) {
+        LOG_INFO("Gamepad connected via periodic polling: %s", g_joystick_name);
+    }
+}
+
+/**
+ * Public function to check for gamepad connection periodically
+ * Should be called from main loop when gamepad is not connected
+ */
+void check_gamepad_connection(void) {
+    try_connect_gamepad();
+}
+
+/**
  * Clean up joystick resources
  */
 void cleanup_joystick(void) {
@@ -250,27 +293,67 @@ bool handle_joystick_event(struct js_event *event) {
     
     // Handle button events
     if (event->type == JS_EVENT_BUTTON) {
+        // Log all button presses for debugging
+        const char* button_names[] = {
+            "A", "B", "X", "Y", "L1", "R1", "SELECT", "START", "L3", "R3", "HOME"
+        };
+        const char* button_name = (event->number < 11) ? button_names[event->number] : "UNKNOWN";
+        if (event->value == 1) {  // Button press (not release)
+            LOG_INFO("Gamepad button pressed: %s (button %d)", button_name, event->number);
+        }
+        
         // Track Start/Select state for quit combo
         if (event->number == JS_BUTTON_START) {
-            if (event->value == 1) { g_js_start_down = true; gettimeofday(&g_js_start_time, NULL); }
+            if (event->value == 1) { 
+                g_js_start_down = true; 
+                gettimeofday(&g_js_start_time, NULL);
+                
+                // Individual START button press - toggle keystone mode
+                // Only if SELECT is not also being held (to avoid interfering with quit combo)
+                if (!g_js_select_down) {
+                    keystone_toggle_enabled();
+                    LOG_INFO("START button: Toggled keystone mode");
+                    return true;
+                }
+            }
             else if (event->value == 0) { g_js_start_down = false; }
         } else if (event->number == JS_BUTTON_SELECT) {
-            if (event->value == 1) { g_js_select_down = true; gettimeofday(&g_js_select_time, NULL); }
+            if (event->value == 1) { 
+                g_js_select_down = true; 
+                gettimeofday(&g_js_select_time, NULL);
+                
+                // Individual SELECT button press - reset keystone
+                // Only if START is not also being held (to avoid interfering with quit combo)
+                if (!g_js_start_down) {
+                    keystone_init(); // Reset to defaults
+                    LOG_INFO("SELECT button: Reset keystone to defaults");
+                    return true;
+                }
+            }
             else if (event->value == 0) { g_js_select_down = false; }
         }
 
-        // If keystone enabled and cycle button is pressed, optionally cycle corners TL->TR->BR->BL
+        // If keystone enabled and cycle button is pressed, cycle corners TL->TR->BR->BL
         if (event->value == 1 && is_keystone_enabled() && g_x_cycle_enabled && event->number == g_cycle_button_code) {
-            int order[4] = {0,1,3,2}; // TL,TR,BR,BL -> next
             int cur = *get_keystone_active_corner_ptr();
             if (cur < 0) cur = g_selected_corner >= 0 ? g_selected_corner : 0;
-            int idx = 0;
-            for (idx = 0; idx < 4; idx++) {
-                if (order[idx] == cur) break;
+            
+            // Cycle through the sequence: TL(0) -> TR(1) -> BR(3) -> BL(2) -> TL(0)
+            int next_corner;
+            switch (cur) {
+                case 0: next_corner = 1; break; // TL -> TR
+                case 1: next_corner = 3; break; // TR -> BR  
+                case 3: next_corner = 2; break; // BR -> BL
+                case 2: next_corner = 0; break; // BL -> TL
+                default: next_corner = 0; break; // Fallback to TL
             }
-            g_selected_corner = order[(idx + 1) % 4];
+            
+            g_selected_corner = next_corner;
             *get_keystone_active_corner_ptr() = g_selected_corner;
-            LOG_INFO("Keystone corner: %d", g_selected_corner);
+            
+            const char* corner_names[] = {"TL", "TR", "BL", "BR"};
+            LOG_INFO("Cycling: %s -> %s (corner %d)", 
+                     corner_names[cur], corner_names[next_corner], next_corner);
             return true;
         }
         
@@ -294,6 +377,13 @@ bool handle_joystick_event(struct js_event *event) {
         // Toggle help display when help button is pressed
         if (event->value == 1 && event->number == g_help_button_code) {
             keystone_toggle_border();
+            return true;
+        }
+        
+        // Toggle border with HOME/Guide button
+        if (event->value == 1 && event->number == JS_BUTTON_HOME) {
+            keystone_toggle_border();
+            LOG_INFO("HOME button: Toggled border display");
             return true;
         }
         
@@ -323,8 +413,13 @@ bool handle_joystick_event(struct js_event *event) {
             return false;
         }
         
-        // Calculate adjustment amount (smaller for fine control)
-        float adjust = (float)event->value / 32767.0f * 0.01f;
+        // Log significant analog movements
+        const char* axis_names[] = {"Left-X", "Left-Y", "Right-X", "Right-Y", "L2", "R2", "D-pad-X", "D-pad-Y"};
+        const char* axis_name = (event->number < 8) ? axis_names[event->number] : "UNKNOWN";
+        LOG_INFO("Gamepad axis moved: %s (axis %d) value=%d", axis_name, event->number, event->value);
+        
+        // Calculate adjustment amount (increased sensitivity for better control)
+        float adjust = (float)event->value / 32767.0f * 0.05f;  // Increased from 0.01f to 0.05f
         
         if (event->number == 0) { // X-axis
             keystone_adjust_corner(g_selected_corner, adjust, 0);

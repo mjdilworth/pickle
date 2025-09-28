@@ -970,12 +970,15 @@ void show_help_overlay(mpv_handle *mpv) {
 		"  m: mesh mode (experimental)\n"
 		"  s/S: save keystone\n"
 		"\nGamepad:\n"
-		"  START: toggle keystone\n"
-		"  Cycle button (default X): corners TL -> TR -> BR -> BL\n"
-		"  Help button (default B): toggle this help\n"
-		"  D-Pad/Left stick: move point\n"
-		"  L1/R1: step -/+    SELECT: reset    Y/Home(Guide): toggle border\n"
-		"  START+SELECT (hold 2s): quit\n";
+		"  START: toggle keystone mode\n"
+		"  SELECT: reset keystone to defaults\n"
+		"  X button: cycle corners (TL -> TR -> BR -> BL)\n"
+		"  B button: toggle border/help display\n"
+		"  HOME/Guide: toggle border display\n"
+		"  Left stick: move selected corner\n"
+		"  L1/R1 together: toggle keystone mode\n"
+		"  L1/R1 individual: adjust step size\n"
+		"  START+SELECT (hold 2s): quit application\n";
 	// Reduce font size and move OSD to top-left with small margins so it fits better
 	if (!g_osd_saved.saved) {
 		int64_t v=0; char *s=NULL;
@@ -3548,12 +3551,15 @@ int main(int argc, char **argv) {
 	// Initialize joystick/gamepad support for 8BitDo controller
 	if (init_joystick()) {
 		LOG_INFO("8BitDo controller detected and enabled for keystone adjustment");
-		LOG_INFO("Controller mappings: START=Toggle keystone mode");
-		LOG_INFO("Cycle button (default X) = Corners TL->TR->BR->BL");
-		LOG_INFO("Help button (default B) = Toggle help overlay");
-	LOG_INFO("D-pad/Left stick=Move corners, L1/R1=Decrease/Increase step size");
-	LOG_INFO("SELECT=Reset keystone, HOME(Guide)=Toggle border");
-	LOG_INFO("START+SELECT (hold 2s)=Quit");
+		LOG_INFO("Controller mappings:");
+		LOG_INFO("  START = Toggle keystone mode");
+		LOG_INFO("  SELECT = Reset keystone to defaults");
+		LOG_INFO("  X button = Cycle corners (TL->TR->BR->BL)");
+		LOG_INFO("  B button = Toggle border/help display");
+		LOG_INFO("  HOME/Guide = Toggle border display");
+		LOG_INFO("  Left stick = Move selected corner");
+		LOG_INFO("  L1+R1 together = Toggle keystone mode");
+		LOG_INFO("  START+SELECT (hold 2s) = Quit application");
 	}
 	
 #ifdef EVENT_DRIVEN_ENABLED
@@ -3773,14 +3779,20 @@ int main(int argc, char **argv) {
 			} else if (is_joystick_enabled() && pfds[i].fd == get_joystick_fd()) {
 				// Handle joystick input
 				struct js_event event;
+				int events_read = 0;
 				while (read(get_joystick_fd(), &event, sizeof(event)) > 0) {
+					events_read++;
 					if (handle_joystick_event(&event)) {
 						// Force a redraw when keystone parameters change
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 					}
 				}
+
 			}
 		}
+		
+		// Periodic gamepad connection check (low resource)
+		check_gamepad_connection();
 		if (g_mpv_wakeup) {
 			g_mpv_wakeup = 0;
 			drain_mpv_events(player.mpv);
