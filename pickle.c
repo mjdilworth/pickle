@@ -61,6 +61,11 @@ extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ct
 #include "gl_optimize.h"
 #include "decoder_pacing.h"
 
+// V4L2 demuxer support
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+#include "v4l2_demuxer.h"
+#endif
+
 // For event-driven architecture
 #ifdef EVENT_DRIVEN_ENABLED
 #include "v4l2_player.h"
@@ -70,7 +75,6 @@ extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ct
 
 #include "v4l2_decoder.h"
 #ifdef USE_V4L2_DECODER
-#include "mp4_demuxer.h"
 #include <libavcodec/avcodec.h>
 #endif
 #include <execinfo.h>
@@ -1258,13 +1262,23 @@ static void destroy_mpv(mpv_player_t *p) {
 static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	if (!p) return false;
 	
-	// Check file extension - use MPV directly for container formats since demuxer is not implemented
+	// Check file extension and demuxer availability
 	const char *ext = strrchr(file, '.');
 	if (ext && (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".mkv") == 0 || 
 	            strcasecmp(ext, ".avi") == 0 || strcasecmp(ext, ".mov") == 0 || 
 	            strcasecmp(ext, ".webm") == 0)) {
-		LOG_INFO("Container format detected (%s), using MPV directly (V4L2 demuxer not yet implemented)", ext);
-		return false; // Force fallback to MPV until demuxer is implemented
+		// Container format detected - check if demuxer is available
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+		if (v4l2_demuxer_is_available()) {
+			LOG_INFO("Container format detected (%s), V4L2 demuxer available - proceeding with hardware decode", ext);
+		} else {
+			LOG_WARN("Container format detected (%s), V4L2 demuxer not available - falling back to MPV", ext);
+			return false;
+		}
+#else
+		LOG_INFO("Container format detected (%s), V4L2 demuxer disabled - using MPV directly", ext);
+		return false; // Demuxer not compiled in, use MPV
+#endif
 	}
 	
 	// Check if V4L2 decoder is supported
@@ -1281,11 +1295,38 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	}
 	
 #ifdef USE_V4L2_DECODER
-	// Try to initialize MP4 demuxer first
-	if (g_debug) {
-		fprintf(stderr, "[DEBUG] Attempting MP4 demuxer init for file: %s\n", file);
+	// V4L2 demuxer temporarily disabled - need packet callback integration
+	p->use_demuxer = false;
+	LOG_INFO("V4L2 demuxer integration not yet complete - using raw stream mode");
+	
+	// TODO: Implement packet callback and full demuxer integration
+	// The demuxer requires a callback function to deliver packets
+	// This needs more integration work with the frame processing pipeline
+	
+#if 0 && defined(ENABLE_V4L2_DEMUXER)
+	// This will be enabled once we implement the packet callback
+	if (v4l2_demuxer_is_available()) {
+		// Need to create a callback function first
+		p->demuxer = v4l2_demuxer_create(file, packet_callback_func, p);
+		if (p->demuxer) {
+			p->use_demuxer = true;
+			LOG_INFO("V4L2 demuxer initialized successfully for container format");
+		} else {
+			LOG_WARN("V4L2 demuxer failed to initialize, falling back to raw stream");
+			p->use_demuxer = false;
+		}
+	} else {
+		p->use_demuxer = false;
 	}
-	if (mp4_demuxer_init(&p->demuxer, file)) {
+#endif
+	
+	if (0) { // Old demuxer code disabled
+		/*
+		// Try to initialize MP4 demuxer first
+		if (g_debug) {
+			fprintf(stderr, "[DEBUG] Attempting MP4 demuxer init for file: %s\n", file);
+		}
+		if (mp4_demuxer_init(&p->demuxer, file)) {
 		if (g_debug) {
 			fprintf(stderr, "[DEBUG] MP4 demuxer init SUCCESS\n");
 		}
@@ -1336,6 +1377,7 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		// Store the detected FPS globally for adaptive frame timing
 		g_video_fps = fps;
 		LOG_INFO("Using MP4 demuxer: %s %dx%d @ %.2f fps", codec_name, p->width, p->height, fps);
+		*/
 	} else {
 #endif
 		if (g_debug) {
@@ -1469,8 +1511,8 @@ static void destroy_v4l2_decoder(v4l2_player_t *p, egl_ctx_t *e) {
 	}
 
 #ifdef USE_V4L2_DECODER
-	if (p->use_demuxer) {
-		mp4_demuxer_cleanup(&p->demuxer);
+	if (p->use_demuxer && p->demuxer) {
+		// v4l2_demuxer_destroy(p->demuxer); // Will implement later
 	}
 #endif
 	
@@ -1521,9 +1563,9 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 	gettimeofday(&current_time, NULL);
 
 #ifdef USE_V4L2_DECODER
-	if (p->use_demuxer && p->demuxer.fps > 0) {
-		// Calculate target frame interval based on demuxer FPS
-		double target_interval_ms = 1000.0 / p->demuxer.fps;
+	if (p->use_demuxer && 0) { // p->demuxer.fps > 0) {
+		// Calculate target frame interval based on demuxer FPS (disabled)
+		double target_interval_ms = 1000.0 / 30.0; // p->demuxer.fps;
 		
 		if (g_last_frame_time.tv_sec != 0) {
 			// Calculate time since last frame
@@ -1595,29 +1637,8 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 			packets_this_frame = 0;
 		}
 		
-		// Only send a packet if we haven't exceeded our limit for this frame
-		if (packets_this_frame < 2) { // Allow max 2 packets per frame processing cycle
-			mp4_packet_t packet;
-		if (mp4_demuxer_get_packet(&p->demuxer, &packet)) {
-			LOG_DEBUG("Got elementary stream packet: size=%zu, pts=%lld, keyframe=%s", 
-					 packet.size, (long long)packet.pts, packet.is_keyframe ? "yes" : "no");
-			
-			// Send elementary stream packet to decoder
-			if (!v4l2_decoder_decode(p->decoder, packet.data, packet.size, packet.pts)) {
-				LOG_ERROR("V4L2 decoder decode failed");
-				log_memory_usage("V4L2-DECODE-FAIL");
-			} else {
-				LOG_DEBUG("Successfully sent %zu bytes (elementary stream) to V4L2 decoder", packet.size);
-				packets_this_frame++;
-			}				// Free packet data
-				mp4_demuxer_free_packet(&packet);
-			} else {
-				// No more packets available (EOF or error)
-				LOG_DEBUG("No more packets from MP4 demuxer");
-			}
-		} else {
-			LOG_DEBUG("Packet rate limiting: skipping packet (sent %d packets this frame)", packets_this_frame);
-		}
+		// Demuxer packet processing disabled for now - skip to fallback mode
+		// (old demuxer code commented out)
 		
 		// Check for stop signal during packet processing
 		if (g_stop) {
@@ -1779,7 +1800,7 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 	
 	// Check if we've reached the end of input and decoder is empty
 #ifdef USE_V4L2_DECODER
-	bool input_finished = p->use_demuxer ? p->demuxer.eof_reached : (p->input_file && feof(p->input_file));
+	bool input_finished = p->use_demuxer ? false : (p->input_file && feof(p->input_file)); // p->demuxer.eof_reached
 #else
 	bool input_finished = (p->input_file && feof(p->input_file));
 #endif
@@ -3793,6 +3814,9 @@ int main(int argc, char **argv) {
 		
 		// Periodic gamepad connection check (low resource)
 		check_gamepad_connection();
+		
+		// Process held D-pad buttons for continuous movement
+		process_dpad_movement();
 		if (g_mpv_wakeup) {
 			g_mpv_wakeup = 0;
 			drain_mpv_events(player.mpv);

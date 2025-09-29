@@ -60,7 +60,7 @@ endif
 
 # Add demuxer module when V4L2 is enabled
 ifeq ($(V4L2),1)
-SOURCES += mp4_demuxer.c
+SOURCES += v4l2_demuxer.c
 endif
 
 OBJECTS  := $(SOURCES:.c=.o)
@@ -73,7 +73,7 @@ endif
 
 # Add demuxer header when V4L2 is enabled
 ifeq ($(V4L2),1)
-HEADERS += mp4_demuxer.h
+HEADERS += v4l2_demuxer.h
 endif
 
 # Toolchain / standards
@@ -162,6 +162,11 @@ endif
 # Check for V4L2 decoder support
 ifeq ($(V4L2),1)
 CFLAGS += -DUSE_V4L2_DECODER=1
+# Enable V4L2 demuxer by default when V4L2 is enabled
+# Set V4L2_DEMUX=0 to disable: make V4L2=1 V4L2_DEMUX=0
+ifneq ($(V4L2_DEMUX),0)
+CFLAGS += -DENABLE_V4L2_DEMUXER=1
+endif
 endif
 
 # Allow CFLAGS to be appended instead of replaced when specified externally

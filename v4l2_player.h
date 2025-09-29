@@ -9,7 +9,7 @@
 #include "v4l2_decoder.h"
 
 #ifdef USE_V4L2_DECODER
-#include "mp4_demuxer.h"
+#include "v4l2_demuxer.h"
 #endif
 
 /**
@@ -31,8 +31,8 @@ typedef struct {
     GLuint texture;              // OpenGL texture for rendering
     
 #ifdef USE_V4L2_DECODER
-    // MP4 demuxer integration (for V4L2 mode)
-    mp4_demuxer_t demuxer;       // MP4 demuxer instance
+    // V4L2 demuxer integration (for V4L2 mode)
+    v4l2_demuxer_t *demuxer;     // V4L2 demuxer instance
     bool use_demuxer;            // Flag indicating demuxer is being used
 #endif
     

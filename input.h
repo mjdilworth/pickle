@@ -28,6 +28,7 @@ typedef enum {
 bool init_joystick(void);
 void cleanup_joystick(void);
 void check_gamepad_connection(void);  // Periodic check for gamepad connection
+void process_dpad_movement(void);     // Process held D-pad for continuous movement
 
 // Event handling
 bool handle_joystick_event(struct js_event *event);

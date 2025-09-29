@@ -47,6 +47,14 @@ static gamepad_layout_t g_gamepad_layout = GP_LAYOUT_AUTO;
 static struct timeval g_last_gamepad_poll = {0}; // Last time we checked for gamepad
 static const int GAMEPAD_POLL_INTERVAL_MS = 10000; // Check every 10 seconds
 
+// D-pad hold-to-move functionality
+static bool g_dpad_up_held = false;
+static bool g_dpad_down_held = false;
+static bool g_dpad_left_held = false;
+static bool g_dpad_right_held = false;
+static struct timeval g_last_dpad_move = {0}; // Last time we moved due to held D-pad
+static const int DPAD_REPEAT_INTERVAL_MS = 50; // Repeat movement every 50ms when held
+
 // Corner selection
 static int g_selected_corner = -1;
 
@@ -245,6 +253,55 @@ static void try_connect_gamepad() {
 }
 
 /**
+ * Process held D-pad buttons for continuous movement
+ * Should be called from main loop to handle hold-to-move functionality
+ */
+void process_dpad_movement(void) {
+    if (!is_keystone_enabled() || g_selected_corner < 0) {
+        return;
+    }
+    
+    // Check if any D-pad direction is held
+    if (!g_dpad_up_held && !g_dpad_down_held && !g_dpad_left_held && !g_dpad_right_held) {
+        return;
+    }
+    
+    // Check if enough time has passed since last movement
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    
+    long elapsed_ms = (now.tv_sec - g_last_dpad_move.tv_sec) * 1000 +
+                      (now.tv_usec - g_last_dpad_move.tv_usec) / 1000;
+    
+    if (elapsed_ms < DPAD_REPEAT_INTERVAL_MS) {
+        return; // Too soon to repeat
+    }
+    
+    // Update last movement time
+    g_last_dpad_move = now;
+    
+    // Apply movement based on held directions (same increment as keyboard)
+    const float move_increment = 0.05f; // Same as keyboard arrows
+    
+    if (g_dpad_up_held) {
+        keystone_adjust_corner(g_selected_corner, 0, -move_increment);
+        LOG_DEBUG("D-pad up held: moving corner %d up", g_selected_corner);
+    }
+    if (g_dpad_down_held) {
+        keystone_adjust_corner(g_selected_corner, 0, move_increment);
+        LOG_DEBUG("D-pad down held: moving corner %d down", g_selected_corner);
+    }
+    if (g_dpad_left_held) {
+        keystone_adjust_corner(g_selected_corner, -move_increment, 0);
+        LOG_DEBUG("D-pad left held: moving corner %d left", g_selected_corner);
+    }
+    if (g_dpad_right_held) {
+        keystone_adjust_corner(g_selected_corner, move_increment, 0);
+        LOG_DEBUG("D-pad right held: moving corner %d right", g_selected_corner);
+    }
+}
+
+/**
  * Public function to check for gamepad connection periodically
  * Should be called from main loop when gamepad is not connected
  */
@@ -405,26 +462,53 @@ bool handle_joystick_event(struct js_event *event) {
     
     // Handle analog stick movements for corner adjustments
     if (event->type == JS_EVENT_AXIS && is_keystone_enabled() && g_selected_corner >= 0) {
-        // Axis 0 = Left stick X, Axis 1 = Left stick Y
-        // Values are -32767 to +32767
+        // Log all axis movements for debugging
+        const char* axis_names[] = {"Left-X", "Left-Y", "Right-X", "Right-Y", "L2", "R2", "D-pad-X", "D-pad-Y"};
+        const char* axis_name = (event->number < 8) ? axis_names[event->number] : "UNKNOWN";
         
-        // Only process significant movements (deadzone)
+        // Handle D-pad axes (6 and 7) for hold-to-move functionality
+        if (event->number == 6) { // D-pad X-axis
+            if (event->value < -16000) {
+                g_dpad_left_held = true;
+                g_dpad_right_held = false;
+            } else if (event->value > 16000) {
+                g_dpad_right_held = true;
+                g_dpad_left_held = false;
+            } else {
+                g_dpad_left_held = false;
+                g_dpad_right_held = false;
+            }
+            LOG_INFO("D-pad X: left=%d right=%d (value=%d)", g_dpad_left_held, g_dpad_right_held, event->value);
+            return true;
+        } else if (event->number == 7) { // D-pad Y-axis
+            if (event->value < -16000) {
+                g_dpad_up_held = true;
+                g_dpad_down_held = false;
+            } else if (event->value > 16000) {
+                g_dpad_down_held = true;
+                g_dpad_up_held = false;
+            } else {
+                g_dpad_up_held = false;
+                g_dpad_down_held = false;
+            }
+            LOG_INFO("D-pad Y: up=%d down=%d (value=%d)", g_dpad_up_held, g_dpad_down_held, event->value);
+            return true;
+        }
+        
+        // Handle analog stick movements (axes 0 and 1) - only for significant movements
         if (abs(event->value) < 8000) {
             return false;
         }
         
-        // Log significant analog movements
-        const char* axis_names[] = {"Left-X", "Left-Y", "Right-X", "Right-Y", "L2", "R2", "D-pad-X", "D-pad-Y"};
-        const char* axis_name = (event->number < 8) ? axis_names[event->number] : "UNKNOWN";
         LOG_INFO("Gamepad axis moved: %s (axis %d) value=%d", axis_name, event->number, event->value);
         
         // Calculate adjustment amount (increased sensitivity for better control)
         float adjust = (float)event->value / 32767.0f * 0.05f;  // Increased from 0.01f to 0.05f
         
-        if (event->number == 0) { // X-axis
+        if (event->number == 0) { // Left stick X-axis
             keystone_adjust_corner(g_selected_corner, adjust, 0);
             return true;
-        } else if (event->number == 1) { // Y-axis
+        } else if (event->number == 1) { // Left stick Y-axis
             keystone_adjust_corner(g_selected_corner, 0, adjust);
             return true;
         }
