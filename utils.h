@@ -9,7 +9,8 @@
 // Logging macros
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) do { if (g_debug) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
+// Provide empty LOG_DEBUG for remaining references (debug disabled in release)
+#define LOG_DEBUG(fmt, ...) do { } while(0)
 
 // Global debug flag (extern declaration)
 extern int g_debug;

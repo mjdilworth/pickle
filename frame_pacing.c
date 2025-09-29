@@ -86,7 +86,6 @@ bool frame_pacing_wait_next_frame(frame_pacing_context_t *ctx) {
     // If we're already late by more than max_frame_lateness_ms, skip this frame
     if (time_until_next_frame_ns < -(ctx->max_frame_lateness_ms * 1000000L)) {
         ctx->frames_skipped++;
-        LOG_DEBUG("Frame skipped: %ld ns late", -time_until_next_frame_ns);
         return false;
     }
     

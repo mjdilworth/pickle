@@ -7,7 +7,6 @@
 
 // Define our own logging macros without including log.h or utils.h
 #define LOG_RENDER_INFO(fmt, ...) fprintf(stderr, "[RENDER INFO] " fmt "\n", ##__VA_ARGS__)
-#define LOG_RENDER_DEBUG(fmt, ...) fprintf(stderr, "[RENDER DEBUG] " fmt "\n", ##__VA_ARGS__)
 #define LOG_RENDER_ERROR(fmt, ...) fprintf(stderr, "[RENDER ERROR] " fmt "\n", ##__VA_ARGS__)
 #define LOG_RENDER_WARN(fmt, ...) fprintf(stderr, "[RENDER WARN] " fmt "\n", ##__VA_ARGS__)
 

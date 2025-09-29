@@ -14,7 +14,7 @@
 #endif
 
 #ifndef LOG_DEBUG
-#define LOG_DEBUG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) do { } while(0)
 #endif
 
 // Domain-specific logging

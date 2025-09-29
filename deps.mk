@@ -1,6 +1,6 @@
 pickle.o: pickle.c drm_keystone.h keystone.h drm.h pickle_globals.h egl.h \
- v4l2_player.h v4l2_decoder.h v4l2_demuxer.h utils.h shader.h input.h \
- compute_keystone.h stats_overlay.h gl_optimize.h decoder_pacing.h
+ v4l2_player.h v4l2_decoder.h utils.h shader.h input.h compute_keystone.h \
+ stats_overlay.h gl_optimize.h decoder_pacing.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
 keystone.o: keystone.c keystone.h utils.h shader.h drm_keystone.h drm.h \
@@ -31,16 +31,15 @@ compute_keystone.o: compute_keystone.c compute_keystone.h keystone.h \
  shader.h utils.h log.h
 event.o: event.c event.h
 event_callbacks.o: event_callbacks.c event_callbacks.h event.h mpv.h \
- error.h keystone.h drm.h v4l2_player.h v4l2_decoder.h v4l2_demuxer.h \
- pickle_globals.h egl.h input.h
+ error.h keystone.h drm.h v4l2_player.h v4l2_decoder.h pickle_globals.h \
+ egl.h input.h
 pickle_events.o: pickle_events.c pickle_events.h event.h mpv.h error.h \
- drm.h v4l2_decoder.h v4l2_player.h v4l2_demuxer.h event_callbacks.h \
- keystone.h pickle_globals.h egl.h input.h
+ drm.h v4l2_decoder.h v4l2_player.h event_callbacks.h keystone.h \
+ pickle_globals.h egl.h input.h
 pickle_globals.o: pickle_globals.c pickle_globals.h drm.h egl.h \
- v4l2_player.h v4l2_decoder.h v4l2_demuxer.h
+ v4l2_player.h v4l2_decoder.h
 mpv_render.o: mpv_render.c pickle_globals.h drm.h egl.h v4l2_player.h \
- v4l2_decoder.h v4l2_demuxer.h mpv.h error.h keystone.h
+ v4l2_decoder.h mpv.h error.h keystone.h
 stats_overlay.o: stats_overlay.c stats_overlay.h
 gl_optimize.o: gl_optimize.c gl_optimize.h log.h
 decoder_pacing.o: decoder_pacing.c decoder_pacing.h log.h
-v4l2_demuxer.o: v4l2_demuxer.c v4l2_demuxer.h log.h

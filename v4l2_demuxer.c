@@ -1,10 +1,11 @@
+#define _GNU_SOURCE
+
 #include "v4l2_demuxer.h"
 #include "log.h"
 
 // Only compile demuxer when enabled
 #if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
 
-#define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -94,7 +95,7 @@ v4l2_demuxer_t* v4l2_demuxer_create(const char *filename,
     for (unsigned int i = 0; i < demuxer->fmt_ctx->nb_streams; i++) {
         if (demuxer->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             demuxer->video_stream = demuxer->fmt_ctx->streams[i];
-            demuxer->video_stream_index = i;
+            demuxer->video_stream_index = (int)i;
             break;
         }
     }
@@ -173,7 +174,6 @@ bool v4l2_demuxer_process_packet(v4l2_demuxer_t *demuxer) {
     
     if (ret < 0) {
         if (ret == AVERROR_EOF) {
-            LOG_DEBUG("V4L2 demuxer: EOF reached");
             demuxer->eof_reached = true;
         } else {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -192,7 +192,7 @@ bool v4l2_demuxer_process_packet(v4l2_demuxer_t *demuxer) {
     // Convert to our packet structure
     v4l2_demuxed_packet_t demux_packet = {0};
     demux_packet.data = packet.data;
-    demux_packet.size = packet.size;
+    demux_packet.size = (size_t)packet.size;
     demux_packet.stream_index = packet.stream_index;
     demux_packet.keyframe = (packet.flags & AV_PKT_FLAG_KEY) != 0;
     
@@ -208,9 +208,6 @@ bool v4l2_demuxer_process_packet(v4l2_demuxer_t *demuxer) {
     } else {
         demux_packet.dts = AV_NOPTS_VALUE;
     }
-    
-    LOG_DEBUG("V4L2 demuxer: Packet size=%zu pts=%ld dts=%ld keyframe=%d",
-              demux_packet.size, (long)demux_packet.pts, (long)demux_packet.dts, demux_packet.keyframe);
     
     // Call user callback
     demuxer->packet_callback(&demux_packet, demuxer->user_data);
@@ -322,7 +319,6 @@ bool v4l2_demuxer_seek(v4l2_demuxer_t *demuxer, int64_t timestamp_us) {
     }
     
     demuxer->eof_reached = false;
-    LOG_DEBUG("V4L2 demuxer: Seek to %ld us successful", (long)timestamp_us);
     return true;
 }
 

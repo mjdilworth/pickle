@@ -45,11 +45,6 @@ bool should_use_zero_copy(kms_ctx_t *d, egl_ctx_t *e) {
     
     // Check if atomic modesetting is supported (preferred for zero-copy)
     if (!d->atomic_supported) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            LOG_DEBUG("Atomic modesetting not supported, zero-copy will use legacy path");
-            logged_once = true;
-        }
         // We can still use zero-copy with legacy modesetting, but it's less efficient
     }
 #endif

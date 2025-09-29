@@ -60,7 +60,7 @@ endif
 
 # Add demuxer module when V4L2 is enabled
 ifeq ($(V4L2),1)
-SOURCES += v4l2_demuxer.c
+SOURCES += v4l2_demuxer.c v4l2_demux_bridge.c v4l2_integration.c
 endif
 
 OBJECTS  := $(SOURCES:.c=.o)
@@ -71,9 +71,9 @@ ifeq ($(VULKAN),1)
 HEADERS += vulkan.h vulkan_utils.h
 endif
 
-# Add demuxer header when V4L2 is enabled
+# Add demuxer headers when V4L2 is enabled
 ifeq ($(V4L2),1)
-HEADERS += v4l2_demuxer.h
+HEADERS += v4l2_demuxer.h v4l2_demux_bridge.h v4l2_integration.h
 endif
 
 # Toolchain / standards
@@ -179,6 +179,8 @@ RPI4_OPT ?= 0
 ifeq ($(RPI4_OPT),1)
 	# Enable V4L2 hardware decoding for RPi4
 	V4L2 = 1
+	# Ensure V4L2 integration sources are included
+	SOURCES += v4l2_demuxer.c v4l2_demux_bridge.c v4l2_integration.c
 	# Check if we're on ARM architecture for RPi4 specific flags
 	ARCH := $(shell uname -m)
 	ifeq ($(ARCH),aarch64)
@@ -189,7 +191,7 @@ ifeq ($(RPI4_OPT),1)
 		CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 	endif
 	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
-	CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1
+	CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1 -DENABLE_V4L2_DEMUXER=1
 
 endif
 
@@ -216,7 +218,7 @@ ifeq ($(MAXPERF),1)
 		else ifneq (,$(filter arm%,$(ARCH)))
 			CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 		endif
-		CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1
+		CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1 -DENABLE_V4L2_DEMUXER=1
 	endif
 endif
 
@@ -396,7 +398,7 @@ preflight:
 	@bash tools/preflight.sh
 
 clean:
-	rm -f $(OBJECTS) $(APP) v4l2_diagnostic v4l2_test
+	rm -f *.o $(APP) v4l2_diagnostic v4l2_test
 
 # Diagnostic tools
 v4l2_diagnostic: v4l2_diagnostic.c

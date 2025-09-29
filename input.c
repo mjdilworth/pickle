@@ -285,19 +285,15 @@ void process_dpad_movement(void) {
     
     if (g_dpad_up_held) {
         keystone_adjust_corner(g_selected_corner, 0, -move_increment);
-        LOG_DEBUG("D-pad up held: moving corner %d up", g_selected_corner);
     }
     if (g_dpad_down_held) {
         keystone_adjust_corner(g_selected_corner, 0, move_increment);
-        LOG_DEBUG("D-pad down held: moving corner %d down", g_selected_corner);
     }
     if (g_dpad_left_held) {
         keystone_adjust_corner(g_selected_corner, -move_increment, 0);
-        LOG_DEBUG("D-pad left held: moving corner %d left", g_selected_corner);
     }
     if (g_dpad_right_held) {
         keystone_adjust_corner(g_selected_corner, move_increment, 0);
-        LOG_DEBUG("D-pad right held: moving corner %d right", g_selected_corner);
     }
 }
 

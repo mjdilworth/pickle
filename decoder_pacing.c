@@ -26,8 +26,8 @@ void decoder_pacing_update(double current_render_fps, uint64_t frames_dropped) {
     gettimeofday(&now, NULL);
     
     // Only adapt every 2 seconds to avoid oscillation
-    double elapsed = (now.tv_sec - g_frame_pacer.last_adaptation.tv_sec) + 
-                    (now.tv_usec - g_frame_pacer.last_adaptation.tv_usec) / 1000000.0;
+    double elapsed = (double)(now.tv_sec - g_frame_pacer.last_adaptation.tv_sec) + 
+                    (double)(now.tv_usec - g_frame_pacer.last_adaptation.tv_usec) / 1000000.0;
     
     if (elapsed < 2.0) return;
     

@@ -64,6 +64,139 @@ extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ct
 // V4L2 demuxer support
 #if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
 #include "v4l2_demuxer.h"
+#include "v4l2_integration.h"
+#include <pthread.h>
+#include <semaphore.h>
+
+// Logging macro needed for V4L2 demuxer functions
+#ifndef LOG_WARN
+#define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+// Packet queue for thread-safe communication between demuxer and decoder
+#define PACKET_QUEUE_SIZE 32
+typedef struct {
+    v4l2_demuxed_packet_t packets[PACKET_QUEUE_SIZE];
+    int read_pos;
+    int write_pos;
+    int count;
+    pthread_mutex_t mutex;
+    sem_t available;  // Semaphore for available packets
+    sem_t space;      // Semaphore for available space
+    bool shutdown;
+} packet_queue_t;
+
+// Global packet queue
+
+
+#endif
+
+/*
+ * V4L2 Integration Functions - Modular Design
+ */
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+
+// V4L2 integration instance
+static v4l2_integration_t *g_v4l2_integration = NULL;
+
+// Initialize V4L2 integration (call in main after other initialization)
+static bool init_v4l2_integration(void) {
+    if (!v4l2_integration_is_available()) {
+        LOG_INFO("V4L2 integration not available");
+        return false;
+    }
+    
+    g_v4l2_integration = v4l2_integration_create();
+    if (!g_v4l2_integration) {
+        LOG_ERROR("Failed to create V4L2 integration");
+        return false;
+    }
+    
+    LOG_INFO("V4L2 integration initialized");
+    return true;
+}
+
+// Try to open file with V4L2 integration (call before MPV fallback)
+static bool try_v4l2_playback(const char *file_path) {
+    if (!g_v4l2_integration) {
+        return false;
+    }
+    
+    // Check if this is a container format that needs demuxing
+    if (!v4l2_integration_is_container_format(file_path)) {
+        LOG_INFO("Not a container format, using MPV: %s", file_path);
+        return false;
+    }
+    
+    // Try to open with V4L2 integration
+    if (!v4l2_integration_open_file(g_v4l2_integration, file_path)) {
+        LOG_WARN("V4L2 integration failed to open: %s", file_path);
+        return false;
+    }
+    
+    // Start playback
+    if (!v4l2_integration_start_playback(g_v4l2_integration)) {
+        LOG_ERROR("Failed to start V4L2 playback");
+        return false;
+    }
+    
+    LOG_INFO("V4L2 integration successfully started playback");
+    return true;
+}
+
+// Bridge V4L2 integration to V4L2 player for rendering
+static bool bridge_v4l2_integration_to_player(v4l2_player_t *player) {
+    if (!g_v4l2_integration || !player) {
+        return false;
+    }
+    
+    // Extract decoder from integration
+    if (g_v4l2_integration->decoder) {
+        player->decoder = g_v4l2_integration->decoder;
+        player->is_active = 1;
+        player->use_demuxer = true;  // We're using the demuxer bridge
+        player->buffer = NULL;       // No direct buffer needed
+        player->buffer_size = 0;
+        player->timestamp = 0;
+        
+        // Initialize frame structure
+        player->current_frame.texture = 0;
+        player->current_frame.egl_image = EGL_NO_IMAGE_KHR;
+        player->current_frame.is_dmabuf_texture = false;
+        
+        LOG_INFO("Bridged V4L2 integration to player for rendering");
+        return true;
+    }
+    
+    return false;
+}
+
+// Process V4L2 packets (call in main loop)
+static void process_v4l2_integration(void) {
+    if (!g_v4l2_integration) return;
+    
+    // Process available packets
+    int processed = v4l2_integration_process(g_v4l2_integration);
+    if (processed > 0) {
+        // Optionally log processing statistics
+        static int total_processed = 0;
+        static int log_counter = 0;
+        total_processed += processed;
+        log_counter++;
+        
+
+    }
+}
+
+// Cleanup V4L2 integration (call in cleanup/exit)
+static void cleanup_v4l2_integration(void) {
+    if (g_v4l2_integration) {
+        v4l2_integration_destroy(g_v4l2_integration);
+        g_v4l2_integration = NULL;
+        LOG_INFO("V4L2 integration cleaned up");
+    }
+}
+
 #endif
 
 // For event-driven architecture
@@ -126,7 +259,9 @@ extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ct
 #endif
 
 // Additional logging macros not included in utils.h
+#ifndef LOG_WARN
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
+#endif
 #define LOG_DRM(fmt, ...)   fprintf(stderr, "[DRM] " fmt "\n", ##__VA_ARGS__)
 #define LOG_MPV(fmt, ...)   fprintf(stderr, "[MPV] " fmt "\n", ##__VA_ARGS__)
 #define LOG_EGL(fmt, ...)   fprintf(stderr, "[EGL] " fmt "\n", ##__VA_ARGS__)
@@ -231,7 +366,6 @@ static bool convert_nv12_to_rgb_texture(v4l2_decoded_frame_t *frame, GLuint *tex
     // Create or reuse texture
     if (*texture == 0) {
         glGenTextures(1, texture);
-        LOG_DEBUG("Created new texture %u for NV12 conversion", *texture);
     }
     
     glBindTexture(GL_TEXTURE_2D, *texture);
@@ -286,7 +420,6 @@ static bool convert_nv12_to_rgb_texture(v4l2_decoded_frame_t *frame, GLuint *tex
         return false;
     }
     
-    LOG_DEBUG("Successfully converted %dx%d NV12 frame to RGB texture", frame->width, frame->height);
     return true;
 }
 
@@ -417,6 +550,8 @@ static int g_have_master = 0; // set if we successfully become DRM master
 int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
 int g_v4l2_fallback_requested = 0; // Set when V4L2 fails and should fall back to MPV
 double g_video_fps = 60.0; // Detected video frame rate (default to 60fps)
+
+// V4L2 integration instance - moved to be with the functions that use it
 
 // These keystone settings are defined in keystone.c through pickle_keystone adapter
 // Removed static variables and using extern from pickle_keystone.h
@@ -1252,6 +1387,36 @@ static void destroy_mpv(mpv_player_t *p) {
 }
 
 #ifdef USE_V4L2_DECODER
+
+#ifdef ENABLE_V4L2_DEMUXER
+/**
+ * Packet callback function for V4L2 demuxer integration
+ * Receives demuxed packets from the demuxer and feeds them to the V4L2 decoder
+ * 
+ * @param packet Demuxed packet from the demuxer
+ * @param user_data User data (v4l2_player_t pointer)
+ */
+static void v4l2_packet_callback(v4l2_demuxed_packet_t *packet, void *user_data) {
+    v4l2_player_t *p = (v4l2_player_t *)user_data;
+    
+    if (!p || !p->decoder || !packet) {
+        LOG_ERROR("V4L2 packet callback: Invalid parameters");
+        return;
+    }
+    
+    // Feed the demuxed packet to the V4L2 decoder
+    if (!v4l2_decoder_decode(p->decoder, packet->data, packet->size, packet->pts)) {
+        LOG_ERROR("V4L2 packet callback: Failed to decode packet (size=%zu)", packet->size);
+        return;
+    }
+    
+    // Process any available decoded frames
+    if (!v4l2_decoder_process_events(p->decoder)) {
+        LOG_ERROR("V4L2 packet callback: Failed to process decoder events");
+    }
+}
+#endif
+
 /**
  * Initialize the V4L2 decoder
  * 
@@ -1295,41 +1460,74 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 	}
 	
 #ifdef USE_V4L2_DECODER
-	// V4L2 demuxer temporarily disabled - need packet callback integration
-	p->use_demuxer = false;
-	LOG_INFO("V4L2 demuxer integration not yet complete - using raw stream mode");
-	
-	// TODO: Implement packet callback and full demuxer integration
-	// The demuxer requires a callback function to deliver packets
-	// This needs more integration work with the frame processing pipeline
-	
-#if 0 && defined(ENABLE_V4L2_DEMUXER)
-	// This will be enabled once we implement the packet callback
+#ifdef ENABLE_V4L2_DEMUXER
+	// V4L2 demuxer integration with packet callback
 	if (v4l2_demuxer_is_available()) {
-		// Need to create a callback function first
-		p->demuxer = v4l2_demuxer_create(file, packet_callback_func, p);
+		// Create demuxer with packet callback
+		p->demuxer = v4l2_demuxer_create(file, v4l2_packet_callback, p);
 		if (p->demuxer) {
-			p->use_demuxer = true;
-			LOG_INFO("V4L2 demuxer initialized successfully for container format");
+			// Get stream information from demuxer
+			const v4l2_stream_info_t *stream_info = v4l2_demuxer_get_stream_info(p->demuxer);
+			if (!stream_info) {
+				LOG_ERROR("Failed to get stream info from V4L2 demuxer");
+				v4l2_demuxer_destroy(p->demuxer);
+				p->demuxer = NULL;
+				p->use_demuxer = false;
+			} else {
+				// Extract codec information
+				switch (stream_info->codec_id) {
+					case 27: // AV_CODEC_ID_H264
+						p->codec = V4L2_CODEC_H264;
+						break;
+					case 173: // AV_CODEC_ID_HEVC
+						p->codec = V4L2_CODEC_HEVC;
+						break;
+					case 139: // AV_CODEC_ID_VP8
+						p->codec = V4L2_CODEC_VP8;
+						break;
+					case 167: // AV_CODEC_ID_VP9
+						p->codec = V4L2_CODEC_VP9;
+						break;
+					default:
+						LOG_ERROR("Unsupported codec ID: %d (%s)", stream_info->codec_id, 
+								  stream_info->codec_name ? stream_info->codec_name : "unknown");
+						v4l2_demuxer_destroy(p->demuxer);
+						p->demuxer = NULL;
+						p->use_demuxer = false;
+						break;
+				}
+				
+				if (p->use_demuxer) {
+					p->width = (uint32_t)stream_info->width;
+					p->height = (uint32_t)stream_info->height;
+					g_video_fps = stream_info->fps;
+					p->use_demuxer = true;
+					LOG_INFO("V4L2 demuxer: %s %dx%d @ %.2f fps", 
+							 stream_info->codec_name, p->width, p->height, stream_info->fps);
+				}
+			}
+			
+			if (!p->use_demuxer) {
+				LOG_WARN("V4L2 demuxer failed to initialize, falling back to raw stream");
+			}
 		} else {
-			LOG_WARN("V4L2 demuxer failed to initialize, falling back to raw stream");
+			LOG_WARN("V4L2 demuxer failed to create, falling back to raw stream");
 			p->use_demuxer = false;
 		}
 	} else {
 		p->use_demuxer = false;
+		LOG_INFO("V4L2 demuxer not available - using raw stream mode");
 	}
+#else
+	// V4L2 demuxer disabled at compile time - use raw stream mode
+	p->use_demuxer = false;
+	LOG_INFO("V4L2 demuxer integration disabled - using raw stream mode");
 #endif
 	
 	if (0) { // Old demuxer code disabled
 		/*
 		// Try to initialize MP4 demuxer first
-		if (g_debug) {
-			fprintf(stderr, "[DEBUG] Attempting MP4 demuxer init for file: %s\n", file);
-		}
 		if (mp4_demuxer_init(&p->demuxer, file)) {
-		if (g_debug) {
-			fprintf(stderr, "[DEBUG] MP4 demuxer init SUCCESS\n");
-		}
 		p->use_demuxer = true;
 		
 		// Get stream information from demuxer
@@ -1380,9 +1578,6 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		*/
 	} else {
 #endif
-		if (g_debug) {
-			fprintf(stderr, "[DEBUG] MP4 demuxer init FAILED, falling back to raw file\n");
-		}
 		// Fallback to raw file reading
 #ifdef USE_V4L2_DECODER
 		p->use_demuxer = false;
@@ -1393,6 +1588,32 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 			free(p->decoder);
 			p->decoder = NULL;
 			return false;
+		}
+		
+		// Check if this is a container format that needs demuxing
+		uint8_t header[12];
+		size_t bytes_read = fread(header, 1, sizeof(header), p->input_file);
+		fseek(p->input_file, 0, SEEK_SET); // Reset file position
+		
+		if (bytes_read >= 8) {
+			// Check for MP4 container (ftyp box)
+			if (header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') {
+				LOG_WARN("Detected MP4 container format in raw stream mode - V4L2 decoder needs elementary stream");
+				LOG_INFO("Container formats require proper demuxing - falling back to MPV decoder");
+				fclose(p->input_file);
+				p->input_file = NULL;
+				free(p->decoder);
+				p->decoder = NULL;
+				return false; // This will trigger MPV fallback
+			}
+			// Check for H.264 Annex-B start code
+			else if (header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x00 && header[3] == 0x01) {
+				LOG_INFO("Detected H.264 Annex-B elementary stream - proceeding with V4L2 decoder");
+			}
+			// Check for other formats
+			else {
+				LOG_WARN("Unknown stream format detected - attempting V4L2 decoder anyway");
+			}
 		}
 		
 		// For raw streams, assume H.264 codec
@@ -1461,23 +1682,45 @@ static bool init_v4l2_decoder(v4l2_player_t *p, const char *file) {
 		return false;
 	}
 	
-	// Allocate read buffer (configurable via environment variable)
-	p->buffer_size = 1024 * 1024;  // Default 1MB buffer
-	const char *env_buffer_size = getenv("PICKLE_V4L2_BUFFER_SIZE_MB");
-	if (env_buffer_size) {
-		int mb = atoi(env_buffer_size);
-		if (mb > 0 && mb <= 64) { // Reasonable bounds: 1-64MB
-			p->buffer_size = (size_t)mb * 1024 * 1024;
+#ifdef ENABLE_V4L2_DEMUXER
+	// Start the demuxer if using demuxer integration
+	if (p->use_demuxer && p->demuxer) {
+		if (!v4l2_demuxer_start_threaded(p->demuxer)) {
+			LOG_ERROR("Failed to start V4L2 demuxer");
+			v4l2_decoder_destroy(p->decoder);
+			if (p->input_file) {
+				fclose(p->input_file);
+			}
+			p->decoder = NULL;
+			return false;
 		}
+		LOG_INFO("V4L2 demuxer started successfully in threaded mode");
 	}
-	p->buffer = malloc(p->buffer_size);
-	if (!p->buffer) {
-		LOG_ERROR("Failed to allocate read buffer");
-		v4l2_decoder_destroy(p->decoder);
-		fclose(p->input_file);
-		// Don't free the decoder memory - v4l2_decoder_destroy already does this
-		p->decoder = NULL;
-		return false;
+#endif
+	
+	// Allocate read buffer only for raw stream mode (not needed for demuxer mode)
+	if (!p->use_demuxer) {
+		p->buffer_size = 1024 * 1024;  // Default 1MB buffer
+		const char *env_buffer_size = getenv("PICKLE_V4L2_BUFFER_SIZE_MB");
+		if (env_buffer_size) {
+			int mb = atoi(env_buffer_size);
+			if (mb > 0 && mb <= 64) { // Reasonable bounds: 1-64MB
+				p->buffer_size = (size_t)mb * 1024 * 1024;
+			}
+		}
+		p->buffer = malloc(p->buffer_size);
+		if (!p->buffer) {
+			LOG_ERROR("Failed to allocate read buffer");
+			v4l2_decoder_destroy(p->decoder);
+			fclose(p->input_file);
+			// Don't free the decoder memory - v4l2_decoder_destroy already does this
+			p->decoder = NULL;
+			return false;
+		}
+	} else {
+		p->buffer = NULL;
+		p->buffer_size = 0;
+		LOG_INFO("Using demuxer mode - no read buffer needed");
 	}
 	
 	p->timestamp = 0;
@@ -1540,6 +1783,8 @@ static void destroy_v4l2_decoder(v4l2_player_t *p, egl_ctx_t *e) {
  * @return true if processing should continue, false to stop playback
  */
 static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
+
+	
 	if (!p || !p->is_active) {
 		return false;
 	}
@@ -1581,9 +1826,7 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 					sleep_time.tv_nsec = (long)(sleep_ms * 1000000);
 					nanosleep(&sleep_time, NULL);
 					
-					if (frame_count % 50 == 0) {
-						LOG_DEBUG("Frame rate limiting: slept %.2f ms (target: %.2f ms)", sleep_ms, target_interval_ms);
-					}
+
 				}
 			}
 		}
@@ -1628,13 +1871,11 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 #ifdef USE_V4L2_DECODER
 	if (p->use_demuxer) {
 		// Limit packets per frame to prevent buffer overrun
-		static int packets_this_frame = 0;
 		static int frame_number = 0;
 		
 		if (frame_count != frame_number) {
 			// New frame, reset packet counter
 			frame_number = frame_count;
-			packets_this_frame = 0;
 		}
 		
 		// Demuxer packet processing disabled for now - skip to fallback mode
@@ -1659,29 +1900,44 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 			}
 		}
 		
-		static int chunk_log_counter = 0;
-		if (++chunk_log_counter % 1000 == 1) {
-			LOG_DEBUG("Using V4L2 chunk size: %zu bytes (logged every 1000 reads)", max_chunk_size);
-		}
+
 			// Read a chunk of data, but limit to safe chunk size
 			size_t bytes_to_read = max_chunk_size < p->buffer_size ? max_chunk_size : p->buffer_size;
 			size_t bytes_read = fread(p->buffer, 1, bytes_to_read, p->input_file);
 			
 			if (bytes_read > 0) {
-				// Send to decoder
+				// Send to decoder with improved backpressure handling
 				if (!v4l2_decoder_decode(p->decoder, p->buffer, bytes_read, p->timestamp)) {
-					LOG_ERROR("V4L2 decoder decode failed");
-					log_memory_usage("V4L2-DECODE-FAIL");
-				} else {
-					static int send_log_counter = 0;
-					if (++send_log_counter % 100 == 1) {
-						LOG_DEBUG("Successfully sent %zu bytes to V4L2 decoder (logged every 100 sends)", bytes_read);
+					// Decoder is likely full - implement gentle backpressure
+					static int backpressure_counter = 0;
+					static struct timespec last_backpressure = {0, 0};
+					struct timespec now;
+					clock_gettime(CLOCK_MONOTONIC, &now);
+					
+					backpressure_counter++;
+					
+
+					
+					// Instead of rewinding, just skip feeding for a short time to let decoder catch up
+					double time_since_last = (double)(now.tv_sec - last_backpressure.tv_sec) + 
+					                        (double)(now.tv_nsec - last_backpressure.tv_nsec) / 1e9;
+					
+					// If we've been in backpressure for more than 100ms, rewind
+					if (time_since_last > 0.1 && fseek(p->input_file, -(long)bytes_read, SEEK_CUR) == 0) {
+						// Successfully rewound, try to let decoder process some frames
 					}
+					
+					last_backpressure = now;
+					
+					// Don't increment timestamp if data wasn't accepted
+				} else {
+
+					
+					// Only increment timestamp when data is successfully sent
+					double frame_interval_us = 1000000.0 / g_video_fps;
+					int64_t interval_us = (int64_t)frame_interval_us;
+					p->timestamp += interval_us;
 				}
-				// Increment timestamp based on detected video FPS (adaptive timing)
-				double frame_interval_us = 1000000.0 / g_video_fps;
-				int64_t interval_us = (int64_t)frame_interval_us;
-				p->timestamp += interval_us;
 			}
 		}
 #ifdef USE_V4L2_DECODER
@@ -1692,11 +1948,14 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 	// This prevents unnecessary buffer thrashing that can cause starvation
 	
 	// Poll for decoded frames with timeout and signal checking
-	static int poll_log_counter = 0;
-	if (++poll_log_counter % 200 == 1) {
-		LOG_DEBUG("Polling V4L2 decoder for frames... (logged every 200 calls)");
-	}
+	static int poll_counter = 0;
+	poll_counter++;
+
 	int poll_result = v4l2_decoder_poll(p->decoder, 0);  // Non-blocking poll
+	
+	if (poll_counter % 100 == 1) {
+		LOG_INFO("V4L2 poll attempt %d, result: %d", poll_counter, poll_result);
+	}
 	
 	if (poll_result > 0) {
 		// Process events
@@ -1710,6 +1969,11 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 		
 		// Try to get a decoded frame
 		v4l2_decoded_frame_t decoded_frame;
+		static int frame_attempt_counter = 0;
+		frame_attempt_counter++;
+		if (frame_attempt_counter % 100 == 1) {
+			LOG_INFO("Attempting to get V4L2 frame (attempt %d)", frame_attempt_counter);
+		}
 		if (v4l2_decoder_get_frame(p->decoder, &decoded_frame)) {
 			// Store frame information in the player struct
             p->current_frame.valid = true;
@@ -1734,8 +1998,6 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
             
             // Create/update OpenGL texture with frame data
             if (decoded_frame.dmabuf_fd >= 0) {
-                LOG_INFO("V4L2: Processing DMA-BUF frame (fd=%d)", decoded_frame.dmabuf_fd);
-                
                 // Create OpenGL texture directly from V4L2 DMA-BUF (zero-copy)
                 GLuint dmabuf_texture = 0;
                 EGLImageKHR dmabuf_image = EGL_NO_IMAGE_KHR;
@@ -1745,11 +2007,6 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
                                                     p->decoder->stride, decoded_frame.format,
                                                     &dmabuf_texture, &dmabuf_image)) {
                     // Successfully created zero-copy texture from DMA-BUF
-                    static int zero_copy_success_counter = 0;
-                    if (++zero_copy_success_counter % 100 == 1) {
-                        LOG_INFO("V4L2: Created zero-copy DMA-BUF texture %u from fd %d (count: %d)",
-                                 dmabuf_texture, decoded_frame.dmabuf_fd, zero_copy_success_counter);
-                    }
                     
                     // Clean up previous texture if it was a DMA-BUF texture
                     if (p->current_frame.is_dmabuf_texture && p->current_frame.texture != 0) {
@@ -1770,15 +2027,10 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
                     }
                 }
             } else if (decoded_frame.data) {
-                LOG_INFO("V4L2: Processing memory-mapped NV12 frame (data=%p, size=%u)", decoded_frame.data, decoded_frame.bytesused);
-                
                 // Convert NV12 to RGB texture using GPU
                 if (convert_nv12_to_rgb_texture_gpu(&decoded_frame, &p->texture)) {
                     p->current_frame.texture = p->texture;
-                    static int convert_log_counter = 0;
-                    if (++convert_log_counter % 100 == 1) {
-                        LOG_DEBUG("Successfully converted NV12 frame to RGB texture %u (logged every 100 conversions)", p->texture);
-                    }
+
                 } else {
                     LOG_ERROR("Failed to convert NV12 frame to RGB texture");
                 }
@@ -1789,12 +2041,11 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
                 LOG_ERROR("Failed to return frame buffer to decoder");
             }
             
+            // Successfully got a frame - reset the no-frame cycle counter
+            got_frame_this_cycle = true;
+            no_frame_cycles = 0;
+            
 			return true;
-		} else {
-			static int no_frame_log_counter = 0;
-			if (++no_frame_log_counter % 500 == 1) {
-				LOG_DEBUG("No decoded frame available from V4L2 decoder (logged every 500 calls)");
-			}
 		}
 	}
 	
@@ -1805,9 +2056,12 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 	bool input_finished = (p->input_file && feof(p->input_file));
 #endif
 	
-	if (input_finished && p->decoder) {
-		// Flush the decoder to get any remaining frames
+	static bool decoder_flushed = false;
+	if (input_finished && p->decoder && !decoder_flushed) {
+		// Flush the decoder to get any remaining frames (only once)
         v4l2_decoder_flush(p->decoder);
+        decoder_flushed = true;
+        LOG_INFO("Decoder flush completed, waiting for remaining frames");
 	}
 	
 	// Track cycles with no frames to detect potential infinite loops
@@ -1820,9 +2074,7 @@ static bool process_v4l2_frame(v4l2_player_t *p, egl_ctx_t *e) {
 			g_v4l2_fallback_requested = 1;
 			return false;
 		}
-		if (no_frame_cycles % 200 == 0) {  // Log every 200 cycles (reduced frequency)
-			LOG_DEBUG("No frames for %d consecutive cycles", no_frame_cycles);
-		}
+
 	}
 	
 	return true;
@@ -1834,7 +2086,6 @@ void drain_mpv_events(mpv_handle *h) {
 		mpv_event *ev = mpv_wait_event(h, 0);
 		if (ev->event_id == MPV_EVENT_NONE) break;
 		if (ev->event_id == MPV_EVENT_VIDEO_RECONFIG) {
-			if (g_debug) fprintf(stderr, "[mpv] VIDEO_RECONFIG\n");
 		}
 		if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
 			mpv_event_log_message *lm = ev->data;
@@ -1847,7 +2098,6 @@ void drain_mpv_events(mpv_handle *h) {
 		if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) {
 			// This event can indicate that playback is resuming after a pause
 			// Mark it as activity to prevent stall detection from triggering
-			if (g_debug) fprintf(stderr, "[mpv] PLAYBACK_RESTART\n");
 			gettimeofday(&g_last_frame_time, NULL);
 		}
 		if (ev->event_id == MPV_EVENT_END_FILE) {
@@ -2374,8 +2624,6 @@ static void render_keystone_quad(GLuint texture) {
     // The keystone rendering code will use g_keystone_fbo_texture
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture);
-    
-    LOG_DEBUG("V4L2 texture set for keystone rendering: %u", texture);
 }
 
 /**
@@ -2387,6 +2635,8 @@ static void render_keystone_quad(GLuint texture) {
  * @return true if rendering succeeded, false otherwise
  */
 bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
+
+	
 	// Start stats timing (was missing for V4L2 path)
 	stats_overlay_render_frame_start(&g_stats_overlay);
 	
@@ -2442,42 +2692,25 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
             // Use zero-copy path to present the frame
             if (present_frame_zero_copy(d, e, p->current_frame.texture, src_rect, dst_rect)) {
                 // Successfully presented using zero-copy path
-                static bool first_frame = true;
-                if (g_debug && first_frame) {
-                    fprintf(stderr, "[debug] Using zero-copy DMA-BUF path with %s modesetting\n", 
-                            d->atomic_supported ? "atomic" : "legacy");
-                    first_frame = false;
-                }
+
                 return true;
             }
         }
     }
 	
-	// Debug: Check if we have a valid frame and texture
+	// Check if we have a valid frame and texture
 	if (p->current_frame.valid) {
-		if (g_debug) {
-			fprintf(stderr, "[DEBUG] V4L2: Valid frame available, texture=%u\n", p->texture);
-		}
 		if (p->texture > 0) {
 			// Render the V4L2 texture to screen using the appropriate pipeline
 			glActiveTexture(GL_TEXTURE0);
 			glBindTexture(GL_TEXTURE_2D, p->texture);
-			if (g_debug) {
-				fprintf(stderr, "[DEBUG] V4L2: Texture %u bound for rendering\n", p->texture);
-			}
 			
 			// Use keystone correction if enabled, otherwise render directly
 			if (g_keystone.enabled && g_keystone_shader_program > 0) {
 				render_keystone_quad(p->texture);
-				LOG_DEBUG("V4L2 frame rendered with keystone correction");
 			} else {
 				render_direct_quad(p->texture);
-				LOG_DEBUG("V4L2 frame rendered directly");
 			}
-		}
-	} else {
-		if (g_debug) {
-			fprintf(stderr, "[DEBUG] V4L2: No valid frame available\n");
 		}
 	}
 	
@@ -2504,15 +2737,8 @@ bool render_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, v4l2_player_t *p) {
 	}
 	
 	if (fb_id == 0) {
-		if (g_debug) {
-			fprintf(stderr, "[DEBUG] Failed to find framebuffer for BO (ring count=%d)\n", g_fb_ring.count);
-		}
 		gbm_surface_release_buffer(e->gbm_surf, bo);
 		return false;
-	}
-	
-	if (g_debug) {
-		fprintf(stderr, "[DEBUG] Using framebuffer ID %u for page flip\n", fb_id);
 	}
 	
 	// Present the framebuffer using KMS
@@ -2752,14 +2978,12 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// First let MPV render to its own texture via render_frame_mpv
 		bool mpv_render_ok = render_frame_mpv(p->mpv, p->rctx, d, e);
 		if (!mpv_render_ok) {
-			if (g_debug) fprintf(stderr, "[DEBUG] Keystone: MPV render failed\n");
 			return false;
 		}
 		
 		// Get the MPV texture
 		GLuint mpv_texture = get_mpv_texture();
 		if (mpv_texture == 0) {
-			if (g_debug) fprintf(stderr, "[DEBUG] Keystone: No MPV texture available\n");
 			return false;
 		}
 		
@@ -2778,10 +3002,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		float dst_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // Full keystone FBO
 		
 		// Render MPV texture to keystone FBO
-		bool blit_ok = render_video_frame(e, mpv_texture, src_rect, dst_rect);
-		if (!blit_ok && g_debug) {
-			fprintf(stderr, "[DEBUG] Keystone: Failed to copy MPV texture %u to FBO\n", mpv_texture);
-		}
+		render_video_frame(e, mpv_texture, src_rect, dst_rect);
 		
 		// Bind framebuffer back to default after copy
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -2816,10 +3037,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 			g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
 			g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
 			
-			if (g_debug) {
-				fprintf(stderr, "DEBUG: Reacquired shader attributes: pos=%d tex=%d u_tex=%d\n", 
-					g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
-			}
+
 				
 			if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
 				fprintf(stderr, "ERROR: Failed to get shader attributes\n");
@@ -3014,19 +3232,11 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	// Render stats overlay if enabled (before buffer swap)
 	// Skip stats overlay in performance mode if configured to do so
 	if (g_show_stats_overlay && !should_skip_feature_for_performance("stats_overlay")) {
-		static int debug_stats_counter = 0;
-		if (++debug_stats_counter % 60 == 0) { // Every 60 frames (~1 second)
-			fprintf(stderr, "[STATS-DEBUG] Rendering stats overlay: enabled=%d, screen=%dx%d\n", 
-					g_show_stats_overlay, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
-		}
+
 		stats_overlay_update(&g_stats_overlay);
 		stats_overlay_render_text(&g_stats_overlay, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
 	} else {
-		static int debug_skip_counter = 0;
-		if (g_show_stats_overlay && ++debug_skip_counter % 60 == 0) { // Every 60 frames (~1 second)
-			fprintf(stderr, "[STATS-DEBUG] Skipping stats overlay: enabled=%d, should_skip=%d\n", 
-					g_show_stats_overlay, should_skip_feature_for_performance("stats_overlay"));
-		}
+
 	}
 	
 	// Swap buffers to display the rendered frame
@@ -3044,8 +3254,6 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		}
 	}
 
-	static bool first_frame = true;
-
 	// Check if we should use zero-copy path
 	if (!g_scanout_disabled && should_use_zero_copy(d, e)) {
 		// We'd need a way to get the MPV rendered texture, but that's not directly exposed
@@ -3059,17 +3267,10 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		// Use zero-copy path to present the frame
 		if (present_frame_zero_copy(d, e, video_texture, src_rect, dst_rect)) {
 			// Successfully presented using zero-copy path
-			if (g_debug && first_frame) {
-				fprintf(stderr, "[debug] Using zero-copy DMA-BUF path with %s modesetting\n", 
-						d->atomic_supported ? "atomic" : "legacy");
-			}
 			return true;
 		}
 		
 		// If zero-copy fails, fall back to standard path
-		if (g_debug && first_frame) {
-			fprintf(stderr, "[debug] Zero-copy path failed, falling back to standard path\n");
-		}
 	}
 
 	// Standard (non-zero-copy) path
@@ -3464,7 +3665,11 @@ int main(int argc, char **argv) {
         }
     }
 
-	
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+	// Initialize V4L2 integration system
+	init_v4l2_integration();
+#endif
+
 	// Try V4L2 hardware decoder first (if built with V4L2 support), fallback to MPV
 #ifdef USE_V4L2_DECODER
 	bool v4l2_attempted = false;
@@ -3487,10 +3692,29 @@ int main(int argc, char **argv) {
 			LOG_WARN("V4L2 decoder not supported on this platform. Falling back to MPV.");
 			g_use_v4l2_decoder = 0;
 		} else {
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+			// Try modular V4L2 integration first for container formats
+			if (try_v4l2_playback(file)) {
+				LOG_INFO("V4L2 integration handling playback");
+				// Bridge the integration decoder to the V4L2 player for rendering
+				if (!bridge_v4l2_integration_to_player(&v4l2_player)) {
+					LOG_WARN("Failed to bridge V4L2 integration to player. Falling back to MPV.");
+					g_use_v4l2_decoder = 0;
+				}
+			} else {
+				// Fall back to traditional V4L2 decoder for raw streams
+				if (!init_v4l2_decoder(&v4l2_player, file)) {
+					LOG_WARN("V4L2 decoder initialization failed. Falling back to MPV.");
+					g_use_v4l2_decoder = 0;
+				}
+			}
+#else
+			// Traditional V4L2 decoder only
 			if (!init_v4l2_decoder(&v4l2_player, file)) {
 				LOG_WARN("V4L2 decoder initialization failed. Falling back to MPV.");
 				g_use_v4l2_decoder = 0;
 			}
+#endif
 		}
 	}
 	
@@ -3539,7 +3763,6 @@ int main(int argc, char **argv) {
 	// V4L2 decoder requires continuous polling, so always enable force_loop mode
 	if (g_use_v4l2_decoder) {
 		force_loop = 1;
-		LOG_DEBUG("V4L2 decoder enabled, forcing continuous render loop for active polling");
 	}
 	struct timeval wd_last_activity; gettimeofday(&wd_last_activity, NULL);
 	gettimeofday(&g_last_frame_time, NULL); // Initialize last frame time
@@ -3663,6 +3886,11 @@ int main(int argc, char **argv) {
 				}
 				last_v4l2_update = now;
 			}
+			
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+			// Process V4L2 integration packets if using modular system
+			process_v4l2_integration();
+#endif
 		}
 		// Check controller quit combo (START+SELECT 2s)
 		if (is_joystick_enabled()) {
@@ -3753,9 +3981,6 @@ int main(int argc, char **argv) {
 				// Handle keyboard input
 				char c;
 				if (read(STDIN_FILENO, &c, 1) > 0) {
-					// Log keypress for debugging (quiet by default)
-					LOG_DEBUG("Key pressed: %d (0x%02x) '%c'", (int)c, (int)c, (c >= 32 && c < 127) ? c : '?');
-					
 					// Special case: Force keystone mode with 'K' (capital K)
 					if (c == 'K') {
 						LOG_INFO("Force enabling keystone mode with capital K");
@@ -3784,7 +4009,6 @@ int main(int argc, char **argv) {
 
 					// Handle keystone adjustment keys first (to avoid 'q' conflict)
 					bool keystone_handled = handle_keyboard_input(c);
-					LOG_DEBUG("Keystone handler returned: %d", keystone_handled);
 					if (keystone_handled) {
 						// Force a redraw when keystone parameters change
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
@@ -3993,6 +4217,10 @@ int main(int argc, char **argv) {
 	// Clean up joystick resources
 	cleanup_joystick();
 	
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+	// Clean up V4L2 integration
+	cleanup_v4l2_integration();
+#endif
 	
 	// Clean up compute shader keystone if initialized
 	compute_keystone_cleanup();
@@ -4015,6 +4243,10 @@ fail:
 	// Clean up joystick resources
 	cleanup_joystick();
 	
+#if defined(USE_V4L2_DECODER) && defined(ENABLE_V4L2_DEMUXER)
+	// Clean up V4L2 integration
+	cleanup_v4l2_integration();
+#endif
 	
 	// Clean up compute shader keystone if initialized
 	compute_keystone_cleanup();

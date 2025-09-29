@@ -92,7 +92,6 @@ bool v4l2_decoder_check_format(v4l2_codec_t codec) {
 
 // Check if any V4L2 M2M decoder is available
 bool v4l2_decoder_is_supported(void) {
-    fprintf(stderr, "[DEBUG] V4L2 decoder support check starting...\n");
     // Try all common V4L2 M2M device paths
     const char *dev_paths[] = {
         "/dev/video0",
@@ -111,16 +110,12 @@ bool v4l2_decoder_is_supported(void) {
         
         struct v4l2_capability cap;
         if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
-            fprintf(stderr, "[DEBUG] Device %s: capabilities=0x%08x\n", dev_paths[i], cap.capabilities);
             if ((cap.capabilities & V4L2_CAP_VIDEO_M2M_MPLANE) || 
                 (cap.capabilities & V4L2_CAP_VIDEO_M2M)) {
                 LOG_INFO("Found M2M device: %s", dev_paths[i]);
-                fprintf(stderr, "[DEBUG] V4L2 hardware decoder FOUND and SUPPORTED!\n");
                 close(fd);
                 return true;
             }
-        } else {
-            fprintf(stderr, "[DEBUG] Device %s: ioctl failed\n", dev_paths[i]);
         }
         
         close(fd);
@@ -624,8 +619,8 @@ bool v4l2_decoder_use_dmabuf(v4l2_decoder_t *dec) {
         struct v4l2_exportbuffer expbuf;
         CLEAR(expbuf);
         
-        expbuf.type = dec->capture_type;
-        expbuf.index = i;
+        expbuf.type = (__u32)dec->capture_type;
+        expbuf.index = (__u32)i;
         expbuf.flags = O_RDONLY; // Read-only for GPU texture creation
         
         if (dec->capture_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
@@ -645,7 +640,6 @@ bool v4l2_decoder_use_dmabuf(v4l2_decoder_t *dec) {
         }
         
         dec->dmabuf_fds[i] = expbuf.fd;
-        LOG_DEBUG("Exported buffer %d as DMA-BUF fd %d", i, expbuf.fd);
     }
     
     LOG_INFO("DMA-BUF export enabled successfully for %d buffers", dec->num_capture_buffers);
@@ -663,7 +657,11 @@ bool v4l2_decoder_start(v4l2_decoder_t *dec) {
         return false;
     }
     
+    LOG_INFO("Starting decoder: fd=%d, initialized=%d, streaming=%d, capture_type=%d, output_type=%d", 
+             dec->fd, dec->initialized, dec->streaming, dec->capture_type, dec->output_type);
+    
     // Enqueue all capture buffers
+    LOG_INFO("Enqueuing %d capture buffers", dec->num_capture_buffers);
     for (int i = 0; i < dec->num_capture_buffers; i++) {
         struct v4l2_buffer buf;
         struct v4l2_plane planes[1];
@@ -694,15 +692,17 @@ bool v4l2_decoder_start(v4l2_decoder_t *dec) {
     }
     
     // Start streaming
+    LOG_INFO("Starting capture streaming (type=%d, num_buffers=%d)", dec->capture_type, dec->num_capture_buffers);
     int type = dec->capture_type;
     if (ioctl(dec->fd, VIDIOC_STREAMON, &type) < 0) {
-        LOG_ERROR("Failed to start capture streaming: %s", strerror(errno));
+        LOG_ERROR("Failed to start capture streaming (type=%d): %s", dec->capture_type, strerror(errno));
         return false;
     }
     
+    LOG_INFO("Starting output streaming (type=%d, num_buffers=%d)", dec->output_type, dec->num_output_buffers);
     type = dec->output_type;
     if (ioctl(dec->fd, VIDIOC_STREAMON, &type) < 0) {
-        LOG_ERROR("Failed to start output streaming: %s", strerror(errno));
+        LOG_ERROR("Failed to start output streaming (type=%d): %s", dec->output_type, strerror(errno));
         
         // Stop capture streaming
         type = dec->capture_type;
@@ -809,12 +809,31 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
         return false;
     }
     
-    // Reduced logging frequency - only log occasionally to avoid spam
-    static int decode_log_counter = 0;
-    if (++decode_log_counter % 50 == 1) {
-        LOG_DEBUG("V4L2 decode: data=%p, size=%zu, timestamp=%lld (logged every 50 frames)", 
-                 data, size, (long long)timestamp);
+    // Track input data flow
+    static size_t total_bytes_fed = 0;
+    static int successful_feeds = 0;
+    static bool analyzed_stream = false;
+    
+    total_bytes_fed += size;
+    
+    // Analyze first chunk for stream format detection
+    if (!analyzed_stream && size >= 8) {
+        const unsigned char *bytes = (const unsigned char *)data;
+        LOG_INFO("V4L2 stream analysis: First 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x", 
+                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+        
+        // Check for common video formats
+        if (bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x01) {
+            LOG_INFO("V4L2 stream: Detected H.264 Annex-B start code");
+        } else if (bytes[4] == 'f' && bytes[5] == 't' && bytes[6] == 'y' && bytes[7] == 'p') {
+            LOG_WARN("V4L2 stream: Detected MP4 container format - decoder may need elementary stream");
+        } else {
+            LOG_WARN("V4L2 stream: Unknown format - may not be compatible with V4L2 decoder");
+        }
+        analyzed_stream = true;
     }
+    
+
     
     // Find an available output buffer
     int buf_index = -1;
@@ -849,7 +868,7 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
     }
     
     if (buf_index < 0) {
-        // Try to dequeue a buffer
+        // Try to dequeue a buffer - this may block if all buffers are in use
         struct v4l2_buffer buf;
         struct v4l2_plane planes[1];
         CLEAR(buf);
@@ -863,8 +882,18 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
             buf.length = 1;
         }
         
-        if (ioctl(dec->fd, VIDIOC_DQBUF, &buf) < 0) {
-            LOG_ERROR("No output buffers available");
+        // Try non-blocking dequeue first
+        int ret = ioctl(dec->fd, VIDIOC_DQBUF, &buf);
+        if (ret < 0) {
+            if (errno == EAGAIN) {
+                // No buffers available right now - this is the main cause of starvation
+                static int starvation_counter = 0;
+                if (++starvation_counter % 100 == 1) {
+                    LOG_WARN("V4L2 input buffer starvation detected (count: %d) - decoder may be overwhelmed", starvation_counter);
+                }
+                return false; // Don't block, return immediately
+            }
+            LOG_ERROR("Failed to dequeue output buffer: %s", strerror(errno));
             return false;
         }
         
@@ -929,21 +958,16 @@ bool v4l2_decoder_decode(v4l2_decoder_t *dec, const void *data, size_t size, int
         buf.length = (__u32)buffer_size;
     }
     
-    static int queue_debug_counter = 0;
-    if (++queue_debug_counter % 100 == 0) {
-        LOG_DEBUG("Queueing buffer %d with %zu bytes (logged every 100 buffers)", buf_index, size);
-    }
-    
     if (ioctl(dec->fd, VIDIOC_QBUF, &buf) < 0) {
         LOG_ERROR("Failed to queue output buffer: %s", strerror(errno));
         return false;
     }
     
-    static int queue_success_counter = 0;
-    if (++queue_success_counter % 100 == 0) {
-        LOG_DEBUG("Successfully queued buffer %d (logged every 100 buffers)", buf_index);
-    }
+
     dec->next_output_buffer = (buf_index + 1) % dec->num_output_buffers;
+    
+    // Update successful feeds counter
+    successful_feeds++;
     
     return true;
 }
@@ -955,9 +979,19 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
         return false;
     }
     
-    // Static counter to track decoder warm-up
+    // Enhanced frame tracking with detailed statistics
     static int frames_attempted = 0;
+    static int frames_produced = 0;
+    static int eagain_count = 0;
+    
     frames_attempted++;
+    
+    // Log frame production statistics periodically
+    if (frames_attempted % 1000 == 1) {
+        LOG_INFO("V4L2 frame stats: attempted=%d, produced=%d, eagain=%d, ratio=%.2f%%", 
+                 frames_attempted, frames_produced, eagain_count, 
+                 frames_attempted > 0 ? (100.0 * frames_produced / frames_attempted) : 0.0);
+    }
     
     // Give the decoder some time to process initial input before trying to get frames
     if (frames_attempted < 10) {
@@ -980,15 +1014,17 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
     
     if (ioctl(dec->fd, VIDIOC_DQBUF, &buf) < 0) {
         if (errno == EAGAIN) {
-            // No buffer available yet
+            // No buffer available yet - this is normal during startup or when decoder is catching up
+            eagain_count++;
             return false;
         }
         
         LOG_ERROR("Failed to dequeue capture buffer: %s (errno=%d)", strerror(errno), errno);
         
         // For broken pipe, check if device is still valid
-        if (errno == EPIPE) {
-            LOG_ERROR("V4L2 device broken pipe - decoder may have failed internally");
+        if (errno == EPIPE || errno == ENODEV) {
+            LOG_ERROR("V4L2 device broken pipe or disconnected - decoder has failed internally");
+            dec->streaming = false; // Mark as not streaming to prevent further operations
         }
         
         return false;
@@ -1011,7 +1047,6 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
     if (dec->dmabuf_fds && buf.index < (unsigned int)dec->num_capture_buffers && dec->dmabuf_fds[buf.index] >= 0) {
         frame->dmabuf_fd = dec->dmabuf_fds[buf.index];
         frame->data = NULL; // No CPU mapping when using DMA-BUF
-        LOG_DEBUG("Frame %d using DMA-BUF fd %d for zero-copy", buf.index, frame->dmabuf_fd);
     } else {
         frame->dmabuf_fd = -1;
         // For memory-mapped buffers, get a pointer to the buffer data
@@ -1024,6 +1059,13 @@ bool v4l2_decoder_get_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame) {
     
     // Remember the buffer index for returning it later  
     frame->buf_index = (int)buf.index;
+    
+    // Track successful frame production
+    frames_produced++;
+    if (frames_produced % 50 == 1) {
+        LOG_INFO("V4L2 decoder produced frame %d (buffer index %d, size %u bytes)", 
+                 frames_produced, buf.index, frame->bytesused);
+    }
     
     // If using a frame callback, call it
     if (dec->frame_cb) {
@@ -1068,7 +1110,6 @@ bool v4l2_decoder_return_frame(v4l2_decoder_t *dec, v4l2_decoded_frame_t *frame)
         return false;
     }
 
-    LOG_DEBUG("Returned buffer %d to decoder", frame->buf_index);
     return true;
 }
 
@@ -1113,11 +1154,7 @@ bool v4l2_decoder_process_events(v4l2_decoder_t *dec) {
     // The main loop should call v4l2_decoder_get_frame() to actually retrieve frames
     // This function is called after polling indicates activity on the device
     
-    // Reduced logging frequency - only log occasionally to avoid spam
-    static int event_log_counter = 0;
-    if (++event_log_counter % 100 == 1) {
-        LOG_DEBUG("V4L2 events available (logged every 100 calls)");
-    }
+
     return true;  // Always return true after successful poll
 }
 #else // !defined(USE_V4L2_DECODER)

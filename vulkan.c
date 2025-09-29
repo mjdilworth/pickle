@@ -1185,8 +1185,7 @@ pickle_result_t vulkan_render_frame(vulkan_ctx_t *ctx, mpv_handle *mpv, mpv_rend
         // we're using a placeholder for now
         // A real implementation would integrate properly with MPV's Vulkan rendering
         
-        // Just log that we would render the frame
-        LOG_DEBUG("MPV has frame available for rendering");
+
     }
     
     // End render pass
@@ -1195,8 +1194,6 @@ pickle_result_t vulkan_render_frame(vulkan_ctx_t *ctx, mpv_handle *mpv, mpv_rend
     // Apply keystone correction if enabled and compute shader is available
     keystone_t *keystone = keystone_get_config();
     if (keystone && keystone->enabled && ctx->compute.initialized) {
-        LOG_DEBUG("Applying keystone correction with Vulkan compute shader");
-        
         // Apply keystone correction to the rendered frame
         vulkan_compute_keystone_apply(ctx, ctx->swapchain.images[image_index], keystone);
     }

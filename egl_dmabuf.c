@@ -161,9 +161,6 @@ bool create_texture_from_v4l2_dmabuf(egl_ctx_t *e, int dmabuf_fd, uint32_t width
     *out_texture = texture;
     *out_image = image;
     
-    LOG_DEBUG("Created OpenGL texture %u from V4L2 DMA-BUF fd %d (%ux%u, stride=%u)", 
-              texture, dmabuf_fd, width, height, stride);
-    
     return true;
 }
 

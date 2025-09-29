@@ -25,7 +25,6 @@ extern int g_help_toggle_request;
 // Define logging macros similar to other Pickle components
 #define LOG_EVENT(fmt, ...) fprintf(stderr, "[EVENT] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) do { if (g_debug) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
 
 // DRM event callback
@@ -83,9 +82,7 @@ void keyboard_event_callback(int fd, uint32_t events, void *user_data) {
     
     char c;
     if (read(fd, &c, 1) > 0) {
-        // Log keypress for debugging
-        LOG_DEBUG("Key pressed: %d (0x%02x) '%c'", 
-                 (int)c, (int)c, (c >= 32 && c < 127) ? c : '?');
+
         
         // Debug numeric keys specifically
         if (c >= '1' && c <= '4') {
@@ -99,11 +96,9 @@ void keyboard_event_callback(int fd, uint32_t events, void *user_data) {
         if (c == 27) { // ESC character starts a sequence
             seq[0] = c;
             seq_pos = 1;
-            LOG_DEBUG("Escape sequence started");
             return; // Wait for more characters
         } else if (seq_pos == 1 && c == '[') { // Second char in sequence
             seq[seq_pos++] = c;
-            LOG_DEBUG("Escape sequence continued: ESC [");
             return; // Wait for final character
         } else if (seq_pos == 2) { // Third and final char in most sequences
             seq[seq_pos++] = c;
@@ -198,7 +193,6 @@ void keyboard_event_callback(int fd, uint32_t events, void *user_data) {
         
         // Handle keystone adjustment keys
         bool keystone_handled = keystone_handle_key(c);
-        LOG_DEBUG("Keystone handler returned: %d", keystone_handled);
         if (keystone_handled) {
             // Force a redraw when keystone parameters change
             g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
