@@ -26,8 +26,8 @@
 # RPi4 optimized build
 rpi4:
 	@$(MAKE) clean
-	@$(MAKE) $(APP) RPI4_OPT=1 V4L2=1
-	@echo "Built RPi4 optimized binary: $(APP)"
+	@$(MAKE) $(APP) RPI4_OPT=1 FFMPEG_V4L2=1
+	@echo "Built RPi4 optimized binary with FFmpeg V4L2 M2M: $(APP)"
 
 # Maximum performance build
 maxperf:
@@ -38,8 +38,15 @@ maxperf:
 # RPi4 optimized with maximum performance
 rpi4-maxperf:
 	@$(MAKE) clean
-	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 V4L2=1
-	@echo "Built RPi4 optimized binary with max performance: $(APP)"
+	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 FFMPEG_V4L2=1
+	@echo "Built RPi4 optimized binary with FFmpeg V4L2 M2M and max performance: $(APP)"
+
+# RPi4 with FFmpeg V4L2 M2M decoder
+rpi4-ffmpeg:
+	@$(MAKE) clean
+	@$(MAKE) $(APP) RPI4_OPT=1 FFMPEG_V4L2=1
+	@echo "Built RPi4 optimized binary with FFmpeg V4L2 M2M: $(APP)"
+
 # ✅ Create keystone module (keystone.c/keystone.h)
 # ✅ Create utils module (utils.c/utils.h)
 # ✅ Create shader module (shader.c/shader.h)
@@ -51,29 +58,29 @@ rpi4-maxperf:
 APP      := pickle
 
 # Source files - add new modules here
-SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c v4l2_decoder.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c gl_optimize.c decoder_pacing.c
+SOURCES  := pickle.c utils.c shader.c keystone.c keystone_funcs.c keystone_get_config.c drm.c drm_atomic.c drm_keystone.c egl.c egl_dmabuf.c render_video.c zero_copy.c input.c error.c frame_pacing.c render.c render_backend.c mpv.c compute_keystone.c event.c event_callbacks.c pickle_events.c pickle_globals.c mpv_render.c stats_overlay.c gl_optimize.c decoder_pacing.c
 
 # Add Vulkan modules when enabled
 ifeq ($(VULKAN),1)
 SOURCES += vulkan.c vulkan_utils.c vulkan_compute.c
 endif
 
-# Add demuxer module when V4L2 is enabled
-ifeq ($(V4L2),1)
-SOURCES += v4l2_demuxer.c
+# Add FFmpeg V4L2 player when enabled (default for RPI4)
+ifeq ($(FFMPEG_V4L2),1)
+SOURCES += ffmpeg_v4l2_player.c
 endif
 
 OBJECTS  := $(SOURCES:.c=.o)
-HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h v4l2_decoder.h v4l2_player.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h stats_overlay.h
+HEADERS  := utils.h shader.h keystone.h drm.h drm_keystone.h egl.h input.h error.h frame_pacing.h render.h render_backend.h mpv.h compute_keystone.h event.h event_callbacks.h pickle_events.h pickle_globals.h stats_overlay.h
 
 # Add Vulkan headers when enabled
 ifeq ($(VULKAN),1)
 HEADERS += vulkan.h vulkan_utils.h
 endif
 
-# Add demuxer header when V4L2 is enabled
-ifeq ($(V4L2),1)
-HEADERS += v4l2_demuxer.h
+# Add FFmpeg V4L2 player header when enabled
+ifeq ($(FFMPEG_V4L2),1)
+HEADERS += ffmpeg_v4l2_player.h
 endif
 
 # Toolchain / standards
@@ -93,11 +100,17 @@ NO_MPV  ?= 0   # build with -DPICKLE_NO_MPV_DEFAULT so runtime can skip mpv init
 PERF    ?= 0   # high-performance build tweaks (e.g. make PERF=1)
 EVENT   ?= 1   # Enable event-driven architecture
 V4L2    ?= 1   # Enable V4L2 hardware decoding support
+FFMPEG_V4L2 ?= 0  # Enable FFmpeg V4L2 M2M decoder (alternative to direct V4L2)
 
 PKGS       := mpv gbm egl glesv2 libdrm libv4l2
 
 # Add FFmpeg libraries for MP4 demuxing when V4L2 is enabled
 ifeq ($(V4L2),1)
+PKGS += libavformat libavcodec libavutil
+endif
+
+# Add FFmpeg libraries when FFmpeg V4L2 player is enabled
+ifeq ($(FFMPEG_V4L2),1)
 PKGS += libavformat libavcodec libavutil
 endif
 
@@ -157,16 +170,12 @@ ifeq ($(EVENT),1)
 	CFLAGS += -DEVENT_DRIVEN_ENABLED=1
 endif
 
-
-
-# Check for V4L2 decoder support
-ifeq ($(V4L2),1)
-CFLAGS += -DUSE_V4L2_DECODER=1
-# Enable V4L2 demuxer by default when V4L2 is enabled
-# Set V4L2_DEMUX=0 to disable: make V4L2=1 V4L2_DEMUX=0
-ifneq ($(V4L2_DEMUX),0)
-CFLAGS += -DENABLE_V4L2_DEMUXER=1
-endif
+# Check for FFmpeg V4L2 player support
+ifeq ($(FFMPEG_V4L2),1)
+	CFLAGS += -DUSE_FFMPEG_V4L2_PLAYER=1
+	# Add FFmpeg libraries
+	PKG_CFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil 2>/dev/null || echo "")
+	PKG_LIBS   += $(shell pkg-config --libs libavformat libavcodec libavutil 2>/dev/null || echo "-L/usr/local/lib -lavformat -lavcodec -lavutil")
 endif
 
 # Allow CFLAGS to be appended instead of replaced when specified externally
@@ -177,8 +186,6 @@ endif
 # RPi4-specific optimizations
 RPI4_OPT ?= 0
 ifeq ($(RPI4_OPT),1)
-	# Enable V4L2 hardware decoding for RPi4
-	V4L2 = 1
 	# Check if we're on ARM architecture for RPi4 specific flags
 	ARCH := $(shell uname -m)
 	ifeq ($(ARCH),aarch64)
@@ -189,7 +196,7 @@ ifeq ($(RPI4_OPT),1)
 		CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 	endif
 	CFLAGS += -ftree-vectorize -funroll-loops -fprefetch-loop-arrays
-	CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1
+	CFLAGS += -DRPI4_OPTIMIZED=1
 
 endif
 
@@ -209,14 +216,17 @@ ifeq ($(MAXPERF),1)
 	endif
 	# Preserve RPI4 flags if RPI4_OPT is enabled
 	ifeq ($(RPI4_OPT),1)
-		V4L2 = 1
 		ARCH := $(shell uname -m)
 		ifeq ($(ARCH),aarch64)
 			CFLAGS += -mcpu=cortex-a72
 		else ifneq (,$(filter arm%,$(ARCH)))
 			CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard
 		endif
-		CFLAGS += -DRPI4_OPTIMIZED=1 -DUSE_V4L2_DECODER=1
+		CFLAGS += -DRPI4_OPTIMIZED=1
+	endif
+	# Re-add FFmpeg V4L2 flag if enabled (MAXPERF replaces CFLAGS)
+	ifeq ($(FFMPEG_V4L2),1)
+		CFLAGS += -DUSE_FFMPEG_V4L2_PLAYER=1
 	endif
 endif
 
@@ -256,9 +266,9 @@ try-run: $(APP)
 # Build mode convenience targets
 release:
 	@$(MAKE) clean
-	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 V4L2=1
+	@$(MAKE) $(APP) RPI4_OPT=1 MAXPERF=1 FFMPEG_V4L2=1
 	strip -s $(APP)
-	@echo "Built and stripped RPi4 optimized binary with max performance: $(APP)"
+	@echo "Built and stripped RPi4 optimized binary with FFmpeg V4L2 M2M and max performance: $(APP)"
 	@ls -lh $(APP)
 
 debug: CFLAGS := -O0 -g3 $(WARN) -std=$(CSTD) $(PKG_CFLAGS)

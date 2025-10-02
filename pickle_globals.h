@@ -35,4 +35,7 @@ void show_help_overlay(mpv_handle *mpv);
 void hide_help_overlay(mpv_handle *mpv);
 bool handle_joystick_event(struct js_event *event);
 
+// Helper function for presenting GBM buffers (used by FFmpeg V4L2 and others)
+bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e);
+
 #endif /* PICKLE_GLOBALS_H */

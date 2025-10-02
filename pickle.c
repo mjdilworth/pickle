@@ -73,10 +73,11 @@ extern bool render_frame_mpv(mpv_handle *mpv, mpv_render_context *mpv_gl, kms_ct
 #include "pickle_events.h"
 #endif
 
-#include "v4l2_decoder.h"
-#ifdef USE_V4L2_DECODER
-#include <libavcodec/avcodec.h>
+// FFmpeg V4L2 player support
+#ifdef USE_FFMPEG_V4L2_PLAYER
+#include "ffmpeg_v4l2_player.h"
 #endif
+
 #include <execinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -414,9 +415,12 @@ typedef struct fb_ring_entry fb_ring_entry_t;
 // Global state 
 static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
-int g_use_v4l2_decoder = 0; // Use V4L2 decoder instead of MPV's internal decoder
-int g_v4l2_fallback_requested = 0; // Set when V4L2 fails and should fall back to MPV
 double g_video_fps = 60.0; // Detected video frame rate (default to 60fps)
+
+#ifdef USE_FFMPEG_V4L2_PLAYER
+int g_use_ffmpeg_v4l2 = 0; // Use FFmpeg V4L2 M2M decoder
+static ffmpeg_v4l2_player_t ffmpeg_v4l2_player = {0}; // FFmpeg V4L2 player instance
+#endif
 
 // These keystone settings are defined in keystone.c through pickle_keystone adapter
 // Removed static variables and using extern from pickle_keystone.h
@@ -431,7 +435,7 @@ static GLint  g_border_a_position_loc = -1;
 static GLint  g_border_u_color_loc = -1;
 
 // GPU-based NV12 to RGB conversion shader
-static GLuint g_nv12_shader_program = 0;
+GLuint g_nv12_shader_program = 0;
 static GLuint g_nv12_vertex_shader = 0;
 static GLuint g_nv12_fragment_shader = 0;
 static GLint  g_nv12_a_position_loc = -1;
@@ -2114,7 +2118,7 @@ static bool convert_nv12_to_rgb_texture_gpu(const v4l2_decoded_frame_t *frame, G
     if (g_nv12_shader_program == 0) {
         if (!init_nv12_shader()) {
             LOG_ERROR("Failed to initialize NV12 shader, falling back to CPU conversion");
-            return convert_nv12_to_rgb_texture((v4l2_decoded_frame_t*)frame, rgb_texture);
+            return false;  // No CPU fallback available in this context
         }
         LOG_INFO("GPU-based NV12 conversion initialized");
     }
@@ -2309,6 +2313,122 @@ void bo_destroy_handler(struct gbm_bo *bo, void *data) {
 		if (h->fb) drmModeRmFB(h->fd, h->fb);
 		free(h);
 	}
+}
+
+/**
+ * Present GBM surface buffer to screen with page flip
+ * Called after eglSwapBuffers() to actually display the frame
+ * Handles both initial modeset and subsequent page flips
+ */
+bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
+	// Get front buffer after eglSwapBuffers
+	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
+	if (!bo) {
+		fprintf(stderr, "gbm_surface_lock_front_buffer failed\n");
+		return false;
+	}
+	
+	// Get or create framebuffer ID
+	struct fb_holder *h = gbm_bo_get_user_data(bo);
+	uint32_t fb_id = h ? h->fb : 0;
+	
+	if (!fb_id) {
+		uint32_t handle = gbm_bo_get_handle(bo).u32;
+		uint32_t pitch = gbm_bo_get_stride(bo);
+		uint32_t width = gbm_bo_get_width(bo);
+		uint32_t height = gbm_bo_get_height(bo);
+		
+		if (!g_scanout_disabled && drmModeAddFB(d->fd, width, height, 24, 32, pitch, handle, &fb_id)) {
+			fprintf(stderr, "drmModeAddFB failed (w=%u h=%u pitch=%u handle=%u err=%s)\n",
+					width, height, pitch, handle, strerror(errno));
+			gbm_surface_release_buffer(e->gbm_surf, bo);
+			return false;
+		}
+		
+		struct fb_holder *nh = calloc(1, sizeof(*nh));
+		if (!nh) {
+			fprintf(stderr, "Out of memory allocating fb_holder\n");
+			gbm_surface_release_buffer(e->gbm_surf, bo);
+			return false;
+		}
+		nh->fb = fb_id;
+		nh->fd = d->fd;
+		gbm_bo_set_user_data(bo, nh, bo_destroy_handler);
+	}
+	
+	// Check if this is the first frame
+	static bool first_frame = true;
+	
+	if (!g_scanout_disabled && first_frame) {
+		// Initial modeset
+		bool success = false;
+		
+		if (d->atomic_supported) {
+			success = atomic_present_framebuffer(d, fb_id, g_vsync_enabled);
+		} else {
+			success = (drmModeSetCrtc(d->fd, d->crtc_id, fb_id, 0, 0, &d->connector_id, 1, &d->mode) == 0);
+		}
+		
+		if (!success) {
+			fprintf(stderr, "[ERROR] Initial modeset failed: %s\n", strerror(errno));
+			gbm_surface_release_buffer(e->gbm_surf, bo);
+			return false;
+		}
+		
+		first_frame = false;
+		g_first_frame_bo = bo;  // Retain this BO until first page flip completes
+		return true;  // Do not release now - buffer needed for scanout
+	} else if (!g_scanout_disabled) {
+		// Subsequent page flips
+		g_egl_for_handler = e;  // Set for page flip handler
+		
+		// Wait for pending flip if needed
+		int max_pending = g_triple_buffer ? 2 : 1;
+		
+		if (g_pending_flips >= max_pending) {
+			// Wait for a pending flip to complete
+			fd_set fds;
+			FD_ZERO(&fds);
+			FD_SET(d->fd, &fds);
+			
+			struct timeval timeout = {0, 100000}; // 100ms
+			
+			if (select(d->fd + 1, &fds, NULL, NULL, &timeout) <= 0) {
+				// Timeout - force reset
+				if (g_debug) fprintf(stderr, "[buffer] Page flip wait timeout, resetting state\n");
+				g_pending_flip = 0;
+			} else if (FD_ISSET(d->fd, &fds)) {
+				// Handle the page flip event
+				drmEventContext ev = {
+					.version = DRM_EVENT_CONTEXT_VERSION,
+					.page_flip_handler = page_flip_handler
+				};
+				drmHandleEvent(d->fd, &ev);
+			}
+		}
+		
+		// Perform page flip
+		if (d->atomic_supported) {
+			if (!atomic_present_framebuffer(d, fb_id, g_vsync_enabled)) {
+				gbm_surface_release_buffer(e->gbm_surf, bo);
+				return false;
+			}
+		} else {
+			if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
+				if (g_debug) fprintf(stderr, "[ERROR] drmModePageFlip failed: %s\n", strerror(errno));
+				gbm_surface_release_buffer(e->gbm_surf, bo);
+				return false;
+			}
+		}
+		
+		g_pending_flip = 1;
+		g_pending_flips++;
+	} else {
+		// Offscreen mode - just release buffer
+		gbm_surface_release_buffer(e->gbm_surf, bo);
+	}
+	
+	return true;
 }
 
 #ifdef USE_V4L2_DECODER
@@ -3267,7 +3387,7 @@ int main(int argc, char **argv) {
 				g_loop_playback = 1;
 				break;
 			case 'm':
-				g_use_v4l2_decoder = -1;  // Explicitly disable V4L2
+				// Option removed - old V4L2 decoder no longer supported
 				break;
 			case 'n':
 				g_vsync_enabled = 0;
@@ -3355,7 +3475,6 @@ int main(int argc, char **argv) {
 	struct kms_ctx drm = {0};
 	struct egl_ctx eglc = {0};
 	mpv_player_t player = {0};
-	v4l2_player_t v4l2_player = {0};
 
 	// Parse stats env
 	const char *stats_env = getenv("PICKLE_STATS");
@@ -3465,56 +3584,59 @@ int main(int argc, char **argv) {
     }
 
 	
-	// Try V4L2 hardware decoder first (if built with V4L2 support), fallback to MPV
-#ifdef USE_V4L2_DECODER
-	bool v4l2_attempted = false;
-	if (g_use_v4l2_decoder == 0) {
-		// Auto-enable V4L2 when available, unless explicitly disabled
-		if (v4l2_decoder_is_supported()) {
-			LOG_INFO("V4L2 hardware decoder available, using it for better performance");
-			g_use_v4l2_decoder = 1;
-		}
-	} else if (g_use_v4l2_decoder == -1) {
-		// Explicitly disabled via command line
-		LOG_INFO("V4L2 hardware decoder disabled via command line flag");
-		g_use_v4l2_decoder = 0;
+	// Try hardware decoders first (if built with support), fallback to MPV
+	
+#ifdef USE_FFMPEG_V4L2_PLAYER
+	// Priority 1: Try FFmpeg V4L2 M2M decoder (most reliable for MP4/container formats)
+	bool ffmpeg_v4l2_attempted = false;
+	// Auto-enable FFmpeg V4L2 when available
+	if (ffmpeg_v4l2_is_supported()) {
+		LOG_INFO("FFmpeg V4L2 M2M decoder available, using it for better performance");
+		g_use_ffmpeg_v4l2 = 1;
 	}
 	
-	if (g_use_v4l2_decoder) {
-		v4l2_attempted = true;
-		// Check if V4L2 decoder is supported
-		if (!v4l2_decoder_is_supported()) {
-			LOG_WARN("V4L2 decoder not supported on this platform. Falling back to MPV.");
-			g_use_v4l2_decoder = 0;
+	if (g_use_ffmpeg_v4l2) {
+		ffmpeg_v4l2_attempted = true;
+		if (!init_ffmpeg_v4l2_player(&ffmpeg_v4l2_player, file)) {
+			LOG_WARN("FFmpeg V4L2 decoder initialization failed. Falling back to MPV.");
+			g_use_ffmpeg_v4l2 = 0;
 		} else {
-			if (!init_v4l2_decoder(&v4l2_player, file)) {
-				LOG_WARN("V4L2 decoder initialization failed. Falling back to MPV.");
-				g_use_v4l2_decoder = 0;
-			}
+			// Successfully initialized FFmpeg V4L2
+			g_video_fps = ffmpeg_v4l2_player.fps;
+			LOG_INFO("FFmpeg V4L2 player initialized: %ux%u @ %.2f fps", 
+			         ffmpeg_v4l2_player.width, ffmpeg_v4l2_player.height, g_video_fps);
 		}
 	}
 	
-	// Fall back to MPV if V4L2 is not used or failed
-	if (!g_use_v4l2_decoder) {
-		if (v4l2_attempted) {
+	// Fall back to MPV if FFmpeg V4L2 failed
+	if (!g_use_ffmpeg_v4l2) {
+		if (ffmpeg_v4l2_attempted) {
 			LOG_INFO("Initializing MPV decoder as fallback");
 		} else {
 			LOG_INFO("Initializing MPV decoder");
 		}
 		if (!init_mpv(&player, file)) RET("init_mpv");
-		// Prime event processing in case mpv already queued wakeups before pipe creation.
 		g_mpv_wakeup = 1;
 	}
+	
 #else
-	// No V4L2 support compiled in, use MPV directly
-	LOG_INFO("Initializing MPV decoder (V4L2 support not compiled in)");
+	// No FFmpeg V4L2 support compiled in, use MPV directly
+	LOG_INFO("Initializing MPV decoder (FFmpeg V4L2 support not compiled in)");
 	if (!init_mpv(&player, file)) RET("init_mpv");
 	g_mpv_wakeup = 1;
 #endif
 
+	// Determine which decoder is active for display message
+	const char *decoder_name = "MPV";
+#ifdef USE_FFMPEG_V4L2_PLAYER
+	if (g_use_ffmpeg_v4l2) {
+		decoder_name = "FFmpeg V4L2 M2M";
+	}
+#endif
+
 	fprintf(stderr, "Playing %s at %dx%d %.2f Hz using %s\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
 			(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal)),
-			g_use_v4l2_decoder ? "V4L2 decoder" : "MPV");
+			decoder_name);
 	
 	// Print keystone control instructions
 	if (g_keystone.enabled) {
@@ -3536,11 +3658,13 @@ int main(int argc, char **argv) {
 	int frames = 0;
 	int force_loop = getenv("PICKLE_FORCE_RENDER_LOOP") ? 1 : 0;
 	
-	// V4L2 decoder requires continuous polling, so always enable force_loop mode
-	if (g_use_v4l2_decoder) {
+	// Hardware decoders require continuous polling, so always enable force_loop mode
+#ifdef USE_FFMPEG_V4L2_PLAYER
+	if (g_use_ffmpeg_v4l2) {
 		force_loop = 1;
-		LOG_DEBUG("V4L2 decoder enabled, forcing continuous render loop for active polling");
+		LOG_DEBUG("FFmpeg V4L2 decoder enabled, forcing continuous render loop for active polling");
 	}
+#endif
 	struct timeval wd_last_activity; gettimeofday(&wd_last_activity, NULL);
 	gettimeofday(&g_last_frame_time, NULL); // Initialize last frame time
 	int wd_forced_first = 0;
@@ -3585,7 +3709,7 @@ int main(int argc, char **argv) {
 	
 #ifdef EVENT_DRIVEN_ENABLED
 	// Initialize the event-driven architecture
-	event_ctx_t *event_ctx = pickle_event_init(&drm, &player, g_use_v4l2_decoder ? &v4l2_player : NULL);
+	event_ctx_t *event_ctx = pickle_event_init(&drm, &player, NULL);
 	if (!event_ctx) {
 		LOG_ERROR("Failed to initialize event system");
 		goto cleanup;
@@ -3595,7 +3719,7 @@ int main(int argc, char **argv) {
 	// Main loop using event-driven architecture
 	while (!g_stop) {
 		if (!pickle_event_process_and_render(event_ctx, &drm, &eglc, &player, 
-		                                   g_use_v4l2_decoder ? &v4l2_player : NULL, 100)) {
+		                                   NULL, 100)) {
 			break;
 		}
 		stats_log_periodic(&player);
@@ -3605,66 +3729,43 @@ int main(int argc, char **argv) {
 	pickle_event_cleanup(event_ctx);
 #else
 	// Original polling-based main loop
+	fprintf(stderr, "[MAIN] Entering main loop, force_loop=%d\n", force_loop);
+	fflush(stderr);
 	while (!g_stop) {
-		// Handle decoder-specific events
-		if (!g_use_v4l2_decoder) {
-			// MPV-specific event handling
-			if (g_mpv_wakeup) {
-				g_mpv_wakeup = 0;
-				drain_mpv_events(player.mpv);
-				if (player.rctx) {
-					uint64_t flags = mpv_render_context_update(player.rctx);
-					g_mpv_update_flags |= flags;
-				}
-			}
-			
-			// Periodically update video FPS from MPV
-			static struct timeval last_fps_query = {0, 0};
-			struct timeval now_fps;
-			gettimeofday(&now_fps, NULL);
-			if (last_fps_query.tv_sec == 0) {
-				last_fps_query = now_fps;
-			}
-			double fps_elapsed = tv_diff(&last_fps_query, &now_fps);
-			if (fps_elapsed > 5.0) { // Query every 5 seconds
-				double container_fps = 0.0;
-				if (mpv_get_property(player.mpv, "container-fps", MPV_FORMAT_DOUBLE, &container_fps) >= 0 && container_fps > 0) {
-					static double last_reported_fps = 0.0;
-					if (g_video_fps != container_fps) { // Only log when FPS actually changes
-						g_video_fps = container_fps;
-						if (container_fps != last_reported_fps) {
-							LOG_INFO("Updated video FPS from MPV: %.2f fps", g_video_fps);
-							last_reported_fps = container_fps;
-						}
-					}
-				}
-				last_fps_query = now_fps;
-			}
-		} else {
-			// V4L2 decoder specific handling
-			// Periodic frame processing at video frame rate, but not constant polling
-			struct timeval now;
-			gettimeofday(&now, NULL);
-			static struct timeval last_v4l2_update = {0, 0};
-			if (last_v4l2_update.tv_sec == 0) {
-				last_v4l2_update = now;
-			}
-			double elapsed = tv_diff(&now, &last_v4l2_update) * 1000.0; // ms
-			double frame_interval_ms = 1000.0 / g_video_fps; // Adaptive frame interval
-			if (elapsed > frame_interval_ms) {
-				// Only check for frames at the video frame rate, not constantly
-				if (v4l2_player.decoder) {
-					// Quick non-blocking check if V4L2 decoder has frames ready
-					int poll_result = v4l2_decoder_poll(v4l2_player.decoder, 0);
-					if (poll_result > 0) {
-						// V4L2 decoder has frames available, request a render
-						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
-					}
-				}
-				last_v4l2_update = now;
+		fprintf(stderr, "[MAIN] Top of loop iteration\n");
+		fflush(stderr);
+		// MPV event handling
+		if (g_mpv_wakeup && player.mpv) {
+			g_mpv_wakeup = 0;
+			drain_mpv_events(player.mpv);
+			if (player.rctx) {
+				uint64_t flags = mpv_render_context_update(player.rctx);
+				g_mpv_update_flags |= flags;
 			}
 		}
-		// Check controller quit combo (START+SELECT 2s)
+		
+		// Periodically update video FPS from MPV
+		static struct timeval last_fps_query = {0, 0};
+		struct timeval now_fps;
+		gettimeofday(&now_fps, NULL);
+	if (last_fps_query.tv_sec == 0) {
+		last_fps_query = now_fps;
+	}
+	double fps_elapsed = tv_diff(&last_fps_query, &now_fps);
+	if (fps_elapsed > 5.0) { // Query every 5 seconds
+		double container_fps = 0.0;
+		if (player.mpv && mpv_get_property(player.mpv, "container-fps", MPV_FORMAT_DOUBLE, &container_fps) >= 0 && container_fps > 0) {
+			static double last_reported_fps = 0.0;
+			if (g_video_fps != container_fps) { // Only log when FPS actually changes
+				g_video_fps = container_fps;
+				if (container_fps != last_reported_fps) {
+					LOG_INFO("Updated video FPS from MPV: %.2f fps", g_video_fps);
+					last_reported_fps = container_fps;
+				}
+			}
+		}
+		last_fps_query = now_fps;
+	}		// Check controller quit combo (START+SELECT 2s)
 		if (is_joystick_enabled()) {
 			// Polling cadence: on every loop iteration; guarded by state flags
 			struct timeval now; gettimeofday(&now, NULL);
@@ -3687,14 +3788,16 @@ int main(int argc, char **argv) {
 		// Process help toggle request from controller
 		if (g_help_toggle_request) {
 			g_help_toggle_request = 0;
-			if (!g_help_visible) {
-				show_help_overlay(player.mpv);
-				g_help_visible = 1;
-			} else {
-				hide_help_overlay(player.mpv);
-				g_help_visible = 0;
+			if (player.mpv) {
+				if (!g_help_visible) {
+					show_help_overlay(player.mpv);
+					g_help_visible = 1;
+				} else {
+					hide_help_overlay(player.mpv);
+					g_help_visible = 0;
+				}
+				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 			}
-			g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
 		}
 		// Prepare pollfds: DRM fd (for page flip events) + mpv wakeup pipe + stdin for keyboard + joystick
 		struct pollfd pfds[4]; int n=0;
@@ -3769,8 +3872,9 @@ int main(int argc, char **argv) {
 						continue;
 					}
 					
-					// Help overlay
-					if (c == 'h' && !g_key_seq_state.in_escape_seq) {
+				// Help overlay
+				if (c == 'h' && !g_key_seq_state.in_escape_seq) {
+					if (player.mpv) {
 						if (!g_help_visible) {
 							show_help_overlay(player.mpv);
 							g_help_visible = 1;
@@ -3779,10 +3883,9 @@ int main(int argc, char **argv) {
 							g_help_visible = 0;
 						}
 						g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME;
-						continue;
 					}
-
-					// Handle keystone adjustment keys first (to avoid 'q' conflict)
+					continue;
+				}					// Handle keystone adjustment keys first (to avoid 'q' conflict)
 					bool keystone_handled = handle_keyboard_input(c);
 					LOG_DEBUG("Keystone handler returned: %d", keystone_handled);
 					if (keystone_handled) {
@@ -3817,7 +3920,7 @@ int main(int argc, char **argv) {
 		
 		// Process held D-pad buttons for continuous movement
 		process_dpad_movement();
-		if (g_mpv_wakeup) {
+		if (g_mpv_wakeup && player.mpv) {
 			g_mpv_wakeup = 0;
 			drain_mpv_events(player.mpv);
 			if (player.rctx) {
@@ -3830,6 +3933,9 @@ int main(int argc, char **argv) {
 		if (frames == 0 && !g_pending_flip) need_frame = 1; // guarantee first frame submission
 		else if (force_loop && !g_pending_flip) need_frame = 1; // continuous mode
 		else if ((g_mpv_update_flags & MPV_RENDER_UPDATE_FRAME) && !g_pending_flip) need_frame = 1;
+		
+		fprintf(stderr, "[LOOP] frames=%d, force_loop=%d, pending_flip=%d, need_frame=%d\n", 
+				frames, force_loop, g_pending_flip, need_frame);
 
 		// Watchdog: if still no frame after WD_FIRST_MS since start, force once.
 		if (!frames && !need_frame && !wd_forced_first) {
@@ -3855,14 +3961,12 @@ int main(int argc, char **argv) {
 				g_pending_flip = 0;
 				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME; // Force frame rendering
 				need_frame = 1;
-				g_stall_reset_count++;
-				
-				// Try to get mpv back on track by forcing an update
-				if (player.rctx) {
-					uint64_t flags = mpv_render_context_update(player.rctx);
-					g_mpv_update_flags |= flags;
-					
-					// Reset decoder if needed (for more aggressive recovery)
+			g_stall_reset_count++;
+			
+			// Try to get mpv back on track by forcing an update
+			if (player.rctx && player.mpv) {
+				uint64_t flags = mpv_render_context_update(player.rctx);
+				g_mpv_update_flags |= flags;					// Reset decoder if needed (for more aggressive recovery)
 					if (g_stall_reset_count > 1) {
 						// When looping, first check if we're at the end of the file
 						if (g_loop_playback) {
@@ -3897,51 +4001,40 @@ int main(int argc, char **argv) {
 		if (need_frame) {
 			if (g_debug && frames < 10) fprintf(stderr, "[debug] rendering frame #%d flags=0x%llx pending_flip=%d\n", frames, (unsigned long long)g_mpv_update_flags, g_pending_flip);
 			
-			bool render_success = false;
-			if (g_use_v4l2_decoder) {
-				render_success = render_v4l2_frame(&drm, &eglc, &v4l2_player);
-				
-				// Check if V4L2 decoder has requested fallback to MPV
-				if (g_v4l2_fallback_requested) {
-					LOG_WARN("V4L2 decoder failed, switching to MPV fallback");
-					
-					// Cleanup V4L2 decoder resources
-					if (v4l2_player.decoder) {
-						v4l2_decoder_destroy(v4l2_player.decoder);
-						v4l2_player.decoder = NULL;
-					}
-					if (v4l2_player.input_file) {
-						fclose(v4l2_player.input_file);
-						v4l2_player.input_file = NULL;
-					}
-					if (v4l2_player.buffer) {
-						free(v4l2_player.buffer);
-						v4l2_player.buffer = NULL;
-					}
-					
-					// Initialize MPV as fallback
-					LOG_INFO("Initializing MPV decoder as fallback");
-					if (!init_mpv(&player, file)) {
-						LOG_ERROR("Failed to initialize MPV fallback decoder");
-						break;
-					}
-					
-					// Switch to MPV mode
-					g_use_v4l2_decoder = 0;
-					g_v4l2_fallback_requested = 0;
-					g_mpv_wakeup = 1;
-					
-					LOG_INFO("Successfully switched to MPV decoder");
-					fprintf(stderr, "Switched to MPV decoder due to V4L2 failure\n");
-					
-					// Continue with MPV rendering
-					render_success = render_frame_fixed(&drm, &eglc, &player);
+			fprintf(stderr, "[MAIN] need_frame=1, frames=%d, pending_flip=%d\n", frames, g_pending_flip);
+			
+		bool render_success = false;
+		
+#ifdef USE_FFMPEG_V4L2_PLAYER
+		if (g_use_ffmpeg_v4l2) {
+			// FFmpeg V4L2 M2M decoder rendering path
+			fprintf(stderr, "[MAIN] Calling ffmpeg_v4l2_get_frame...\n");
+			if (ffmpeg_v4l2_get_frame(&ffmpeg_v4l2_player)) {
+				fprintf(stderr, "[MAIN] Got frame, calling upload_to_gl...\n");
+				if (ffmpeg_v4l2_upload_to_gl(&ffmpeg_v4l2_player)) {
+					fprintf(stderr, "[MAIN] Uploaded, calling render...\n");
+					render_success = render_ffmpeg_v4l2_frame(&drm, &eglc, &ffmpeg_v4l2_player);
+					fprintf(stderr, "[MAIN] Render returned: %d\n", render_success);
+				} else {
+					fprintf(stderr, "[MAIN] Upload FAILED\n");
 				}
 			} else {
-				render_success = render_frame_fixed(&drm, &eglc, &player);
+				fprintf(stderr, "[MAIN] Get frame failed, EOF=%d\n", ffmpeg_v4l2_player.eof_reached);
+				if (ffmpeg_v4l2_player.eof_reached && g_loop_playback) {
+					// Reset for loop playback
+					ffmpeg_v4l2_reset(&ffmpeg_v4l2_player);
+				} else if (ffmpeg_v4l2_player.eof_reached) {
+					// End of video in non-loop mode
+					LOG_INFO("End of video reached");
+					g_stop = 1;
+					break;
+				}
 			}
-			
-			if (!render_success) { 
+		} else
+#endif
+		{
+			render_success = render_frame_fixed(&drm, &eglc, &player);
+		}			if (!render_success) { 
 				fprintf(stderr, "Render failed, exiting\n"); 
 				break; 
 			}
@@ -4000,9 +4093,23 @@ int main(int argc, char **argv) {
 	// Clean up keystone resources
 	keystone_cleanup();
 	
-	if (g_use_v4l2_decoder) {
-		destroy_v4l2_decoder(&v4l2_player, &eglc);
-	} else {
+	// Release first frame BO if still held (must be done before deinit_gbm_egl)
+	if (g_first_frame_bo && g_egl_for_handler && g_egl_for_handler->gbm_surf) {
+		gbm_surface_release_buffer(g_egl_for_handler->gbm_surf, g_first_frame_bo);
+		g_first_frame_bo = NULL;
+	}
+
+	// Clean up decoder resources
+#ifdef USE_FFMPEG_V4L2_PLAYER
+	if (g_use_ffmpeg_v4l2) {
+		// Make sure EGL context is current for GL cleanup
+		if (eglc.dpy != EGL_NO_DISPLAY && eglc.ctx != EGL_NO_CONTEXT && eglc.surf != EGL_NO_SURFACE) {
+			eglMakeCurrent(eglc.dpy, eglc.surf, eglc.surf, eglc.ctx);
+		}
+		cleanup_ffmpeg_v4l2_player(&ffmpeg_v4l2_player);
+	} else
+#endif
+	{
 		destroy_mpv(&player);
 	}
 	deinit_gbm_egl(&eglc);
@@ -4022,11 +4129,7 @@ fail:
 	// Clean up keystone resources
 	keystone_cleanup();
 	
-	if (g_use_v4l2_decoder) {
-		destroy_v4l2_decoder(&v4l2_player, &eglc);
-	} else {
-		destroy_mpv(&player);
-	}
+	destroy_mpv(&player);
 	deinit_gbm_egl(&eglc);
 	deinit_drm(&drm);
 	return 1;
