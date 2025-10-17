@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
 #include <GLES3/gl31.h>
@@ -24,6 +25,8 @@ typedef struct {
     AVFormatContext *format_ctx;
     AVCodecContext *codec_ctx;
     const AVCodec *codec;
+    AVBSFContext *bsf_ctx;
+    AVBSFContext *bsf_ctx_aud; // optional: h264_metadata with aud=insert
     AVPacket *packet;
     AVFrame *frame;
     int video_stream_index;
@@ -53,6 +56,14 @@ typedef struct {
     bool initialized;
     bool eof_reached;
     bool loop_enabled;
+    bool avcc_extradata_converted;
+    bool fatal_error;
+    bool extradata_injected;
+    bool use_annexb_bsf;
+    bool use_aud_bsf;
+    int avcc_length_size;
+    bool seen_keyframe; // true once we've encountered first keyframe packet
+    bool seen_idr;      // true once we've observed IDR NAL (type 5) from BSF output
     
     // File path
     char *file_path;

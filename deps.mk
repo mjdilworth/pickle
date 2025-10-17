@@ -1,6 +1,6 @@
 pickle.o: pickle.c drm_keystone.h keystone.h drm.h pickle_globals.h egl.h \
  v4l2_player.h v4l2_decoder.h utils.h shader.h input.h compute_keystone.h \
- stats_overlay.h gl_optimize.h decoder_pacing.h
+ stats_overlay.h gl_optimize.h decoder_pacing.h ffmpeg_v4l2_player.h
 utils.o: utils.c utils.h
 shader.o: shader.c shader.h utils.h
 keystone.o: keystone.c keystone.h utils.h shader.h drm_keystone.h drm.h \
@@ -42,3 +42,6 @@ mpv_render.o: mpv_render.c pickle_globals.h drm.h egl.h v4l2_player.h \
 stats_overlay.o: stats_overlay.c stats_overlay.h
 gl_optimize.o: gl_optimize.c gl_optimize.h log.h
 decoder_pacing.o: decoder_pacing.c decoder_pacing.h log.h
+ffmpeg_v4l2_player.o: ffmpeg_v4l2_player.c ffmpeg_v4l2_player.h drm.h \
+ egl.h pickle_globals.h v4l2_player.h v4l2_decoder.h log.h shader.h \
+ keystone.h render.h error.h frame_pacing.h render_backend.h

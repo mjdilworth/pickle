@@ -33,7 +33,7 @@
 - **B (button 1)**: Toggle border/help display  
 - **Y (button 3)**: [Available for corner selection when cycling disabled]
 
-### **System Buttons**
+### **System Buttons**c
 - **START (button 7)**: ✅ **NEW** - Toggle keystone mode
 - **SELECT (button 6)**: ✅ **NEW** - Reset keystone to defaults
 - **HOME/Guide (button 10)**: ✅ **NEW** - Toggle border display
