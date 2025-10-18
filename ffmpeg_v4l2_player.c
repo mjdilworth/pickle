@@ -5,6 +5,11 @@
 #include "shader.h"
 #include "keystone.h"
 #include "render.h"
+
+// Debug flag for BSF/filter packet dumps - set to 0 to disable detailed packet logging
+#ifndef FFMPEG_V4L2_DEBUG_BSF
+#define FFMPEG_V4L2_DEBUG_BSF 0
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -230,6 +235,7 @@ static int scan_nal_types(const uint8_t *data, int size, int max_out, int *out_t
 
 // --- Memory tracking helpers ---
 
+#if FFMPEG_V4L2_DEBUG_BSF
 static int64_t last_memory_log_time = 0;  // Throttle memory logging to once per second
 
 static void log_memory_usage(const char *context) {
@@ -252,12 +258,13 @@ static void log_memory_usage(const char *context) {
     }
     fclose(status);
     
-    LOG_INFO("[MEMORY] %s: VmSize=%ld MB, VmRSS=%ld MB, VmPeak=%ld MB",
+    LOG_DEBUG("[MEMORY] %s: VmSize=%ld MB, VmRSS=%ld MB, VmPeak=%ld MB",
              context, vm_size/1024, vm_rss/1024, vm_peak/1024);
     
     // Update the last log time
     last_memory_log_time = current_time;
 }
+#endif
 
 typedef enum {
     DELIVERY_CONTINUE = 0,
@@ -537,13 +544,15 @@ static delivery_result_t forward_packet_to_decoder(ffmpeg_v4l2_player_t *player,
     }
 
     if (new_idr) {
+#if FFMPEG_V4L2_DEBUG_BSF
         if (strcmp(tag, "AUD") == 0) {
-            LOG_INFO("[AUD] First IDR observed after AUD insertion");
+            LOG_DEBUG("[AUD] First IDR observed after AUD insertion");
         } else if (strcmp(tag, "FILTER") == 0) {
-            LOG_INFO("[FILTER] First IDR observed after SEI/AUD stripping");
+            LOG_DEBUG("[FILTER] First IDR observed after SEI/AUD stripping");
         } else {
-            LOG_INFO("[%s] First IDR observed in Annex-B output", tag);
+            LOG_DEBUG("[%s] First IDR observed in Annex-B output", tag);
         }
+#endif
     }
 
     return deliver_final_access_unit(player,
@@ -795,28 +804,30 @@ static delivery_result_t forward_through_aud(ffmpeg_v4l2_player_t *player,
         // Process ONE packet at a time to maintain send/receive balance
         aud_ret = av_bsf_receive_packet(player->bsf_ctx_aud, player->packet);
         if (aud_ret == 0) {
+#if FFMPEG_V4L2_DEBUG_BSF
             static int aud_dump_count = 0;
             if (aud_dump_count < 4) {
                 int types[8] = {0};
                 int n = scan_nal_types(player->packet->data, player->packet->size, 8, types);
-                LOG_INFO("[AUD] out #%d: size=%d first64=", aud_dump_count + 1, player->packet->size);
+                LOG_DEBUG("[AUD] out #%d: size=%d first64=", aud_dump_count + 1, player->packet->size);
                 const int bytes_to_dump = player->packet->size < 64 ? player->packet->size : 64;
                 char hexbuf[3 * 64 + 1] = {0};
                 int off = 0;
                 for (int i = 0; i < bytes_to_dump; i++) {
                     off += snprintf(hexbuf + off, sizeof(hexbuf) - (size_t)off, "%02X ", player->packet->data[i]);
                 }
-                LOG_INFO("%s", hexbuf);
+                LOG_DEBUG("%s", hexbuf);
                 if (n > 0) {
                     char nalstr[64] = {0};
                     off = 0;
                     for (int i = 0; i < n && i < 8; i++) {
                         off += snprintf(nalstr + off, sizeof(nalstr) - (size_t)off, "%d%s", types[i], (i + 1 < n && i < 7) ? "," : "");
                     }
-                    LOG_INFO("[AUD] NAL sequence (first %d): %s", n, nalstr);
+                    LOG_DEBUG("[AUD] NAL sequence (first %d): %s", n, nalstr);
                 }
                 aud_dump_count++;
             }
+#endif
 
             delivery_result_t result = dispatch_packet_to_decoder(player,
                                                                   player->packet,
@@ -1098,7 +1109,9 @@ static bool switch_to_software_decoder(ffmpeg_v4l2_player_t *player) {
     }
 
     LOG_INFO("Attempting to switch to software decoder");
+#if FFMPEG_V4L2_DEBUG_BSF
     log_memory_usage("Before switching to software decoder");
+#endif
 
     // Get codec parameters from the video stream
     AVCodecParameters *codecpar = player->format_ctx->streams[player->video_stream_index]->codecpar;
@@ -1605,7 +1618,9 @@ bool init_ffmpeg_v4l2_player(ffmpeg_v4l2_player_t *player, const char *file) {
              av_get_pix_fmt_name(player->codec_ctx->pix_fmt),
              player->codec_ctx->width, player->codec_ctx->height);
     
+#if FFMPEG_V4L2_DEBUG_BSF
     log_memory_usage("After codec opened");
+#endif
     
     // Allocate packet and frame
     player->packet = av_packet_alloc();
@@ -1651,7 +1666,9 @@ bool init_ffmpeg_v4l2_player(ffmpeg_v4l2_player_t *player, const char *file) {
         return false;
     }
     
+#if FFMPEG_V4L2_DEBUG_BSF
     log_memory_usage("After NV12 buffer allocated");
+#endif
     
     // Create OpenGL textures for NV12 format
     glGenTextures(1, &player->y_texture);
@@ -1904,8 +1921,10 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
         player->frames_decoded++;
         packet_count = 0;  // Reset packet count on successful frame
         
+#if FFMPEG_V4L2_DEBUG_BSF
         // Log memory usage periodically - using time-based throttling now
         log_memory_usage("During decode");
+#endif
         
         return true;
     }
@@ -2113,28 +2132,30 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
             // Receive ONE BSF output for this input to maintain balance between send and receive operations
             bsf_ret = av_bsf_receive_packet(player->bsf_ctx, player->packet);
             if (bsf_ret == 0) {
+#if FFMPEG_V4L2_DEBUG_BSF
                 static int bsf_dump_count = 0;
                 if (bsf_dump_count < 4) {
                     int types[8] = {0};
                     int n = scan_nal_types(player->packet->data, player->packet->size, 8, types);
-                    LOG_INFO("[BSF] out #%d: size=%d first64=", bsf_dump_count + 1, player->packet->size);
+                    LOG_DEBUG("[BSF] out #%d: size=%d first64=", bsf_dump_count + 1, player->packet->size);
                     const int bytes_to_dump = player->packet->size < 64 ? player->packet->size : 64;
                     char hexbuf[3 * 64 + 1] = {0};
                     int off = 0;
                     for (int i = 0; i < bytes_to_dump; i++) {
                         off += snprintf(hexbuf + off, sizeof(hexbuf) - (size_t)off, "%02X ", player->packet->data[i]);
                     }
-                    LOG_INFO("%s", hexbuf);
+                    LOG_DEBUG("%s", hexbuf);
                     if (n > 0) {
                         char nalstr[64] = {0};
                         off = 0;
                         for (int i = 0; i < n && i < 8; i++) {
                             off += snprintf(nalstr + off, sizeof(nalstr) - (size_t)off, "%d%s", types[i], (i + 1 < n && i < 7) ? "," : "");
                         }
-                        LOG_INFO("[BSF] NAL sequence (first %d): %s", n, nalstr);
+                        LOG_DEBUG("[BSF] NAL sequence (first %d): %s", n, nalstr);
                     }
                     bsf_dump_count++;
                 }
+#endif
 
                 if (player->use_filter_units_bsf && player->bsf_ctx_filter_units) {
                     int filter_ret = av_bsf_send_packet(player->bsf_ctx_filter_units, player->packet);
@@ -2150,28 +2171,30 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
                     // between send and receive operations
                     filter_ret = av_bsf_receive_packet(player->bsf_ctx_filter_units, player->packet);
                     if (filter_ret == 0) {
+#if FFMPEG_V4L2_DEBUG_BSF
                         static int filter_dump_count = 0;
                         if (filter_dump_count < 4) {
                             int types[8] = {0};
                             int n = scan_nal_types(player->packet->data, player->packet->size, 8, types);
-                            LOG_INFO("[FILTER] out #%d: size=%d first64=", filter_dump_count + 1, player->packet->size);
+                            LOG_DEBUG("[FILTER] out #%d: size=%d first64=", filter_dump_count + 1, player->packet->size);
                             const int bytes_to_dump = player->packet->size < 64 ? player->packet->size : 64;
                             char hexbuf[3 * 64 + 1] = {0};
                             int off = 0;
                             for (int i = 0; i < bytes_to_dump; i++) {
                                 off += snprintf(hexbuf + off, sizeof(hexbuf) - (size_t)off, "%02X ", player->packet->data[i]);
                             }
-                            LOG_INFO("%s", hexbuf);
+                            LOG_DEBUG("%s", hexbuf);
                             if (n > 0) {
                                 char nalstr[64] = {0};
                                 off = 0;
                                 for (int i = 0; i < n && i < 8; i++) {
                                     off += snprintf(nalstr + off, sizeof(nalstr) - (size_t)off, "%d%s", types[i], (i + 1 < n && i < 7) ? "," : "");
                                 }
-                                LOG_INFO("[FILTER] NAL sequence (first %d): %s", n, nalstr);
+                                LOG_DEBUG("[FILTER] NAL sequence (first %d): %s", n, nalstr);
                             }
                             filter_dump_count++;
                         }
+#endif
 
                         delivery_result_t result = forward_through_aud(player,
                                                                          start_time,
