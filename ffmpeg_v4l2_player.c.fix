@@ -1,0 +1,85 @@
+// Add the missing function before ffmpeg_v4l2_upload_to_gl
+
+/**
+ * Copy frame data to NV12 buffer with proper format handling
+ */
+static bool copy_frame_to_nv12_buffer(AVFrame *frame, ffmpeg_v4l2_player_t *player,
+                                     const uint8_t **y_plane_out, 
+                                     const uint8_t **uv_plane_out) {
+    if (!frame || !player || !y_plane_out || !uv_plane_out) {
+        return false;
+    }
+
+    enum AVPixelFormat fmt = frame->format;
+    int width = frame->width;
+    int height = frame->height;
+    
+    // Calculate buffer sizes
+    size_t y_plane_size = width * height;
+    size_t uv_plane_size = width * height / 2;
+    size_t required_size = y_plane_size + uv_plane_size;
+    
+    // Ensure our buffer is big enough
+    if (!player->nv12_buffer || player->nv12_buffer_size < required_size) {
+        LOG_ERROR("NV12 staging buffer unavailable or too small (have %zu need %zu)",
+                  player->nv12_buffer_size, required_size);
+        return false;
+    }
+
+    uint8_t *dst_y = player->nv12_buffer;
+    uint8_t *dst_uv = player->nv12_buffer + y_plane_size;
+
+    switch (fmt) {
+    case AV_PIX_FMT_NV12:
+        for (int y = 0; y < height; ++y) {
+            const size_t dst_offset = (size_t)y * (size_t)width;
+            const size_t src_offset = (size_t)y * (size_t)frame->linesize[0];
+            memcpy(dst_y + dst_offset, 
+                   frame->data[0] + src_offset, 
+                   width);
+        }
+
+        // Copy UV plane (interleaved)
+        for (int y = 0; y < height / 2; ++y) {
+            const size_t dst_offset = (size_t)y * (size_t)width;
+            const size_t src_offset = (size_t)y * (size_t)frame->linesize[1];
+            memcpy(dst_uv + dst_offset, 
+                   frame->data[1] + src_offset, 
+                   width);
+        }
+        break;
+        
+    case AV_PIX_FMT_YUV420P:
+        // Copy Y plane
+        for (int y = 0; y < height; ++y) {
+            const size_t dst_offset = (size_t)y * (size_t)width;
+            const size_t src_offset = (size_t)y * (size_t)frame->linesize[0];
+            memcpy(dst_y + dst_offset, 
+                   frame->data[0] + src_offset, 
+                   width);
+        }
+
+        // Interleave U and V planes to UV plane for NV12
+        for (int y = 0; y < height / 2; ++y) {
+            for (int x = 0; x < width / 2; ++x) {
+                const size_t dst_index = y * width + x * 2;
+                const size_t src_index_u = y * frame->linesize[1] + x;
+                const size_t src_index_v = y * frame->linesize[2] + x;
+                
+                dst_uv[dst_index] = frame->data[1][src_index_u];     // U
+                dst_uv[dst_index + 1] = frame->data[2][src_index_v]; // V
+            }
+        }
+        break;
+        
+    default: {
+        const char *fmt_name = av_get_pix_fmt_name(fmt);
+        LOG_WARN("Unsupported pixel format for NV12 conversion: %s", fmt_name ? fmt_name : "unknown");
+        return false;
+    }
+    }
+    
+    *y_plane_out = dst_y;
+    *uv_plane_out = dst_uv;
+    return true;
+}

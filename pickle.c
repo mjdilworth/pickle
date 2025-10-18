@@ -2063,7 +2063,7 @@ static bool init_border_shader() {
 }
 
 // Initialize NV12 to RGB conversion shader
-static bool init_nv12_shader() {
+static bool __attribute__((unused)) init_nv12_shader() {
     g_nv12_vertex_shader = compile_shader(GL_VERTEX_SHADER, g_nv12_vs_src);
     if (!g_nv12_vertex_shader) return false;
     
@@ -2144,7 +2144,7 @@ static bool init_nv12_shader() {
 }
 
 // GPU-based NV12 to RGB conversion using shaders (high performance)
-static bool convert_nv12_to_rgb_texture_gpu(const v4l2_decoded_frame_t *frame, GLuint *rgb_texture) {
+static bool __attribute__((unused)) convert_nv12_to_rgb_texture_gpu(const v4l2_decoded_frame_t *frame, GLuint *rgb_texture) {
     if (!frame || !frame->data || !rgb_texture) return false;
     
     // Initialize NV12 shader if needed

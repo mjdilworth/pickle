@@ -8,6 +8,7 @@
 #include <libavcodec/bsf.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/rational.h>
 #include <GLES3/gl31.h>
 #include "drm.h"
 #include "egl.h"
@@ -26,7 +27,10 @@ typedef struct {
     AVCodecContext *codec_ctx;
     const AVCodec *codec;
     AVBSFContext *bsf_ctx;
+    AVBSFContext *bsf_ctx_filter_units;
     AVBSFContext *bsf_ctx_aud; // optional: h264_metadata with aud=insert
+    AVCodecParserContext *parser_ctx;
+    AVPacket *au_packet; // temporary packet used for parser output
     AVPacket *packet;
     AVFrame *frame;
     int video_stream_index;
@@ -36,6 +40,9 @@ typedef struct {
     uint32_t height;
     double fps;
     int64_t duration;
+    AVRational stream_time_base;
+    int64_t frame_duration; // duration in stream_time_base units
+    int64_t last_valid_pts;
     
     // OpenGL texture for rendering
     GLuint y_texture;
@@ -60,6 +67,7 @@ typedef struct {
     bool fatal_error;
     bool extradata_injected;
     bool use_annexb_bsf;
+    bool use_filter_units_bsf;
     bool use_aud_bsf;
     int avcc_length_size;
     bool seen_keyframe; // true once we've encountered first keyframe packet
@@ -67,6 +75,22 @@ typedef struct {
     
     // File path
     char *file_path;
+    
+    // Threading support
+    bool use_threaded_decoding;
+    void *decode_thread;
+    bool thread_running;
+    bool thread_stop_requested;
+    
+    // Frame queue for threaded decoding
+    struct {
+        AVFrame *frames[3];  // 3-frame queue buffer
+        int write_idx;       // Producer index
+        int read_idx;        // Consumer index
+        int count;           // Number of frames in queue
+        void *mutex;         // Mutex for thread safety
+        void *cond;          // Condition variable for signaling
+    } frame_queue;
 } ffmpeg_v4l2_player_t;
 
 /**
@@ -147,5 +171,29 @@ void ffmpeg_v4l2_get_stats(ffmpeg_v4l2_player_t *player,
  * @param player Pointer to player structure
  */
 void cleanup_ffmpeg_v4l2_player(ffmpeg_v4l2_player_t *player);
+
+/**
+ * Enable threaded decoding mode (must be called before init_ffmpeg_v4l2_player)
+ *
+ * @param player Pointer to player structure
+ * @return true on success, false on failure
+ */
+bool ffmpeg_v4l2_enable_threaded_decoding(ffmpeg_v4l2_player_t *player);
+
+/**
+ * Start the decoding thread (automatically called by init_ffmpeg_v4l2_player if threaded mode is enabled)
+ *
+ * @param player Pointer to player structure
+ * @return true on success, false on failure
+ */
+bool ffmpeg_v4l2_start_decode_thread(ffmpeg_v4l2_player_t *player);
+
+/**
+ * Stop the decoding thread (automatically called by cleanup_ffmpeg_v4l2_player)
+ *
+ * @param player Pointer to player structure
+ * @return true on success, false on failure
+ */
+bool ffmpeg_v4l2_stop_decode_thread(ffmpeg_v4l2_player_t *player);
 
 #endif // FFMPEG_V4L2_PLAYER_H

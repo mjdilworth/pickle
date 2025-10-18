@@ -84,8 +84,9 @@ fi
 
 # Build command
 BUILD_CMD="make"
-if [ $DEBUG -eq 1 ]; then
-    BUILD_CMD="$BUILD_CMD DEBUG=1"
+if [ $DEBUG -eq 0 ]; then
+    # Override Makefile default to strip debug flags when requested
+    BUILD_CMD="$BUILD_CMD DEBUG="
 fi
 if [ $RELEASE -eq 1 ]; then
     BUILD_CMD="$BUILD_CMD RELEASE=1"

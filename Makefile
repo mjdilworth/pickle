@@ -176,6 +176,8 @@ ifeq ($(FFMPEG_V4L2),1)
 	# Add FFmpeg libraries
 	PKG_CFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil 2>/dev/null || echo "")
 	PKG_LIBS   += $(shell pkg-config --libs libavformat libavcodec libavutil 2>/dev/null || echo "-L/usr/local/lib -lavformat -lavcodec -lavutil")
+	# If we're not using pkg-config, ensure the libraries are added to LIBS directly
+	LIBS += -lavformat -lavcodec -lavutil
 endif
 
 # Allow CFLAGS to be appended instead of replaced when specified externally
