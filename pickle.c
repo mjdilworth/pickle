@@ -2360,16 +2360,26 @@ void bo_destroy_handler(struct gbm_bo *bo, void *data) {
  * Handles both initial modeset and subsequent page flips
  */
 bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
+	static int frame_count = 0;
+	frame_count++;
+	
+	fprintf(stderr, "[GBM] Frame %d: Attempting to lock front buffer (DRM fd=%d, crtc=%u)\n", 
+	        frame_count, d ? d->fd : -999, d ? d->crtc_id : 0);
+	
 	// Get front buffer after eglSwapBuffers
 	struct gbm_bo *bo = gbm_surface_lock_front_buffer(e->gbm_surf);
 	if (!bo) {
-		fprintf(stderr, "gbm_surface_lock_front_buffer failed\n");
+		fprintf(stderr, "[GBM] ERROR Frame %d: gbm_surface_lock_front_buffer failed\n", frame_count);
 		return false;
 	}
+	
+	fprintf(stderr, "[GBM] Frame %d: Successfully locked front buffer\n", frame_count);
 	
 	// Get or create framebuffer ID
 	struct fb_holder *h = gbm_bo_get_user_data(bo);
 	uint32_t fb_id = h ? h->fb : 0;
+	
+	if (g_debug) fprintf(stderr, "[GBM] Frame %d: fb_id=%u (from user_data=%p)\n", frame_count, fb_id, (void*)h);
 	
 	if (!fb_id) {
 		uint32_t handle = gbm_bo_get_handle(bo).u32;
@@ -2377,21 +2387,29 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 		uint32_t width = gbm_bo_get_width(bo);
 		uint32_t height = gbm_bo_get_height(bo);
 		
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Creating new FB (w=%u h=%u pitch=%u handle=%u)\n", 
+		                    frame_count, width, height, pitch, handle);
+		
 		if (!g_scanout_disabled && drmModeAddFB(d->fd, width, height, 24, 32, pitch, handle, &fb_id)) {
-			fprintf(stderr, "drmModeAddFB failed (w=%u h=%u pitch=%u handle=%u err=%s)\n", width, height, pitch, handle, strerror(errno));
+			fprintf(stderr, "[GBM] ERROR Frame %d: drmModeAddFB failed (w=%u h=%u pitch=%u handle=%u err=%s)\n", 
+			        frame_count, width, height, pitch, handle, strerror(errno));
 			gbm_surface_release_buffer(e->gbm_surf, bo);
 			return false;
 		}
 		
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: drmModeAddFB succeeded, new fb_id=%u\n", frame_count, fb_id);
+		
 		struct fb_holder *nh = calloc(1, sizeof(*nh));
 		if (!nh) {
-			fprintf(stderr, "Out of memory allocating fb_holder\n");
+			fprintf(stderr, "[GBM] ERROR Frame %d: Out of memory allocating fb_holder\n", frame_count);
 			gbm_surface_release_buffer(e->gbm_surf, bo);
 			return false;
 		}
 		nh->fb = fb_id;
 		nh->fd = d->fd;
 		gbm_bo_set_user_data(bo, nh, bo_destroy_handler);
+		
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Set user_data with new fb_holder (fb=%u)\n", frame_count, fb_id);
 	}
 	
 	// Check if this is the first frame
@@ -2401,6 +2419,9 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 		// Initial modeset
 		bool success = false;
 		
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Performing initial modeset (atomic=%d, fb_id=%u)\n", 
+		                    frame_count, d->atomic_supported, fb_id);
+		
 		if (d->atomic_supported) {
 			success = atomic_present_framebuffer(d, fb_id, g_vsync_enabled);
 		} else {
@@ -2408,10 +2429,12 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 		}
 		
 		if (!success) {
-			fprintf(stderr, "[ERROR] Initial modeset failed: %s\n", strerror(errno));
+			fprintf(stderr, "[GBM] ERROR Frame %d: Initial modeset failed: %s\n", frame_count, strerror(errno));
 			gbm_surface_release_buffer(e->gbm_surf, bo);
 			return false;
 		}
+		
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Initial modeset succeeded\n", frame_count);
 		
 		first_frame = false;
 		g_first_frame_bo = bo;  // Retain this BO until first page flip completes
@@ -2424,7 +2447,12 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 		// For MPV, we want to throttle to avoid building up a backlog
 		int max_pending = (g_use_ffmpeg_v4l2) ? 1 : (g_triple_buffer ? 2 : 1);
 		
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Page flip (pending_flips=%d, max=%d, use_ffmpeg=%d)\n", 
+		                    frame_count, g_pending_flips, max_pending, g_use_ffmpeg_v4l2);
+		
 		if (g_pending_flips >= max_pending) {
+			if (g_debug) fprintf(stderr, "[GBM] Frame %d: At max pending flips, waiting for completion\n", frame_count);
+			
 			// Wait for a pending flip to complete
 			fd_set fds;
 			FD_ZERO(&fds);
@@ -2432,11 +2460,14 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 			
 			struct timeval timeout = {0, 10000}; // 10ms for FFmpeg, quicker recovery
 			
-			if (select(d->fd + 1, &fds, NULL, NULL, &timeout) <= 0) {
+			int select_result = select(d->fd + 1, &fds, NULL, NULL, &timeout);
+			if (select_result <= 0) {
 				// Timeout - force reset
-				if (g_debug) fprintf(stderr, "[buffer] Page flip wait timeout, resetting state\n");
+				if (g_debug) fprintf(stderr, "[GBM] Frame %d: Page flip wait timeout, resetting state (select_result=%d)\n", 
+				                    frame_count, select_result);
 				g_pending_flip = 0;
 			} else if (FD_ISSET(d->fd, &fds)) {
+				if (g_debug) fprintf(stderr, "[GBM] Frame %d: Handling page flip event\n", frame_count);
 				// Handle the page flip event
 				drmEventContext ev = {
 					.version = DRM_EVENT_CONTEXT_VERSION,
@@ -2447,18 +2478,25 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 		}
 		
 		// Perform page flip
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Issuing page flip (atomic=%d, fb_id=%u, crtc=%u)\n", 
+		                    frame_count, d->atomic_supported, fb_id, d->crtc_id);
+		
 		if (d->atomic_supported) {
 			if (!atomic_present_framebuffer(d, fb_id, g_vsync_enabled)) {
+				fprintf(stderr, "[GBM] ERROR Frame %d: atomic_present_framebuffer failed\n", frame_count);
 				gbm_surface_release_buffer(e->gbm_surf, bo);
 				return false;
 			}
 		} else {
 			if (drmModePageFlip(d->fd, d->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT, bo)) {
-				if (g_debug) fprintf(stderr, "[ERROR] drmModePageFlip failed: %s\n", strerror(errno));
+				fprintf(stderr, "[GBM] ERROR Frame %d: drmModePageFlip failed: %s (errno=%d)\n", 
+				        frame_count, strerror(errno), errno);
 				gbm_surface_release_buffer(e->gbm_surf, bo);
 				return false;
 			}
 		}
+		
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Page flip issued successfully\n", frame_count);
 		
 		// For FFmpeg V4L2, don't set pending_flip flag - we want immediate continuous rendering
 		// For MPV, we throttle with pending_flip to avoid backlog
@@ -2467,13 +2505,15 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 			g_pending_flip = 1;
 			g_pending_flips++;
 		} else {
-			if (g_debug) fprintf(stderr, "[DRM] FFmpeg V4L2 path - skipping g_pending_flip\n");
+			if (g_debug) fprintf(stderr, "[GBM] Frame %d: FFmpeg V4L2 path - skipping g_pending_flip\n", frame_count);
 		}
 	} else {
 		// Offscreen mode - just release buffer
+		if (g_debug) fprintf(stderr, "[GBM] Frame %d: Offscreen mode, releasing buffer\n", frame_count);
 		gbm_surface_release_buffer(e->gbm_surf, bo);
 	}
 	
+	if (g_debug) fprintf(stderr, "[GBM] Frame %d: Successfully presented\n", frame_count);
 	return true;
 }
 
@@ -3924,13 +3964,13 @@ int main(int argc, char **argv) {
 #ifdef USE_FFMPEG_V4L2_PLAYER
 		if (g_use_ffmpeg_v4l2) {
 			// FFmpeg V4L2 M2M decoder rendering path
-			if (g_debug) fprintf(stderr, "[MAIN] Calling ffmpeg_v4l2_get_frame...\n");
+			fprintf(stderr, "[MAIN] Render loop iteration: Calling ffmpeg_v4l2_get_frame...\n");
 			if (ffmpeg_v4l2_get_frame(&ffmpeg_v4l2_player)) {
 				// Success - reset failure counter
 				g_v4l2_consecutive_failures = 0;
-				if (g_debug) fprintf(stderr, "[MAIN] Got frame, calling upload_to_gl...\n");
+				fprintf(stderr, "[MAIN] Got frame, calling upload_to_gl...\n");
 				if (ffmpeg_v4l2_upload_to_gl(&ffmpeg_v4l2_player)) {
-					if (g_debug) fprintf(stderr, "[MAIN] Uploaded, calling render...\n");
+					fprintf(stderr, "[MAIN] Uploaded, calling render...\n");
 					render_success = render_ffmpeg_v4l2_frame(&drm, &eglc, &ffmpeg_v4l2_player);
 					if (g_debug) fprintf(stderr, "[MAIN] Render returned: %d\n", render_success);
 				} else {

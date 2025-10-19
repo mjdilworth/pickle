@@ -1,7 +1,7 @@
 #include "pickle_globals.h"
 
 // Export variables used by other modules
-int g_debug = 0;
+int g_debug = 0;  // Debug disabled for normal operation
 uint64_t g_frames = 0;
 int g_help_toggle_request = 0;
 int g_use_v4l2_decoder = 0;

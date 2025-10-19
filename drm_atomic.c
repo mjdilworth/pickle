@@ -72,9 +72,9 @@ uint32_t find_property_id(int fd, uint32_t obj_id, uint32_t obj_type, const char
 bool find_atomic_properties(kms_ctx_t *d, struct prop_ids *props) {
     if (!d || !props) return false;
     
-    // Find CRTC properties
-    props->crtc_mode_id = find_property_id(d->fd, d->crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
-    props->crtc_active = find_property_id(d->fd, d->crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+    // Find CRTC properties using crtc_id, not crtc (which is uninitialized)
+    props->crtc_mode_id = find_property_id(d->fd, d->crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+    props->crtc_active = find_property_id(d->fd, d->crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
     
     // Find plane properties
     props->plane_fb_id = find_property_id(d->fd, d->plane, DRM_MODE_OBJECT_PLANE, "FB_ID");
@@ -130,10 +130,9 @@ bool init_atomic_modesetting(kms_ctx_t *d) {
         return false;
     }
     
-    // Temporarily disable atomic modesetting due to segfault issues
-    // TODO: Fix atomic page flip event handling
+    // Disable atomic modesetting - fall back to legacy mode
     d->atomic_supported = false;
-    LOG_INFO("Atomic modesetting available but disabled (needs debugging)");
+    LOG_INFO("Atomic modesetting disabled, using legacy DRM mode");
     return false;
 }
 
@@ -168,6 +167,13 @@ bool atomic_present_framebuffer(kms_ctx_t *d, uint32_t fb_id, bool wait_vsync) {
     
     struct prop_ids *props = (struct prop_ids *)d->prop_ids;
     
+    // Debug: Check if properties are valid
+    if (props->plane_fb_id == 0 || props->crtc_active == 0 || props->crtc_mode_id == 0) {
+        LOG_ERROR("Invalid property IDs: fb_id=%u, crtc_active=%u, crtc_mode_id=%u",
+                 props->plane_fb_id, props->crtc_active, props->crtc_mode_id);
+        return false;
+    }
+    
     // Create an atomic request
     drmModeAtomicReqPtr req = drmModeAtomicAlloc();
     if (!req) {
@@ -175,38 +181,65 @@ bool atomic_present_framebuffer(kms_ctx_t *d, uint32_t fb_id, bool wait_vsync) {
         return false;
     }
     
+    LOG_INFO("Atomic commit: plane=%u, crtc_id=%u, fb_id=%u, mode=%ux%u, props={fb:%u, active:%u, mode:%u}",
+             d->plane, d->crtc_id, fb_id, d->mode.hdisplay, d->mode.vdisplay,
+             props->plane_fb_id, props->crtc_active, props->crtc_mode_id);
+    
     // Add properties to the request
     // Set plane properties
     drmModeAtomicAddProperty(req, d->plane, props->plane_fb_id, fb_id);
-    drmModeAtomicAddProperty(req, d->plane, props->plane_crtc_id, d->crtc);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_crtc_id, d->crtc_id);  // FIX: use crtc_id not crtc
     drmModeAtomicAddProperty(req, d->plane, props->plane_crtc_x, 0);
     drmModeAtomicAddProperty(req, d->plane, props->plane_crtc_y, 0);
     
     // Source coordinates are in 16.16 fixed-point format
+    uint32_t src_w = d->mode.hdisplay << 16;
+    uint32_t src_h = d->mode.vdisplay << 16;
     drmModeAtomicAddProperty(req, d->plane, props->plane_src_x, 0);
     drmModeAtomicAddProperty(req, d->plane, props->plane_src_y, 0);
-    drmModeAtomicAddProperty(req, d->plane, props->plane_src_w, d->mode.hdisplay << 16);
-    drmModeAtomicAddProperty(req, d->plane, props->plane_src_h, d->mode.vdisplay << 16);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_src_w, src_w);
+    drmModeAtomicAddProperty(req, d->plane, props->plane_src_h, src_h);
+    
+    LOG_DEBUG("Atomic properties: src=0x%x,0x%x %ux%u crtc_x=%u crtc_y=%u",
+             0, 0, src_w >> 16, src_h >> 16, 0, 0);
     
     // Set CRTC properties if it's the first frame
+    bool setting_crtc_mode = false;
     if (!d->crtc_initialized) {
-        drmModeAtomicAddProperty(req, d->crtc, props->crtc_active, 1);
-        drmModeAtomicAddProperty(req, d->crtc, props->crtc_mode_id, d->mode_blob_id);
-        d->crtc_initialized = true;
+        LOG_INFO("First frame: Setting CRTC active and mode (mode_blob_id=%u)", d->mode_blob_id);
+        if (d->mode_blob_id == 0) {
+            LOG_ERROR("Mode blob ID is 0 - cannot set mode!");
+            drmModeAtomicFree(req);
+            return false;
+        }
+        drmModeAtomicAddProperty(req, d->crtc_id, props->crtc_active, 1);  // FIX: use crtc_id not crtc
+        drmModeAtomicAddProperty(req, d->crtc_id, props->crtc_mode_id, d->mode_blob_id);  // FIX: use crtc_id not crtc
+        setting_crtc_mode = true;
     }
     
     // Commit the atomic request
     uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
     if (wait_vsync) {
-        flags |= DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_ALLOW_MODESET;
+        flags |= DRM_MODE_PAGE_FLIP_EVENT;
+    }
+    // Only add ALLOW_MODESET if we're actually changing the mode
+    if (!d->crtc_initialized && wait_vsync) {
+        flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
     }
     
     int ret = drmModeAtomicCommit(d->fd, req, flags, NULL);
     drmModeAtomicFree(req);
     
     if (ret) {
-        LOG_ERROR("Atomic commit failed: %s", strerror(errno));
+        LOG_ERROR("Atomic commit failed (fb=%u, plane=%u, crtc=%u): %s", 
+                  fb_id, d->plane, d->crtc_id, strerror(errno));
         return false;
+    }
+    
+    // Only mark CRTC as initialized after the commit succeeds
+    if (setting_crtc_mode) {
+        d->crtc_initialized = true;
+        LOG_INFO("CRTC mode successfully initialized");
     }
     
     return true;

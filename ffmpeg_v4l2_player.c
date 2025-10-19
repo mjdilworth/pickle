@@ -1857,6 +1857,15 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
     
     int64_t start_time = get_time_us();
     
+    // Log frame attempts periodically (every 100 calls)
+    static int frame_attempt_count = 0;
+    frame_attempt_count++;
+    if (frame_attempt_count % 50 == 0 || frame_attempt_count < 5) {
+        fprintf(stderr, "[V4L2_GET_FRAME] Attempt #%d, frames_decoded=%lu, initialized=%d, frame_data[0]=%p\n",
+                frame_attempt_count, player->frames_decoded, player->initialized, (void*)(player->frame ? player->frame->data[0] : NULL));
+        fflush(stderr);
+    }
+    
     // Handle threaded decoding mode first
     if (player->use_threaded_decoding && player->thread_running) {
         // Try to get a frame from the queue
@@ -1997,6 +2006,15 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
 #endif
         
         return true;
+    } else {
+        // Log first 10 failures to understand why frames aren't available
+        static int receive_frame_fail_count = 0;
+        if (receive_frame_fail_count < 10 || receive_frame_fail_count % 200 == 0) {
+            fprintf(stderr, "[V4L2_RECEIVE] avcodec_receive_frame ret=%d (EAGAIN=%d, EOF=%d), frames_decoded=%lu\n",
+                    ret, AVERROR(EAGAIN), AVERROR_EOF, player->frames_decoded);
+            fflush(stderr);
+            receive_frame_fail_count++;
+        }
     }
     
     // OPTIMIZED: Limit packets per call to prevent blocking - based on video_decoder.c
@@ -2007,13 +2025,21 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
     // BCM2835 V4L2 decoder issues usually manifest as stuck state with EAGAIN loop, so combine
     // this check with EAGAIN streak detection below for robust stuck decoder detection.
     // Global stuck watchdog: if no first frame within 2 seconds, force software fallback
-    if (player->frames_decoded == 0 && player->seen_idr && (start_time - first_call_us) > 2000000) {
+    double elapsed_us = (double)(start_time - first_call_us);
+    if (frame_attempt_count % 100 == 0) {
+        fprintf(stderr, "[V4L2_WATCHDOG] frames_decoded=%lu, seen_idr=%d, elapsed=%.2f ms\n",
+                player->frames_decoded, player->seen_idr, elapsed_us / 1000.0);
+        fflush(stderr);
+    }
+    if (player->frames_decoded == 0 && player->seen_idr && elapsed_us > 2000000) {
         LOG_ERROR("No frames produced after %.2f s, forcing software fallback",
-                  (double)(start_time - first_call_us) / 1000000.0);
+                  elapsed_us / 1000000.0);
+        fprintf(stderr, "[V4L2_FALLBACK] Triggering software decoder fallback!\n");
+        fflush(stderr);
         return switch_to_software_decoder(player);
     }
 
-    if (player->frames_decoded == 0 && player->seen_idr && total_packets_sent > 100) {
+    if (player->frames_decoded == 0 && player->seen_idr && total_packets_sent > 10) {
         // Get V4L2 device info before giving up
         if (player->codec_ctx) {
             const char* hw_device = NULL;
@@ -2033,11 +2059,14 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
             LOG_WARN("Skipping mid-stream flush (EAGAIN implies need more data)");
         }
         
-    LOG_WARN("V4L2 M2M decoder failed to produce first frame after %" PRIu64 " packets", (uint64_t)total_packets_sent);
-    LOG_WARN("Stream is still not producing frames - falling back to software decoder");
+    LOG_WARN("V4L2 M2M decoder failed to produce first frame after %" PRIu64 " packets - skipping software fallback and going straight to MPV", (uint64_t)total_packets_sent);
+    LOG_WARN("Stream is still not producing frames - falling back to MPV immediately");
+        fprintf(stderr, "[V4L2_SKIP_SW_FALLBACK] Skipping software decoder and using MPV directly\n");
+        fflush(stderr);
         
-        // Force immediate fallback to software decoder
-        return switch_to_software_decoder(player);
+        // Mark as fatal to trigger MPV fallback immediately
+        player->fatal_error = true;
+        return false;
     }
     
     // Add a consecutive EAGAIN counter
@@ -2052,6 +2081,14 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
     
     // Loop to handle non-video packets and decoder EAGAIN without blocking too long
     while (ret == AVERROR(EAGAIN) && packets_processed < max_packets) {
+        // Log packet processing at low frequency to understand packet flow
+        static int read_attempt = 0;
+        read_attempt++;
+        if (read_attempt % 50 == 0) {
+            fprintf(stderr, "[V4L2_PACKET] Packet read attempt #%d, frames_decoded=%lu, total_packets=%" PRIu64 "\n",
+                    read_attempt, player->frames_decoded, total_packets_sent);
+        }
+        
         if (g_debug && packets_processed < 10) {
             LOG_DEBUG("[V4L2] Reading packet %d (max %d)...", packets_processed + 1, max_packets);
         }
@@ -2409,6 +2446,16 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
             int send_result;
             while (1) {
                 send_result = avcodec_send_packet(player->codec_ctx, player->packet);
+                
+                // Log packet sends at low frequency
+                static int send_attempt = 0;
+                send_attempt++;
+                if (send_attempt % 100 == 0 || send_result != 0) {
+                    fprintf(stderr, "[V4L2_SEND] Packet send attempt #%d, result=%d (%s), size=%d, packets_processed=%d, total_sent=%" PRIu64 "\n",
+                            send_attempt, send_result, av_err2str(send_result), 
+                            player->packet->size, packets_processed, total_packets_sent);
+                }
+                
                 if (g_debug && total_packets_sent <= 10) {
                     LOG_DEBUG("[V4L2] avcodec_send_packet returned: %d (%s), packet size: %d, keyframe: %d",
                               send_result, av_err2str(send_result), player->packet->size,
@@ -2503,6 +2550,9 @@ static bool copy_frame_to_nv12_buffer(AVFrame *frame, ffmpeg_v4l2_player_t *play
     
     // Ensure our buffer is big enough
     if (!player->nv12_buffer || player->nv12_buffer_size < required_size) {
+        fprintf(stderr, "[NV12_UPLOAD_ERROR] Buffer check failed: buffer=%p, size=%zu (need %zu)\n",
+                (void*)player->nv12_buffer, player->nv12_buffer_size, required_size);
+        fflush(stderr);
         LOG_ERROR("NV12 staging buffer unavailable or too small (have %zu need %zu)",
                   player->nv12_buffer_size, required_size);
         return false;
@@ -2602,9 +2652,34 @@ static bool copy_frame_to_nv12_buffer(AVFrame *frame, ffmpeg_v4l2_player_t *play
  * Optimized to avoid unnecessary copies
  */
 bool ffmpeg_v4l2_upload_to_gl(ffmpeg_v4l2_player_t *player) {
-    if (!player || !player->frame || !player->frame->data[0]) {
+    if (!player) {
+        fprintf(stderr, "[NV12_UPLOAD] Early return: player is NULL\n");
+        fflush(stderr);
         return false;
     }
+    
+    if (!player->frame) {
+        fprintf(stderr, "[NV12_UPLOAD] Early return: frame is NULL\n");
+        fflush(stderr);
+        return false;
+    }
+    
+    if (!player->frame->data[0]) {
+        fprintf(stderr, "[NV12_UPLOAD] Early return: frame->data[0] is NULL (format=%d, width=%d, height=%d, linesize=[%d,%d,%d])\n",
+                player->frame->format, player->frame->width, player->frame->height,
+                player->frame->linesize[0], player->frame->linesize[1], player->frame->linesize[2]);
+        fprintf(stderr, "[NV12_UPLOAD] Frame data pointers: [%p, %p, %p, %p, %p, %p, %p, %p]\n",
+                (void*)player->frame->data[0], (void*)player->frame->data[1],
+                (void*)player->frame->data[2], (void*)player->frame->data[3],
+                (void*)player->frame->data[4], (void*)player->frame->data[5],
+                (void*)player->frame->data[6], (void*)player->frame->data[7]);
+        fflush(stderr);
+        return false;
+    }
+
+    fprintf(stderr, "[NV12_UPLOAD] Starting upload for frame %lu, format=%d\n",
+            player->frames_decoded, player->frame->format);
+    fflush(stderr);
 
     // Check if we already have valid textures with the current frame's data
     // to avoid unnecessary uploads (e.g., when paused)
@@ -2780,13 +2855,22 @@ bool render_ffmpeg_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, ffmpeg_v4l2_player_t *
     }
     
     // Swap buffers to present the rendered frame
-    eglSwapBuffers(e->dpy, e->surf);
+    static int swap_count = 0;
+    swap_count++;
+    LOG_DEBUG("[SWAP] Frame %d: Calling eglSwapBuffers", swap_count);
+    EGLBoolean swap_result = eglSwapBuffers(e->dpy, e->surf);
+    LOG_DEBUG("[SWAP] Frame %d: eglSwapBuffers returned %d", swap_count, swap_result);
+    if (!swap_result) {
+        LOG_ERROR("[SWAP] Frame %d: eglSwapBuffers FAILED, EGL error: 0x%04x", swap_count, eglGetError());
+    }
     
     // Present the GBM buffer to screen with page flip
+    LOG_DEBUG("[SWAP] Frame %d: Calling present_gbm_surface", swap_count);
     if (!present_gbm_surface(d, e)) {
-        LOG_ERROR("Failed to present GBM surface");
+        LOG_ERROR("[SWAP] Frame %d: Failed to present GBM surface", swap_count);
         return false;
     }
+    LOG_DEBUG("[SWAP] Frame %d: Successfully presented GBM surface", swap_count);
     
     return true;
 }
