@@ -5,6 +5,7 @@
 #include "shader.h"
 #include "keystone.h"
 #include "render.h"
+#include "gl_optimize.h"
 
 // Debug flag for BSF/filter packet dumps - set to 0 to disable detailed packet logging
 #ifndef FFMPEG_V4L2_DEBUG_BSF
@@ -107,7 +108,7 @@ static void reset_parser_state(ffmpeg_v4l2_player_t *player) {
     if (consecutive_parser_resets >= parser_reset_threshold && !deep_reset_attempted) {
         LOG_ERROR("[V4L2] Multiple parser resets (%d) haven't fixed the issue, attempting deep reset", 
                   consecutive_parser_resets);
-        if (deep_reset_codec(player)) {
+            if (deep_reset_codec(player)) { 
             consecutive_parser_resets = 0;
             deep_reset_attempted = true;
         }
@@ -1203,8 +1204,13 @@ static bool switch_to_software_decoder(ffmpeg_v4l2_player_t *player) {
     return true;
 }
 
-// Declare external shader program (from pickle.c)
+// Declare external shader program and uniforms (from pickle.c)
 extern GLuint g_nv12_shader_program;
+extern GLint g_nv12_u_texture_y_loc;
+extern GLint g_nv12_u_texture_uv_loc;
+
+// Declare keystone state (from keystone.h)
+#include "keystone.h"
 
 // Declare rendering functions
 extern void render_keystone_quad(void);
@@ -1308,13 +1314,21 @@ bool init_ffmpeg_v4l2_player(ffmpeg_v4l2_player_t *player, const char *file) {
     player->frame_duration = 0;
     player->last_valid_pts = AV_NOPTS_VALUE;
     
-    // Calculate FPS
+    // Calculate FPS - use actual stream values, with better fallback
     if (video_stream->avg_frame_rate.den != 0) {
         player->fps = av_q2d(video_stream->avg_frame_rate);
     } else if (video_stream->r_frame_rate.den != 0) {
         player->fps = av_q2d(video_stream->r_frame_rate);
     } else {
-        player->fps = 30.0; // Default fallback
+        // Calculate from time_base as last resort
+        AVRational tb = video_stream->time_base;
+        if (tb.num > 0 && tb.den > 0) {
+            player->fps = (double)tb.den / (double)tb.num;
+        } else {
+            // Only use fallback if absolutely necessary - changed from 30.0 to 60.0
+            LOG_WARN("Unable to determine video FPS, using 60 FPS fallback");
+            player->fps = 60.0; // Modern videos are often 60fps
+        }
     }
     
     LOG_INFO("Video: %ux%u @ %.2f fps", player->width, player->height, player->fps);
@@ -1674,25 +1688,70 @@ bool init_ffmpeg_v4l2_player(ffmpeg_v4l2_player_t *player, const char *file) {
     glGenTextures(1, &player->y_texture);
     glGenTextures(1, &player->uv_texture);
     
-    // Setup Y texture (luminance)
+    // Setup Y texture (luminance) - use GL_R8 for GLES 3.x
     glBindTexture(GL_TEXTURE_2D, player->y_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei)player->width, (GLsizei)player->height, 
-                 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)player->width, (GLsizei)player->height, 
+                 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
-    // Setup UV texture (chrominance)
+    // Setup UV texture (chrominance) - use GL_RG8 for GLES 3.x
     glBindTexture(GL_TEXTURE_2D, player->uv_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei)player->width / 2, 
-                 (GLsizei)player->height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, (GLsizei)player->width / 2, 
+                 (GLsizei)player->height / 2, 0, GL_RG, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
     glBindTexture(GL_TEXTURE_2D, 0);
+    
+    LOG_INFO("Created GL textures: Y=%u (R8 %ux%u), UV=%u (RG8 %ux%u)",
+             player->y_texture, player->width, player->height,
+             player->uv_texture, player->width/2, player->height/2);
+    
+    // Create VBO/VAO for optimized rendering (one-time setup)
+    glGenVertexArrays(1, &player->vao);
+    glGenBuffers(1, &player->vbo);
+    
+    // Bind VAO first, then configure VBO
+    glBindVertexArray(player->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, player->vbo);
+    
+    // Fullscreen quad vertices (position + texcoord interleaved)
+    // For TRIANGLE_STRIP: TL -> TR -> BL -> BR creates two triangles correctly
+    static const float vertices[] = {
+        -1.0f,  1.0f, 0.0f, 1.0f,  // Vertex 0: Top-left
+         1.0f,  1.0f, 1.0f, 1.0f,  // Vertex 1: Top-right
+        -1.0f, -1.0f, 0.0f, 0.0f,  // Vertex 2: Bottom-left
+         1.0f, -1.0f, 1.0f, 0.0f   // Vertex 3: Bottom-right
+    };
+    
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    
+    // Configure vertex attributes
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    // Unbind
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    
+    LOG_INFO("Created VBO/VAO for optimized rendering: VAO=%u, VBO=%u", player->vao, player->vbo);
+    
+    // Note: Using global uniform locations (g_nv12_u_texture_y_loc, g_nv12_u_texture_uv_loc)
+    // that were cached when the NV12 shader was initialized in pickle.c
+    
+    // Bind textures to texture units once (state persists between frames)
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, player->y_texture);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, player->uv_texture);
+    LOG_INFO("Bound textures to units 0 and 1 (persistent state)");
     
     player->initialized = true;
     LOG_INFO("FFmpeg V4L2 player initialized successfully");
@@ -1774,6 +1833,7 @@ static bool deep_reset_codec(ffmpeg_v4l2_player_t *player) {
     if (player->codec_ctx->codec_id == AV_CODEC_ID_H264) {
         player->parser_ctx = av_parser_init(AV_CODEC_ID_H264);
         if (!player->parser_ctx) {
+
             LOG_ERROR("[V4L2] Failed to initialize parser after deep reset");
             player->fatal_error = true;
             return false;
@@ -1838,10 +1898,12 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
     }
     
     // Non-threaded mode follows original logic
-    const int time_budget_us = 8000; // Keep each call under ~8ms to avoid stalls
+    // Dynamic time budget based on frame rate - at 60 FPS, each frame is ~16.6ms
+    const int time_budget_us = player->fps > 50.0 ? 12000 : 8000; // 12ms for 60fps, 8ms for 30fps
+    static int initial_budget_logs = 0; // Track limited diagnostics when startup stalls
     static ffmpeg_v4l2_player_t *last_player = NULL;
     static int packet_count = 0;  // Track packets sent for debugging
-    static int max_packets = 5;    // Adaptive budget per iteration
+    static int max_packets = 10;    // Increased from 5 to 10 for better throughput
     static int consecutive_fails = 0;
     static uint64_t total_packets_sent = 0;  // Track total packets sent for early failure detection
     static int64_t first_call_us = 0;   // Watchdog: time when we started decoding this player
@@ -1849,7 +1911,7 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
     if (player != last_player) {
         last_player = player;
         packet_count = 0;
-        max_packets = 5;
+        max_packets = 10;
         consecutive_fails = 0;
         total_packets_sent = 0;
         first_call_us = start_time;
@@ -1919,6 +1981,14 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
         player->decode_time_avg = (player->decode_time_avg * 0.9) + 
                                  ((double)decode_time / 1000.0 * 0.1);
         player->frames_decoded++;
+        
+        // Log first few frames to confirm decoding is working
+        if (player->frames_decoded <= 5) {
+            LOG_INFO("Decoded frame #%lu (PTS: %ld, format: %d, size: %dx%d)", 
+                     player->frames_decoded, player->frame->pts, player->frame->format,
+                     player->frame->width, player->frame->height);
+        }
+        
         packet_count = 0;  // Reset packet count on successful frame
         
 #if FFMPEG_V4L2_DEBUG_BSF
@@ -1986,9 +2056,17 @@ bool ffmpeg_v4l2_get_frame(ffmpeg_v4l2_player_t *player) {
             LOG_DEBUG("[V4L2] Reading packet %d (max %d)...", packets_processed + 1, max_packets);
         }
         // Don't hog the CPU/GPU: respect per-call time budget
-        if ((get_time_us() - start_time) >= time_budget_us) {
+        int64_t elapsed_us = get_time_us() - start_time;
+        if (elapsed_us >= time_budget_us) {
             if (g_debug) {
                 LOG_DEBUG("[V4L2] Time budget hit after %d packets; returning to main loop", packets_processed);
+            }
+            if (initial_budget_logs < 6 && player->frames_decoded == 0 && player->seen_keyframe) {
+                LOG_INFO("[V4L2] Decoder busy after keyframe (elapsed=%.2f ms, packets=%d, total=%" PRIu64 ")",
+                         (double)elapsed_us / 1000.0,
+                         packets_processed,
+                         total_packets_sent);
+                initial_budget_logs++;
             }
             return false; // Yield back to main loop; try again next iteration
         }
@@ -2409,6 +2487,15 @@ static bool copy_frame_to_nv12_buffer(AVFrame *frame, ffmpeg_v4l2_player_t *play
     int width = frame->width;
     int height = frame->height;
     
+    // Debug: Log format on first few frames
+    static int format_log_count = 0;
+    if (format_log_count < 3) {
+        LOG_INFO("Frame format: %d (%s), size: %dx%d, linesize: [%d, %d, %d]",
+                 fmt, av_get_pix_fmt_name(fmt), width, height,
+                 frame->linesize[0], frame->linesize[1], frame->linesize[2]);
+        format_log_count++;
+    }
+    
     // Calculate buffer sizes
     size_t y_plane_size = width * height;
     size_t uv_plane_size = width * height / 2;
@@ -2545,27 +2632,41 @@ bool ffmpeg_v4l2_upload_to_gl(ffmpeg_v4l2_player_t *player) {
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     
+    // Debug: Check first few pixels to verify we have valid data
+    if (player->frames_rendered < 3 && y_plane && uv_plane) {
+        LOG_INFO("Frame #%lu Y samples: [0]=%u [100]=%u [1000]=%u, UV samples: [0]=%u,%u [100]=%u,%u",
+                 player->frames_rendered + 1,
+                 y_plane[0], y_plane[100], y_plane[1000],
+                 uv_plane[0], uv_plane[1], uv_plane[100], uv_plane[101]);
+    }
+    
     // Only upload textures if we have valid data
     if (y_plane && uv_plane) {
-        // Upload Y plane
+        // Upload Y plane - use GL_RED for GLES 3.x
         glBindTexture(GL_TEXTURE_2D, player->y_texture);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
                         frame->width, frame->height,
-                        GL_LUMINANCE, GL_UNSIGNED_BYTE,
+                        GL_RED, GL_UNSIGNED_BYTE,
                         y_plane);
     
-        // Upload UV plane (NV12 format has interleaved U and V)
+        // Upload UV plane (NV12 format has interleaved U and V) - use GL_RG for GLES 3.x
         glBindTexture(GL_TEXTURE_2D, player->uv_texture);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
                         frame->width / 2, frame->height / 2,
-                        GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                        GL_RG, GL_UNSIGNED_BYTE,
                         uv_plane);
     }
 
-    glBindTexture(GL_TEXTURE_2D, 0);
+    // Don't unbind - keep textures bound for rendering
     
     player->texture_valid = true;
     player->frames_rendered++;
+    
+    // Log first few uploads to confirm rendering path is working
+    if (player->frames_rendered <= 5) {
+        LOG_INFO("Uploaded frame #%lu to GL (Y tex: %u, UV tex: %u)", 
+                 player->frames_rendered, player->y_texture, player->uv_texture);
+    }
     
     // CRITICAL: Unref the frame to release its memory
     // Without this, frame buffers accumulate and cause OOM
@@ -2581,6 +2682,35 @@ bool render_ffmpeg_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, ffmpeg_v4l2_player_t *
     if (!player || !player->texture_valid) {
         return false;
     }
+
+    bool keystone_requested = false;
+    if (g_keystone.enabled && !should_skip_feature_for_performance("keystone")) {
+        keystone_requested = true;
+        if (g_keystone_shader_program == 0) {
+            if (!init_keystone_shader()) {
+                LOG_WARN("Failed to initialize keystone shader, skipping keystone rendering");
+                keystone_requested = false;
+            }
+        }
+    }
+
+    if (keystone_requested) {
+        int target_w = (int)d->mode.hdisplay;
+        int target_h = (int)d->mode.vdisplay;
+        if (!ensure_keystone_fbo(target_w, target_h)) {
+            LOG_WARN("Failed to set up keystone FBO, rendering without keystone");
+            keystone_requested = false;
+        }
+    }
+
+    GLint prev_fbo = 0;
+    GLint prev_viewport[4] = {0};
+    if (keystone_requested) {
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+        glGetIntegerv(GL_VIEWPORT, prev_viewport);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
+        glViewport(0, 0, g_keystone_fbo_w, g_keystone_fbo_h);
+    }
     
     // Clear the framebuffer
     glClear(GL_COLOR_BUFFER_BIT);
@@ -2588,57 +2718,66 @@ bool render_ffmpeg_v4l2_frame(kms_ctx_t *d, egl_ctx_t *e, ffmpeg_v4l2_player_t *
     // Use NV12 shader program
     glUseProgram(g_nv12_shader_program);
     
-    // Bind textures
+    // Textures are already bound at init - just set the uniform samplers
+    // Use global uniform locations that were cached when shader was initialized
+    static int uniform_log_count = 0;
+    if (uniform_log_count < 2) {
+        LOG_INFO("Setting uniforms: Y_loc=%d, UV_loc=%d, shader=%u", 
+                 g_nv12_u_texture_y_loc, g_nv12_u_texture_uv_loc, g_nv12_shader_program);
+        uniform_log_count++;
+    }
+    
+    if (g_nv12_u_texture_y_loc >= 0) glUniform1i(g_nv12_u_texture_y_loc, 0);
+    if (g_nv12_u_texture_uv_loc >= 0) glUniform1i(g_nv12_u_texture_uv_loc, 1);
+
+    // Bind textures to the expected units each frame to avoid state drift
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, player->y_texture);
-    
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, player->uv_texture);
     
-    // Set texture uniforms
-    GLint y_tex_loc = glGetUniformLocation(g_nv12_shader_program, "u_texture_y");
-    GLint uv_tex_loc = glGetUniformLocation(g_nv12_shader_program, "u_texture_uv");
+    // TODO: Handle keystone vertex updates
+    // For now, just use fullscreen quad always
+    // Keystone vertex update code temporarily disabled to debug hang
     
-    if (y_tex_loc >= 0) glUniform1i(y_tex_loc, 0);
-    if (uv_tex_loc >= 0) glUniform1i(uv_tex_loc, 1);
+    // Use pre-configured VAO (contains VBO and vertex attribute setup)
+    glBindVertexArray(player->vao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
     
-    // Apply keystone correction if enabled
-    extern keystone_t g_keystone;
-    if (g_keystone.enabled) {
-        // TODO: Apply keystone transformation - for now render fullscreen
-        float vertices[] = {
-            -1.0f,  1.0f, 0.0f, 1.0f,  // Top-left
-            -1.0f, -1.0f, 0.0f, 0.0f,  // Bottom-left
-             1.0f,  1.0f, 1.0f, 1.0f,  // Top-right
-             1.0f, -1.0f, 1.0f, 0.0f   // Bottom-right
-        };
-        
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), vertices);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), vertices + 2);
-        glEnableVertexAttribArray(1);
-        
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    } else {
-        // Simple fullscreen quad
-        float vertices[] = {
-            -1.0f,  1.0f, 0.0f, 1.0f,  // Top-left
-            -1.0f, -1.0f, 0.0f, 0.0f,  // Bottom-left
-             1.0f,  1.0f, 1.0f, 1.0f,  // Top-right
-             1.0f, -1.0f, 1.0f, 0.0f   // Bottom-right
-        };
-        
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), vertices);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), vertices + 2);
-        glEnableVertexAttribArray(1);
-        
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (keystone_requested) {
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+        glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);
+
+        if (!keystone_render_texture(g_keystone_fbo_texture,
+                                     (int)d->mode.hdisplay,
+                                     (int)d->mode.vdisplay,
+                                     false,
+                                     false)) {
+            LOG_WARN("Keystone rendering failed, falling back to direct presentation");
+            glClear(GL_COLOR_BUFFER_BIT);
+            glUseProgram(g_nv12_shader_program);
+            if (g_nv12_u_texture_y_loc >= 0) glUniform1i(g_nv12_u_texture_y_loc, 0);
+            if (g_nv12_u_texture_uv_loc >= 0) glUniform1i(g_nv12_u_texture_uv_loc, 1);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, player->y_texture);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, player->uv_texture);
+            glBindVertexArray(player->vao);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glBindVertexArray(0);
+        }
+
+        glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);
     }
-    
-    // Unbind
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glUseProgram(0);
+
+    // Check for GL errors if in debug mode
+    if (g_debug) {
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            LOG_ERROR("GL error during render: 0x%04x", err);
+        }
+    }
     
     // Swap buffers to present the rendered frame
     eglSwapBuffers(e->dpy, e->surf);
@@ -2994,7 +3133,7 @@ static void* decode_thread_func(void *arg) {
     while (!player->thread_stop_requested && !player->eof_reached && !player->fatal_error) {
         // Don't read too many packets if the queue is full
         if (player->frame_queue.count >= 2) {
-            usleep(5000); // Sleep briefly to avoid CPU spin
+            usleep(1000); // Reduced from 5000 to 1000 (1ms) for better responsiveness at 60fps
             continue;
         }
         

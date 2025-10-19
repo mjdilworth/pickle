@@ -370,6 +370,58 @@ void cleanup_keystone_fbo(void) {
     g_keystone_fbo_h = 0;
 }
 
+bool ensure_keystone_fbo(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    if (g_keystone_fbo && g_keystone_fbo_w == width && g_keystone_fbo_h == height) {
+        return true;
+    }
+
+    if (g_keystone_fbo) {
+        glDeleteFramebuffers(1, &g_keystone_fbo);
+        g_keystone_fbo = 0;
+    }
+    if (g_keystone_fbo_texture) {
+        glDeleteTextures(1, &g_keystone_fbo_texture);
+        g_keystone_fbo_texture = 0;
+    }
+
+    GLint prev_fbo = 0;
+    GLint prev_tex = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+
+    glGenTextures(1, &g_keystone_fbo_texture);
+    glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    glGenFramebuffers(1, &g_keystone_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_keystone_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_keystone_fbo_texture, 0);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        LOG_ERROR("Keystone FBO incomplete: 0x%04x", status);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+        cleanup_keystone_fbo();
+        return false;
+    }
+
+    g_keystone_fbo_w = width;
+    g_keystone_fbo_h = height;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    return true;
+}
+
 void cleanup_mesh_resources(void) {
     if (g_keystone.mesh_points) {
         for (int i = 0; i < g_keystone.mesh_size; i++) {
@@ -409,6 +461,174 @@ void cleanup_keystone_resources(void) {
     
     // Reset keystone state
     g_keystone.initialized = false;
+}
+
+bool keystone_render_texture(GLuint texture, int screen_w, int screen_h, bool flip_x, bool flip_y) {
+    if (texture == 0 || screen_w <= 0 || screen_h <= 0) {
+        return false;
+    }
+
+    if (g_keystone_shader_program == 0) {
+        if (!init_keystone_shader()) {
+            return false;
+        }
+    }
+
+    if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
+        g_keystone_a_position_loc = glGetAttribLocation(g_keystone_shader_program, "a_position");
+        g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
+        g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
+        if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
+            LOG_WARN("Keystone shader attributes unavailable");
+            return false;
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, screen_w, screen_h);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glUseProgram(g_keystone_shader_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(g_keystone_u_texture_loc, 0);
+
+    // Vertices for TRIANGLE_STRIP: TL -> TR -> BL -> BR
+    float vertices[] = {
+        g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[0][1] * 2.0f),  // 0: TL (points[0])
+        g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[1][1] * 2.0f),  // 1: TR (points[1])
+        g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[2][1] * 2.0f),  // 2: BL (points[2])
+        g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[3][1] * 2.0f)   // 3: BR (points[3])
+    };
+
+    float u0 = flip_x ? 1.0f : 0.0f;
+    float u1 = flip_x ? 0.0f : 1.0f;
+    float v0 = flip_y ? 1.0f : 0.0f;
+    float v1 = flip_y ? 0.0f : 1.0f;
+    // Texture coordinates matching the vertex order: TL, TR, BL, BR
+    float texcoords[] = {
+        u0, v0,  // 0: TL
+        u1, v0,  // 1: TR
+        u0, v1,  // 2: BL
+        u1, v1   // 3: BR
+    };
+
+    if (g_keystone_vertex_buffer == 0) {
+        glGenBuffers(1, &g_keystone_vertex_buffer);
+    }
+    if (g_keystone_texcoord_buffer == 0) {
+        glGenBuffers(1, &g_keystone_texcoord_buffer);
+    }
+    if (g_keystone_index_buffer == 0) {
+        GLushort indices[] = {0, 1, 2, 2, 1, 3};
+        glGenBuffers(1, &g_keystone_index_buffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+    } else {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+    glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_keystone_texcoord_buffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+    glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+
+    glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+    glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+
+    if (g_show_border) {
+        if (g_border_shader_program == 0 && !init_border_shader()) {
+            LOG_WARN("Failed to initialize border shader");
+        } else {
+            float line_vertices[] = {
+                g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[0][1] * 2.0f),
+                g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[1][1] * 2.0f),
+                g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[1][1] * 2.0f),
+                g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[2][1] * 2.0f),
+                g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[2][1] * 2.0f),
+                g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[3][1] * 2.0f),
+                g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[3][1] * 2.0f),
+                g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[0][1] * 2.0f)
+            };
+
+            if (g_keystone_vertex_buffer == 0) {
+                glGenBuffers(1, &g_keystone_vertex_buffer);
+            }
+
+            glUseProgram(g_border_shader_program);
+            glUniform4f(g_border_u_color_loc, 1.0f, 1.0f, 0.0f, 1.0f);
+            glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(line_vertices), line_vertices, GL_DYNAMIC_DRAW);
+            glEnableVertexAttribArray((GLuint)g_border_a_position_loc);
+            glVertexAttribPointer((GLuint)g_border_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glLineWidth((GLfloat)g_border_width);
+            glDrawArrays(GL_LINES, 0, 8);
+            glDisableVertexAttribArray((GLuint)g_border_a_position_loc);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glUseProgram(0);
+        }
+    }
+
+    if (g_show_corner_markers) {
+        GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+        if (!blend_enabled) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+
+        GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+        if (!scissor_enabled) {
+            glEnable(GL_SCISSOR_TEST);
+        }
+
+        GLfloat prev_clear[4] = {0};
+        glGetFloatv(GL_COLOR_CLEAR_VALUE, prev_clear);
+
+        int marker_size = 10;
+        for (int i = 0; i < 4; i++) {
+            int x = (int)(g_keystone.points[i][0] * (float)screen_w);
+            int y = (int)(g_keystone.points[i][1] * (float)screen_h);
+            x -= marker_size / 2;
+            y -= marker_size / 2;
+            if (x < 0) x = 0; else if (x > screen_w - marker_size) x = screen_w - marker_size;
+            if (y < 0) y = 0; else if (y > screen_h - marker_size) y = screen_h - marker_size;
+
+            if (i == g_keystone.active_corner) {
+                glClearColor(1.0f, 0.0f, 0.0f, 0.8f);
+            } else {
+                glClearColor(0.0f, 1.0f, 0.0f, 0.8f);
+            }
+
+            glScissor(x, screen_h - y - marker_size, marker_size, marker_size);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+
+        glScissor(0, 0, screen_w, screen_h);
+        glClearColor(prev_clear[0], prev_clear[1], prev_clear[2], prev_clear[3]);
+
+        if (!scissor_enabled) {
+            glDisable(GL_SCISSOR_TEST);
+        }
+        if (!blend_enabled) {
+            glDisable(GL_BLEND);
+        }
+    }
+
+    return true;
 }
 
 void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
@@ -684,71 +904,93 @@ bool keystone_handle_key(char key) {
             return true;
     }
     
-    // Handle keystone-specific keys only when keystone mode is enabled
-    if (!g_keystone.enabled) {
-        return false;
-    }
-    
-    // Process keystone keys only when keystone mode is enabled
+    // Process keystone keys - corner selection works even when disabled (will enable keystone)
     switch (key) {
-        // Corner selection
+        // Corner selection (always allow, will enable keystone if needed)
         case '1': // Top-left (ASCII 49)
         case 1:   // Alternative keycode that might be sent
+            if (!g_keystone.enabled) {
+                g_keystone.enabled = true;
+                keystone_update_matrix();
+                LOG_INFO("Keystone auto-enabled for corner selection");
+            }
             g_keystone.active_corner = 0;
             LOG_INFO("Selected corner 1 (top-left)");
             fprintf(stderr, "\rAdjusting corner %d (top-left)\n", g_keystone.active_corner + 1);
             return true;
         case '2': // Top-right (ASCII 50)
         case 2:   // Alternative keycode that might be sent
+            if (!g_keystone.enabled) {
+                g_keystone.enabled = true;
+                keystone_update_matrix();
+                LOG_INFO("Keystone auto-enabled for corner selection");
+            }
             g_keystone.active_corner = 1;
             LOG_INFO("Selected corner 2 (top-right)");
             fprintf(stderr, "\rAdjusting corner %d (top-right)\n", g_keystone.active_corner + 1);
             return true;
         case '3': // Bottom-left (ASCII 51)
         case 3:   // Alternative keycode that might be sent
+            if (!g_keystone.enabled) {
+                g_keystone.enabled = true;
+                keystone_update_matrix();
+                LOG_INFO("Keystone auto-enabled for corner selection");
+            }
             g_keystone.active_corner = 2;
             LOG_INFO("Selected corner 3 (bottom-left)");
             fprintf(stderr, "\rAdjusting corner %d (bottom-left)\n", g_keystone.active_corner + 1);
             return true;
         case '4': // Bottom-right (ASCII 52)
         case 4:   // Alternative keycode that might be sent
+            if (!g_keystone.enabled) {
+                g_keystone.enabled = true;
+                keystone_update_matrix();
+                LOG_INFO("Keystone auto-enabled for corner selection");
+            }
             g_keystone.active_corner = 3;
             LOG_INFO("Selected corner 4 (bottom-right)");
             fprintf(stderr, "\rAdjusting corner %d (bottom-right)\n", g_keystone.active_corner + 1);
             return true;
             
-        // Movement keys - arrow keys only
+        // Movement keys - arrow keys (only when keystone is enabled)
         case 65: // Up arrow
+            if (!g_keystone.enabled) return false;
             LOG_INFO("Keystone: Processing Up arrow key for corner %d", g_keystone.active_corner + 1);
             keystone_adjust_corner(g_keystone.active_corner, 0, -0.05f);  // Increased from -0.01f
             return true;
         case 66: // Down arrow
+            if (!g_keystone.enabled) return false;
             LOG_INFO("Keystone: Processing Down arrow key for corner %d", g_keystone.active_corner + 1);
             keystone_adjust_corner(g_keystone.active_corner, 0, 0.05f);  // Increased from 0.01f
             return true;
         case 68: // Left arrow
+            if (!g_keystone.enabled) return false;
             LOG_INFO("Keystone: Processing Left arrow key for corner %d", g_keystone.active_corner + 1);
             keystone_adjust_corner(g_keystone.active_corner, -0.05f, 0);  // Increased from -0.01f
             return true;
         case 67: // Right arrow
+            if (!g_keystone.enabled) return false;
             LOG_INFO("Keystone: Processing Right arrow key for corner %d", g_keystone.active_corner + 1);
             keystone_adjust_corner(g_keystone.active_corner, 0.05f, 0);  // Increased from 0.01f
             return true;
             
-        // Toggle features
+        // Toggle features (only when keystone is enabled)
         case 'b': // Toggle border
+            if (!g_keystone.enabled) return false;
             g_show_border = !g_show_border;
             // Sync keystone border visibility with the global setting
             g_keystone.border_visible = (g_show_border != 0);
             fprintf(stderr, "\rBorder %s\n", g_show_border ? "enabled" : "disabled");
             return true;
         case 'c': // Toggle corner markers
+            if (!g_keystone.enabled) return false;
             g_show_corner_markers = !g_show_corner_markers;
             // Sync keystone corner markers visibility with the global setting
             g_keystone.corner_markers = (g_show_corner_markers != 0);
             fprintf(stderr, "\rCorner markers %s\n", g_show_corner_markers ? "enabled" : "disabled");
             return true;
         case 'r': // Reset keystone
+            if (!g_keystone.enabled) return false;
             keystone_init(); // Re-initialize to defaults
             fprintf(stderr, "\rKeystone settings reset\n");
             return true;

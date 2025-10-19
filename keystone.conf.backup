@@ -1,11 +1,11 @@
 # Pickle keystone configuration
 enabled=1
 mesh_size=4
-corner1=0.065000,0.065000
-corner2=0.620000,0.110000
-corner3=0.110000,0.880000
-corner4=0.570000,0.855000
-border=0
+corner1=0.118200,0.243820
+corner2=0.634950,0.212020
+corner3=0.620000,0.884980
+corner4=0.080000,0.875000
+border=1
 cornermarks=1
 border_width=5
 mesh_0_0=0.000000,0.000000

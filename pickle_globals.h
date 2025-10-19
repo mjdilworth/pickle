@@ -25,6 +25,13 @@ extern int g_use_v4l2_decoder;
 extern int g_scanout_disabled;
 extern int g_mpv_pipe[2];
 
+// NV12 shader and rendering state
+extern GLuint g_nv12_vao;
+extern GLuint g_nv12_vbo;
+extern GLuint g_nv12_shader_program;
+extern GLint g_nv12_u_texture_y_loc;
+extern GLint g_nv12_u_texture_uv_loc;
+
 // Functions that need to be shared across modules
 void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data);
 void drain_mpv_events(mpv_handle *h);

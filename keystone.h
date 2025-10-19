@@ -59,6 +59,7 @@ bool init_keystone_shader(void);
 void cleanup_keystone_shader(void);
 void update_keystone_mesh(void);
 void render_with_keystone(GLuint source_texture, int width, int height);
+bool keystone_render_texture(GLuint texture, int screen_w, int screen_h, bool flip_x, bool flip_y);
 
 // Toggle functions
 void keystone_toggle_enabled(void);

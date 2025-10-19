@@ -49,6 +49,11 @@ typedef struct {
     GLuint uv_texture;
     bool texture_valid;
     
+    // OpenGL rendering optimization
+    GLuint vbo;              // Vertex buffer object
+    GLuint vao;              // Vertex array object
+    // Note: Uniform locations are global (g_nv12_u_texture_y_loc, g_nv12_u_texture_uv_loc)
+    
     // NV12 conversion buffer
     uint8_t *nv12_buffer;
     size_t nv12_buffer_size;

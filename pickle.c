@@ -446,10 +446,10 @@ static GLuint g_nv12_vertex_shader = 0;
 static GLuint g_nv12_fragment_shader = 0;
 static GLint  g_nv12_a_position_loc = -1;
 static GLint  g_nv12_a_tex_coord_loc = -1;
-static GLint  g_nv12_u_texture_y_loc = -1;
-static GLint  g_nv12_u_texture_uv_loc = -1;
-static GLuint g_nv12_vao = 0;
-static GLuint g_nv12_vbo = 0;
+GLint  g_nv12_u_texture_y_loc = -1;
+GLint  g_nv12_u_texture_uv_loc = -1;
+GLuint g_nv12_vao = 0;
+GLuint g_nv12_vbo = 0;
 
 // Joystick/gamepad support
 // Note: All joystick-related variables and functions are now in input.c
@@ -905,8 +905,6 @@ static int g_vsync_enabled = 1;         // Enable vsync by default
 static int g_frame_timing_enabled = 0;  // Detailed frame timing metrics (when PICKLE_TIMING=1)
 
 // Texture orientation controls (used in keystone pass only)
-static int g_tex_flip_x = 0; // 1 = mirror horizontally (left/right)
-static int g_tex_flip_y = 0; // 1 = flip vertically (top/bottom)
 int g_help_visible = 0; // toggle state for help overlay
 
 // --- Statistics ---
@@ -2085,6 +2083,11 @@ static bool __attribute__((unused)) init_nv12_shader() {
     
     glAttachShader(g_nv12_shader_program, g_nv12_vertex_shader);
     glAttachShader(g_nv12_shader_program, g_nv12_fragment_shader);
+    
+    // Bind attribute locations BEFORE linking
+    glBindAttribLocation(g_nv12_shader_program, 0, "a_position");
+    glBindAttribLocation(g_nv12_shader_program, 1, "a_tex_coord");
+    
     glLinkProgram(g_nv12_shader_program);
     
     GLint linked = 0;
@@ -2113,17 +2116,23 @@ static bool __attribute__((unused)) init_nv12_shader() {
     g_nv12_u_texture_y_loc = glGetUniformLocation(g_nv12_shader_program, "u_texture_y");
     g_nv12_u_texture_uv_loc = glGetUniformLocation(g_nv12_shader_program, "u_texture_uv");
     
+    LOG_INFO("NV12 shader locations: pos=%d, tex=%d, Y_uniform=%d, UV_uniform=%d",
+             g_nv12_a_position_loc, g_nv12_a_tex_coord_loc, 
+             g_nv12_u_texture_y_loc, g_nv12_u_texture_uv_loc);
+    LOG_INFO("NV12 shader program ID: %u", g_nv12_shader_program);
+    
     // Create VAO and VBO for fullscreen quad
     glGenVertexArrays(1, &g_nv12_vao);
     glGenBuffers(1, &g_nv12_vbo);
     
     // Setup fullscreen quad vertices (position + texture coordinates)
+    // For TRIANGLE_STRIP: TL -> TR -> BL -> BR creates two triangles correctly
     float quad_vertices[] = {
         // Position   // TexCoord
-        -1.0f, -1.0f, 0.0f, 1.0f,  // Bottom-left
-         1.0f, -1.0f, 1.0f, 1.0f,  // Bottom-right
-        -1.0f,  1.0f, 0.0f, 0.0f,  // Top-left
-         1.0f,  1.0f, 1.0f, 0.0f,  // Top-right
+        -1.0f,  1.0f, 0.0f, 1.0f,  // Top-left
+         1.0f,  1.0f, 1.0f, 1.0f,  // Top-right
+        -1.0f, -1.0f, 0.0f, 0.0f,  // Bottom-left
+         1.0f, -1.0f, 1.0f, 0.0f,  // Bottom-right
     };
     
     glBindVertexArray(g_nv12_vao);
@@ -2237,9 +2246,6 @@ static bool __attribute__((unused)) convert_nv12_to_rgb_texture_gpu(const v4l2_d
     
     // Render fullscreen quad to perform conversion
     glBindVertexArray(g_nv12_vao);
-    glBindAttribLocation(g_nv12_shader_program, 0, "a_position");
-    glBindAttribLocation(g_nv12_shader_program, 1, "a_tex_coord");
-    
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     
     // Restore default framebuffer
@@ -2414,8 +2420,9 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 		// Subsequent page flips
 		g_egl_for_handler = e;  // Set for page flip handler
 		
-		// Wait for pending flip if needed
-		int max_pending = g_triple_buffer ? 2 : 1;
+		// For FFmpeg V4L2, don't wait for pending flips - we want continuous rendering
+		// For MPV, we want to throttle to avoid building up a backlog
+		int max_pending = (g_use_ffmpeg_v4l2) ? 1 : (g_triple_buffer ? 2 : 1);
 		
 		if (g_pending_flips >= max_pending) {
 			// Wait for a pending flip to complete
@@ -2423,7 +2430,7 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 			FD_ZERO(&fds);
 			FD_SET(d->fd, &fds);
 			
-			struct timeval timeout = {0, 100000}; // 100ms
+			struct timeval timeout = {0, 10000}; // 10ms for FFmpeg, quicker recovery
 			
 			if (select(d->fd + 1, &fds, NULL, NULL, &timeout) <= 0) {
 				// Timeout - force reset
@@ -2453,9 +2460,15 @@ bool present_gbm_surface(kms_ctx_t *d, egl_ctx_t *e) {
 			}
 		}
 		
-		if (g_debug) fprintf(stderr, "[DRM] Setting g_pending_flip = 1 (location 1)\n");
-		g_pending_flip = 1;
-		g_pending_flips++;
+		// For FFmpeg V4L2, don't set pending_flip flag - we want immediate continuous rendering
+		// For MPV, we throttle with pending_flip to avoid backlog
+		if (!g_use_ffmpeg_v4l2) {
+			if (g_debug) fprintf(stderr, "[DRM] Setting g_pending_flip = 1 (location 1)\n");
+			g_pending_flip = 1;
+			g_pending_flips++;
+		} else {
+			if (g_debug) fprintf(stderr, "[DRM] FFmpeg V4L2 path - skipping g_pending_flip\n");
+		}
 	} else {
 		// Offscreen mode - just release buffer
 		gbm_surface_release_buffer(e->gbm_surf, bo);
@@ -2924,217 +2937,14 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	
 	// If software keystone is enabled, render the FBO texture with our shader
 	if (g_keystone.enabled && !use_drm_keystone && g_keystone_fbo && g_keystone_fbo_texture) {
-		// Render keystone corrected video using shaders
-		
-		// Switch back to default framebuffer
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		
-		// Reset viewport to match screen size (cached)
-		gl_viewport_cached(0, 0, (int)d->mode.hdisplay, (int)d->mode.vdisplay);
-		
-		// Use our shader program (cached)
-		gl_use_program_cached(g_keystone_shader_program);
-		
-		// Check for shader attribute locations before using them
-		if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
-			// Re-acquire attribute locations
-			g_keystone_a_position_loc = glGetAttribLocation(g_keystone_shader_program, "a_position");
-			g_keystone_a_texcoord_loc = glGetAttribLocation(g_keystone_shader_program, "a_texCoord");
-			g_keystone_u_texture_loc = glGetUniformLocation(g_keystone_shader_program, "u_texture");
-			
-			if (g_debug) {
-				fprintf(stderr, "DEBUG: Reacquired shader attributes: pos=%d tex=%d u_tex=%d\n", 
-					g_keystone_a_position_loc, g_keystone_a_texcoord_loc, g_keystone_u_texture_loc);
-			}
-				
-			if (g_keystone_a_position_loc < 0 || g_keystone_a_texcoord_loc < 0 || g_keystone_u_texture_loc < 0) {
-				fprintf(stderr, "ERROR: Failed to get shader attributes\n");
-				return false; // Can't continue with invalid attributes
-			}
+		if (!keystone_render_texture(g_keystone_fbo_texture,
+								 (int)d->mode.hdisplay,
+								 (int)d->mode.vdisplay,
+								 false,
+								 true)) {
+			LOG_ERROR("Failed to render keystone texture");
+			return false;
 		}
-		
-		// Set up texture (cached)
-		glActiveTexture(GL_TEXTURE0);
-		gl_bind_texture_cached(GL_TEXTURE_2D, g_keystone_fbo_texture);
-		glUniform1i(g_keystone_u_texture_loc, 0);
-		
-		// Always enable blending for proper rendering regardless of border state (cached)
-		gl_enable_blend_cached(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		
-		// Ensure alpha blending is properly handled for video content
-		glDisable(GL_DEPTH_TEST);
-		
-		// Clear any previous OpenGL errors
-		while (glGetError() != GL_NO_ERROR);
-		
-		// For video content rendered through keystone, we need to flip Y coordinates
-		// because MPV renders to FBO without flipping (mpv_flip_y = 0 when keystone enabled)
-		g_tex_flip_y = 1;
-		
-		// Correct warping approach: Draw a warped quad where vertices match the keystone corners
-		// Convert keystone points from normalized [0,1] space to clip space [-1,1]
-		float vertices[] = {
-			g_keystone.points[0][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[0][1] * 2.0f),  // Top left 
-			g_keystone.points[1][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[1][1] * 2.0f),  // Top right
-			g_keystone.points[3][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[3][1] * 2.0f),  // Bottom left 
-			g_keystone.points[2][0] * 2.0f - 1.0f, 1.0f - (g_keystone.points[2][1] * 2.0f)   // Bottom right
-		};
-		
-		// Texture coordinates with optional flips
-		float u0 = g_tex_flip_x ? 1.0f : 0.0f;
-		float u1 = g_tex_flip_x ? 0.0f : 1.0f;
-		float v0 = g_tex_flip_y ? 1.0f : 0.0f;
-		float v1 = g_tex_flip_y ? 0.0f : 1.0f;
-		float texcoords[] = {
-			u0, v0,  // Top left
-			u1, v0,  // Top right
-			u0, v1,  // Bottom left
-			u1, v1   // Bottom right
-		};
-		
-		// Enable vertex arrays
-		glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
-		glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
-		
-		// Initialize buffers if needed
-		if (g_keystone_vertex_buffer == 0) {
-			glGenBuffers(1, &g_keystone_vertex_buffer);
-		}
-		if (g_keystone_texcoord_buffer == 0) {
-			glGenBuffers(1, &g_keystone_texcoord_buffer);
-		}
-		
-		// Bind and set vertex positions
-		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
-		glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-		
-		// Bind and set texture coordinates
-		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_texcoord_buffer);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_DYNAMIC_DRAW);
-		glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-		
-		// Prepare a cached index buffer for two triangles
-		if (g_keystone_index_buffer == 0) {
-			GLushort indices[] = {0, 1, 2, 2, 1, 3};
-			glGenBuffers(1, &g_keystone_index_buffer);
-			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
-			glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-		} else {
-			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
-		}
-		
-	// Draw using indexed triangles
-	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
-	
-	// Unbind buffers
-	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-	glBindBuffer(GL_ARRAY_BUFFER, 0);
-	
-	// Disable attribute arrays
-	glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
-	glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
-	
-	// Reset texture binding
-	glBindTexture(GL_TEXTURE_2D, 0);
-	
-	// Check for OpenGL errors after drawing
-	GLenum error = glGetError();
-	if (error != GL_NO_ERROR) {
-		fprintf(stderr, "ERROR: OpenGL error after drawing keystone texture: %d\n", error);
-		// Print more details about the error
-		switch (error) {
-			case GL_INVALID_ENUM: fprintf(stderr, "GL_INVALID_ENUM: An unacceptable value is specified for an enumerated argument\n"); break;
-			case GL_INVALID_VALUE: fprintf(stderr, "GL_INVALID_VALUE: A numeric argument is out of range\n"); break;
-			case GL_INVALID_OPERATION: fprintf(stderr, "GL_INVALID_OPERATION: The specified operation is not allowed in the current state\n"); break;
-			case GL_INVALID_FRAMEBUFFER_OPERATION: fprintf(stderr, "GL_INVALID_FRAMEBUFFER_OPERATION: The framebuffer object is not complete\n"); break;
-			case GL_OUT_OF_MEMORY: fprintf(stderr, "GL_OUT_OF_MEMORY: There is not enough memory left to execute the command\n"); break;
-			default: fprintf(stderr, "Unknown OpenGL error\n");
-		}
-	}
-		
-		// Clean up
-		glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
-		glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
-		gl_disable_blend_cached(); // Disable blending after drawing the video (cached)
-		gl_use_program_cached(0);
-		
-		// Reset texture flip flag after keystone rendering to avoid affecting other renders
-		g_tex_flip_y = 0;
-	}
-	
-	// Draw border around the keystone quad if enabled (software keystone only)
-	if (g_show_border && !use_drm_keystone) {
-		// Determine quad positions in clip space matching the keystone corners
-		float vx = g_keystone.points[0][0]*2.0f-1.0f;
-		float vy = 1.0f-(g_keystone.points[0][1]*2.0f);
-		float v0[2] = { vx, vy }; // TL
-		float v1[2] = { g_keystone.points[1][0]*2.0f-1.0f, 1.0f-(g_keystone.points[1][1]*2.0f) }; // TR
-		float v2[2] = { g_keystone.points[3][0]*2.0f-1.0f, 1.0f-(g_keystone.points[3][1]*2.0f) }; // BL
-		float v3[2] = { g_keystone.points[2][0]*2.0f-1.0f, 1.0f-(g_keystone.points[2][1]*2.0f) }; // BR
-		float lines[] = {
-			v0[0], v0[1], v1[0], v1[1], // top edge
-			v1[0], v1[1], v3[0], v3[1], // right edge
-			v3[0], v3[1], v2[0], v2[1], // bottom edge
-			v2[0], v2[1], v0[0], v0[1], // left edge
-		};
-		// Use border shader (cached)
-		gl_use_program_cached(g_border_shader_program);
-		glUniform4f(g_border_u_color_loc, 1.0f, 1.0f, 0.0f, 1.0f); // Yellow
-	// Upload a tiny VBO on existing vertex buffer to avoid creating a new one
-		if (g_keystone_vertex_buffer == 0) glGenBuffers(1, &g_keystone_vertex_buffer);
-		glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(lines), lines, GL_DYNAMIC_DRAW);
-		glEnableVertexAttribArray((GLuint)g_border_a_position_loc);
-		glVertexAttribPointer((GLuint)g_border_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-	// Set line width (may be clamped to 1 on some GLES drivers)
-	glLineWidth((GLfloat)g_border_width);
-	// Draw 4 line segments (each pair of vertices forms a segment)
-		glDrawArrays(GL_LINES, 0, 8);
-		// Cleanup
-		glDisableVertexAttribArray((GLuint)g_border_a_position_loc);
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
-		glUseProgram(0);
-	}
-	
-	// Draw corner markers for keystone adjustment if enabled (software keystone only)
-	// This is simplistic and would need a shader-based approach for proper GLES implementation
-	if (g_keystone.enabled && !use_drm_keystone && g_show_corner_markers) {
-		// Draw colored markers at each corner position to show their current locations
-		int corner_size = 10;
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		
-		int w = d->mode.hdisplay;
-		int h = d->mode.vdisplay;
-		
-		for (int i = 0; i < 4; i++) {
-			// Calculate screen position from normalized coordinates
-			int x = (int)((float)g_keystone.points[i][0] * (float)w);
-			int y = (int)((float)g_keystone.points[i][1] * (float)h);
-			
-			// Set color: active corner is red, others are green
-			if (i == g_keystone.active_corner) {
-				glClearColor(1.0f, 0.0f, 0.0f, 0.8f); // Red
-			} else {
-				glClearColor(0.0f, 1.0f, 0.0f, 0.8f); // Green
-			}
-			
-			// Ensure marker stays visible within screen bounds (integer clamps)
-			x = x - corner_size/2;
-			y = y - corner_size/2;
-			if (x < 0) x = 0; else if (x > w - corner_size) x = w - corner_size;
-			if (y < 0) y = 0; else if (y > h - corner_size) y = h - corner_size;
-			
-			// Draw the corner marker
-			glScissor(x, h - y - corner_size, corner_size, corner_size);
-			glEnable(GL_SCISSOR_TEST);
-			glClear(GL_COLOR_BUFFER_BIT);
-		}
-		
-		glDisable(GL_SCISSOR_TEST);
-		glDisable(GL_BLEND);
 	}
 	
 	// Render stats overlay if enabled (before buffer swap)
@@ -3629,8 +3439,24 @@ int main(int argc, char **argv) {
 			decoder_initialized = true;
 			decoder_name = "FFmpeg V4L2 M2M";
 			
-			LOG_INFO("FFmpeg V4L2 decoder initialized successfully: %ux%u @ %.2f fps", 
-			         ffmpeg_v4l2_player.width, ffmpeg_v4l2_player.height, g_video_fps);
+			// Initialize NV12 shader for rendering
+			if (g_nv12_shader_program == 0) {
+				if (!init_nv12_shader()) {
+					LOG_ERROR("Failed to initialize NV12 shader for FFmpeg V4L2 rendering");
+					cleanup_ffmpeg_v4l2_player(&ffmpeg_v4l2_player);
+					memset(&ffmpeg_v4l2_player, 0, sizeof(ffmpeg_v4l2_player));
+					g_use_ffmpeg_v4l2 = 0;
+					decoder_initialized = false;
+				} else {
+					LOG_INFO("NV12 shader initialized for FFmpeg V4L2 rendering");
+				}
+			}
+			
+			if (decoder_initialized) {
+				// Note: Keystone now works with FFmpeg V4L2 rendering
+				LOG_INFO("FFmpeg V4L2 decoder initialized successfully: %ux%u @ %.2f fps", 
+				         ffmpeg_v4l2_player.width, ffmpeg_v4l2_player.height, g_video_fps);
+			}
 		} else {
 			LOG_WARN("FFmpeg V4L2 decoder initialization failed, cleaning up...");
 			// Ensure clean state before fallback
@@ -3715,6 +3541,8 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "  [/] - Decrease/increase border width\n");
 	fprintf(stderr, "  v - Toggle performance stats overlay (FPS, CPU, GPU, RAM)\n");
 	fprintf(stderr, "  (border draws around keystone quad; background is always black)\n\n");
+
+	LOG_INFO("Entering main event/render loop...");
 
 	// Watchdog: if no frame submitted within WD_FIRST_MS, force a render attempt even if mpv flags missing.
 	int frames = 0;
