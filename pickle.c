@@ -1251,7 +1251,7 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	gl_state_init();
 	
 	// Initialize adaptive frame pacing
-	double initial_fps = g_vsync_enabled ? 30.0 : 50.0; // Conservative targets
+	double initial_fps = g_vsync_enabled ? 60.0 : 60.0; // Support 60 FPS playback
 	decoder_pacing_init(initial_fps);
 	
 	mpv_render_context_set_update_callback(p->rctx, on_mpv_events, NULL);
