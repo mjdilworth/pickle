@@ -63,6 +63,16 @@
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
 
+// Version information for production debugging
+#define PICKLE_VERSION_MAJOR 1
+#define PICKLE_VERSION_MINOR 0
+#define PICKLE_VERSION_PATCH 0
+#define PICKLE_VERSION_STRING "1.0.0"
+
+#ifndef PICKLE_BUILD_DATE
+#define PICKLE_BUILD_DATE __DATE__
+#endif
+
 // Some minimal systems or older headers might miss certain DRM macros; guard them.
 #ifndef DRM_MODE_TYPE_PREFERRED
 #define DRM_MODE_TYPE_PREFERRED  (1<<3)
@@ -121,6 +131,7 @@ static const char *mpv_end_reason_str(int r) {
 
 static volatile sig_atomic_t g_stop = 0;
 static void handle_sigint(int s){ (void)s; g_stop = 1; }
+static void handle_sigterm(int s){ (void)s; g_stop = 1; }  // Graceful shutdown for systemd/docker
 static void handle_sigsegv(int s){
 	(void)s;
 	void *bt[32];
@@ -3067,20 +3078,28 @@ int main(int argc, char **argv) {
 	static struct option long_options[] = {
 		{"loop", no_argument, NULL, 'l'},
 		{"help", no_argument, NULL, 'h'},
+		{"version", no_argument, NULL, 'V'},
 		{0, 0, 0, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "lh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "lhV", long_options, NULL)) != -1) {
 		switch (opt) {
 			case 'l':
 				g_loop_playback = 1;
 				break;
+			case 'V':
+				fprintf(stderr, "pickle %s (built %s)\n", PICKLE_VERSION_STRING, PICKLE_BUILD_DATE);
+				fprintf(stderr, "DRM/KMS + GBM + EGL + libmpv video player for Raspberry Pi 4\n");
+				return 0;
 			case 'h':
+				fprintf(stderr, "pickle %s - DRM/KMS video player for Raspberry Pi 4\n\n", PICKLE_VERSION_STRING);
 				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
 				fprintf(stderr, "  -h, --help            Show this help message\n");
+				fprintf(stderr, "  -V, --version         Show version information\n");
+				fprintf(stderr, "\nSee README.md for environment variables and keystone controls.\n");
 				return 0;
 			default:
 				fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
@@ -3113,7 +3132,9 @@ int main(int argc, char **argv) {
 	}
 
 	signal(SIGINT, handle_sigint);
+	signal(SIGTERM, handle_sigterm);  // Graceful shutdown for systemd/docker
 	signal(SIGSEGV, handle_sigsegv);
+	signal(SIGPIPE, SIG_IGN);  // Ignore broken pipe (prevents crash on audio disconnect)
 
 	if (getenv("PICKLE_DEBUG")) g_debug = 1;
 	gettimeofday(&g_prog_start, NULL);
@@ -3178,6 +3199,7 @@ int main(int argc, char **argv) {
 	// Prime event processing in case mpv already queued wakeups before pipe creation.
 	g_mpv_wakeup = 1;
 
+	fprintf(stderr, "pickle %s (built %s)\n", PICKLE_VERSION_STRING, PICKLE_BUILD_DATE);
 	fprintf(stderr, "Playing %s at %dx%d %.2f Hz\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
 			(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal))); 
 	

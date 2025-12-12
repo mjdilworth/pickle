@@ -93,7 +93,10 @@ try-run: $(APP)
 	./$(APP) "$(VIDEO)" $(MPV_ARGS) || { echo "Hint: use 'sudo make run VIDEO=...' if permission denied."; exit 1; }
 
 # Build mode convenience targets
-release: CFLAGS := -O3 -DNDEBUG $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
+# Pass build date for version info
+BUILD_DATE := $(shell date +%Y-%m-%d)
+
+release: CFLAGS := -O3 -DNDEBUG -DPICKLE_BUILD_DATE=\"$(BUILD_DATE)\" $(WARN) -std=$(CSTD) $(PKG_CFLAGS)
 release: clean $(APP)
 	@echo "Built release binary: $(APP)"
 
