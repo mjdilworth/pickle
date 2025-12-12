@@ -1035,7 +1035,7 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 		fprintf(stderr, "[mpv] WARNING: PICKLE_NO_CUSTOM_CTX deprecated; custom context disabled by default now.\n");
 
 	const char *vo_req = getenv("PICKLE_VO");
-	if (!vo_req || !*vo_req) vo_req = "libmpv"; // Changed default from "gpu" to avoid conflicts
+	if (!vo_req || !*vo_req) vo_req = "libmpv";
 	r = mpv_set_option_string(p->mpv, "vo", vo_req);
 	if (r < 0) {
 		fprintf(stderr, "[mpv] vo=%s failed (%d); falling back to vo=libmpv\n", vo_req, r);
@@ -1044,15 +1044,36 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 		log_opt_result("vo=libmpv", r);
 	}
 	const char *vo_used = vo_req;
+	
+	// Hardware decoding: drm-copy is optimal for RPi4 with vo=libmpv
+	// It uses V4L2 hardware decoder and copies frames to GPU textures efficiently
 	const char *hwdec_pref = getenv("PICKLE_HWDEC");
-	if (!hwdec_pref || !*hwdec_pref) hwdec_pref = "auto-safe";
+	if (!hwdec_pref || !*hwdec_pref) hwdec_pref = "drm-copy";  // Better than auto-safe for RPi4
 	r = mpv_set_option_string(p->mpv, "hwdec", hwdec_pref); log_opt_result("hwdec", r);
+	
+	// Specify V4L2 codec preference for RPi4 (uses hardware H.264/HEVC decoder)
+	r = mpv_set_option_string(p->mpv, "hwdec-codecs", "h264,hevc,mpeg2video,mpeg4,vp8,vp9");
+	log_opt_result("hwdec-codecs", r);
+	
 	r = mpv_set_option_string(p->mpv, "opengl-es", "yes"); log_opt_result("opengl-es=yes", r);
+	
+	// Disable aspect ratio preservation to fill entire display (important for keystone/projector mode)
+	r = mpv_set_option_string(p->mpv, "keepaspect", "no");
+	log_opt_result("keepaspect=no", r);
 	
 	// Video sync mode for better frame timing
 	const char *video_sync = g_vsync_enabled ? "display-resample" : "audio";
 	r = mpv_set_option_string(p->mpv, "video-sync", video_sync);
 	log_opt_result("video-sync", r);
+	
+	// Interpolation for smoother playback when display-resample is active
+	if (g_vsync_enabled) {
+		r = mpv_set_option_string(p->mpv, "interpolation", "yes");
+		log_opt_result("interpolation", r);
+		// Use fast bilinear for temporal interpolation (low GPU overhead)
+		r = mpv_set_option_string(p->mpv, "tscale", "oversample");
+		log_opt_result("tscale=oversample", r);
+	}
 	
 	// Set a higher frame queue size for smoother playback
 	r = mpv_set_option_string(p->mpv, "vo-queue-size", "4");
@@ -1077,50 +1098,24 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	r = mpv_set_option_string(p->mpv, "audio-buffer", "0.2");  // 200ms audio buffer
 	log_opt_result("audio-buffer", r);
 	
+	// === RPi4 GPU Optimizations ===
+	// Use fast bilinear scaling (less GPU load than spline/lanczos)
+	r = mpv_set_option_string(p->mpv, "scale", "bilinear");
+	log_opt_result("scale=bilinear", r);
+	
+	// Disable expensive post-processing for embedded/kiosk use
+	r = mpv_set_option_string(p->mpv, "deband", "no");
+	log_opt_result("deband=no", r);
+	r = mpv_set_option_string(p->mpv, "dither-depth", "no");
+	log_opt_result("dither-depth=no", r);
+	
+	// Reduce latency for initial frame display
+	r = mpv_set_option_string(p->mpv, "demuxer-readahead-secs", "1.0");
+	log_opt_result("demuxer-readahead-secs", r);
+	
 	// Prefer using MPV_RENDER_PARAM_FLIP_Y during rendering instead of global rotation
 
-	const char *ctx_override = getenv("PICKLE_GPU_CONTEXT");
-	int forced_headless = getenv("PICKLE_FORCE_HEADLESS") ? 1 : 0;
-	int headless_attempted = 0;
-	if (ctx_override && *ctx_override && strcmp(vo_used, "gpu") == 0) {
-		int rc = mpv_set_option_string(p->mpv, "gpu-context", ctx_override);
-		log_opt_result("gpu-context (override)", rc);
-	} else if (strcmp(vo_used, "gpu") == 0) {
-		// Always try to avoid DRM contexts that conflict with our own DRM usage
-		const char *try_contexts[] = {"x11egl", "waylandvk", "wayland", "x11vk", "displayvk", NULL};
-		int ctx_set = 0;
-		for (int i = 0; try_contexts[i] && !ctx_set; i++) {
-			int rc = mpv_set_option_string(p->mpv, "gpu-context", try_contexts[i]);
-			if (rc >= 0) {
-				fprintf(stderr, "[mpv] Using gpu-context=%s to avoid DRM conflicts\n", try_contexts[i]);
-				ctx_set = 1;
-				break;
-			}
-		}
-		if (!ctx_set && (forced_headless || (!g_have_master && !getenv("PICKLE_DISABLE_HEADLESS")))) {
-			int rc = mpv_set_option_string(p->mpv, "gpu-context", "headless");
-			if (rc < 0) {
-				fprintf(stderr, "[mpv] gpu-context=headless unsupported (%d); will proceed without it.\n", rc);
-			} else {
-				fprintf(stderr, "[mpv] Using gpu-context=headless (%s).\n", forced_headless?"forced":"auto");
-				headless_attempted = 1;
-			}
-		}
-	}
-	if (strcmp(vo_used, "gpu") == 0) {
-		mpv_set_option_string(p->mpv, "terminal", "no");
-		mpv_set_option_string(p->mpv, "input-default-bindings", "no");
-		mpv_set_option_string(p->mpv, "input-vo-keyboard", "no");  // Disable mpv's keyboard handling
-		mpv_set_option_string(p->mpv, "input-cursor", "no");       // Disable cursor handling
-		mpv_set_option_string(p->mpv, "input-media-keys", "no");   // Disable media key handling
-		// Prevent mpv from attempting any DRM/KMS operations since we handle display ourselves
-		if (!getenv("PICKLE_KEEP_ATOMIC")) {
-			mpv_set_option_string(p->mpv, "drm-atomic", "no");
-			mpv_set_option_string(p->mpv, "drm-mode", "");
-			mpv_set_option_string(p->mpv, "drm-connector", "");
-			mpv_set_option_string(p->mpv, "drm-device", "");
-		}
-	}
+	// vo=libmpv doesn't need gpu-context configuration
 
 	int use_adv = 0;
 	const char *adv_env = getenv("PICKLE_GL_ADV");
@@ -1146,20 +1141,6 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	params[pi].type = 0;
 	fprintf(stderr, "[mpv] Creating render context (advanced_control=%d vo=%s) ...\n", use_adv, vo_used);
 	int cr = mpv_render_context_create(&p->rctx, p->mpv, params);
-	if (cr < 0 && strcmp(vo_used, "gpu") == 0 && !forced_headless && !headless_attempted) {
-		// Retry once with libmpv fallback for compatibility
-		fprintf(stderr, "[mpv] render context create failed (%d); retrying with vo=libmpv\n", cr);
-		mpv_terminate_destroy(p->mpv); p->mpv=NULL; p->rctx=NULL;
-		p->mpv = mpv_create();
-		if (!p->mpv) { fprintf(stderr, "mpv_create (retry) failed\n"); return false; }
-		if (want_debug && *want_debug) mpv_request_log_messages(p->mpv, "debug"); else mpv_request_log_messages(p->mpv, "warn");
-		mpv_set_option_string(p->mpv, "vo", "libmpv");
-		mpv_set_option_string(p->mpv, "hwdec", hwdec_pref);
-		if (disable_audio) mpv_set_option_string(p->mpv, "audio", "no");
-		if (mpv_initialize(p->mpv) < 0) { fprintf(stderr, "mpv_initialize (libmpv retry) failed\n"); return false; }
-		p->using_libmpv = 1;
-		cr = mpv_render_context_create(&p->rctx, p->mpv, params);
-	}
 	if (cr < 0) { fprintf(stderr, "mpv_render_context_create failed (%d)\n", cr); return false; }
 	fprintf(stderr, "[mpv] Render context OK\n");
 	mpv_render_context_set_update_callback(p->rctx, on_mpv_events, NULL);
@@ -3474,7 +3455,7 @@ int main(int argc, char **argv) {
 						
 						// If we're still having issues, try cycling the hardware decoder
 						if (g_stall_reset_count > 2) {
-							const char *cmd[] = {"cycle-values", "hwdec", "auto-safe", "no", NULL};
+							const char *cmd[] = {"cycle-values", "hwdec", "drm-copy", "auto-safe", "no", NULL};
 							mpv_command_async(player.mpv, 0, cmd);
 							fprintf(stderr, "[wd] cycling hwdec as part of recovery\n");
 						}
@@ -3553,6 +3534,7 @@ fail:
 	destroy_mpv(&player);
 	deinit_gbm_egl(&eglc);
 	deinit_drm(&drm);
+	
 	return 1;
 }
 
