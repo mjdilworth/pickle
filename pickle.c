@@ -235,6 +235,25 @@ typedef struct {
     bool perspective_pins[4];// Whether each corner is pinned (fixed) during adjustments
 } keystone_t;
 
+// Forward declaration for mpv player structure (matches typedef below)
+typedef struct mpv_player_struct mpv_player_t;
+
+// Video instance structure - encapsulates one video + keystone pair
+#define MAX_VIDEOS 2
+typedef struct video_instance {
+    mpv_player_t *player;         // Pointer to mpv player (allocated separately)
+    keystone_t keystone;          // Keystone settings for this video
+    GLuint fbo;                   // FBO for mpv render target
+    GLuint fbo_texture;           // Texture attached to FBO
+    int fbo_w, fbo_h;             // FBO dimensions
+    char config_path[512];        // Path to keystone config file
+    int index;                    // Instance index (0 or 1)
+    const char *video_file;       // Path to video file
+    volatile uint64_t update_flags; // mpv update flags for this instance
+	int use_subrect;              // Use texture sub-rectangle (single-mpv mode)
+	float u0, u1, v0, v1;         // Texture coordinates when use_subrect=1
+} video_instance_t;
+
 // Typedefs for clarity
 typedef struct kms_ctx kms_ctx_t;
 typedef struct egl_ctx egl_ctx_t;
@@ -243,15 +262,46 @@ typedef struct fb_ring_entry fb_ring_entry_t;
 
 // Forward declarations for keystone functions
 static void keystone_update_matrix(void);
+static void keystone_update_matrix_for(keystone_t *ks);
 static void keystone_adjust_corner(int corner, float x_delta, float y_delta);
 static bool keystone_handle_key(char key);
 static void keystone_init(void);
+static void keystone_init_instance(video_instance_t *inst, int video_index, int total_videos);
+static bool keystone_load_config(const char* path);
+static bool keystone_load_config_to(const char* path, keystone_t *ks);
+static bool keystone_load_instance_config(video_instance_t *inst);
 static bool keystone_save_config(const char* path);
+static bool keystone_save_config_from(const char* path, const keystone_t *ks);
+static bool keystone_save_instance_config(video_instance_t *inst);
 static void cleanup_mesh_resources(void);
 
 // Global state 
 static fb_ring_t g_fb_ring = {0};
 static int g_have_master = 0; // set if we successfully become DRM master
+
+// Multi-video instance management
+static video_instance_t g_videos[MAX_VIDEOS] = {0};  // Array of video instances
+static int g_num_videos = 0;                          // Number of active video instances (1 or 2)
+static int g_active_corner_global = 0;                // Global corner index (0-7 for 2 videos, 0-3 for 1)
+                                                      // Corners 0-3 = video 0, corners 4-7 = video 1
+
+// Alternate frame rendering for dual-video performance
+static int g_alternate_frame_mode = 1;                // 1=enabled (default for dual video)
+static int g_render_frame_count = 0;                  // Frame counter for alternation
+static int g_single_mpv_mode = 0;                     // 1=use single mpv with lavfi-complex
+
+// Composite FBO/texture when using single mpv for dual videos
+static GLuint g_composite_fbo = 0;
+static GLuint g_composite_texture = 0;
+static int g_composite_w = 0;
+static int g_composite_h = 0;
+
+// Helper macros for multi-video corner management
+#define CORNER_VIDEO(c) ((c) / 4)                     // Which video instance (0 or 1)
+#define CORNER_LOCAL(c) ((c) % 4)                     // Local corner within video (0-3)
+#define CORNER_GLOBAL(v, c) ((v) * 4 + (c))           // Global corner from video + local
+
+// Legacy global keystone for backward compatibility (points to g_videos[0].keystone when single video)
 static keystone_t g_keystone = {
     .points = {
         {0.0f, 0.0f},  // Top-left
@@ -266,21 +316,22 @@ static keystone_t g_keystone = {
     .mesh_points = NULL,
     .active_mesh_point = {-1, -1},
     .perspective_pins = {false, false, false, false}
-}; // Keystone correction settings
+}; // Keystone correction settings (used for single-video mode)
 static int g_keystone_adjust_step = 1; // Step size for keystone adjustments (in 1/1000 units)
 static bool g_show_border = false; // Whether to show border around the video
 static int g_border_width = 5; // Border width in pixels
 static bool g_show_background = false; // Deprecated: background is always black now
 static bool g_show_corner_markers = true; // Show keystone corner highlights
 static int g_loop_playback = 0; // Whether to loop video playback
-static GLuint g_keystone_shader_program = 0; // Shader program for keystone correction
+static GLuint g_keystone_shader_program = 0; // Shader program for keystone correction (shared)
 static GLuint g_keystone_vertex_shader = 0;
 static GLuint g_keystone_fragment_shader = 0;
-static GLuint g_keystone_vertex_buffer = 0;
-static GLuint g_keystone_texcoord_buffer = 0;
-static GLuint g_keystone_index_buffer = 0;   // Cached index buffer for quad
-static GLuint g_keystone_fbo = 0;            // Cached FBO for mpv render target
-static GLuint g_keystone_fbo_texture = 0;    // Texture attached to FBO
+static GLuint g_keystone_vertex_buffer = 0;  // Shared vertex buffer
+static GLuint g_keystone_texcoord_buffer = 0; // Shared texcoord buffer
+static GLuint g_keystone_index_buffer = 0;   // Shared index buffer for quad
+// Note: FBO is now per-instance in video_instance_t, these are kept for single-video backward compat
+static GLuint g_keystone_fbo = 0;            // Cached FBO for mpv render target (single video mode)
+static GLuint g_keystone_fbo_texture = 0;    // Texture attached to FBO (single video mode)
 static int g_keystone_fbo_w = 0;             // FBO width
 static int g_keystone_fbo_h = 0;             // FBO height
 static GLint g_keystone_a_position_loc = -1;
@@ -830,11 +881,11 @@ static void deinit_gbm_egl(egl_ctx_t *e) {
 }
 
 // MPV rendering integration
-typedef struct {
+struct mpv_player_struct {
 	mpv_handle *mpv;             // MPV API handle
 	mpv_render_context *rctx;    // MPV render context for OpenGL rendering
 	int using_libmpv;            // Flag indicating fallback to vo=libmpv occurred
-} mpv_player_t;
+};
 
 // Wakeup callback sets a flag so main loop knows mpv wants processing.
 static volatile int g_mpv_wakeup = 0;
@@ -857,6 +908,11 @@ static int g_debug = 0;
 static int g_triple_buffer = 1;         // Enable triple buffering by default
 static int g_vsync_enabled = 1;         // Enable vsync by default
 static int g_frame_timing_enabled = 0;  // Detailed frame timing metrics (when PICKLE_TIMING=1)
+
+// Target FPS limiting for smooth playback (0 = unlimited)
+static int g_target_fps = 0;            // Will be auto-set based on video count
+static double g_frame_interval_us = 0;  // Microseconds between frames (calculated from target_fps)
+static struct timeval g_last_render_time = {0}; // For frame pacing
 
 // Texture orientation controls (used in keystone pass only)
 static int g_tex_flip_x = 0; // 1 = mirror horizontally (left/right)
@@ -915,13 +971,16 @@ static void stats_log_periodic(mpv_player_t *p) {
 	double avg_fps  = (total > 0.0) ? (double)frames_now / total : 0.0;
 	// Query mpv drop stats if possible
 	int64_t drop_dec = 0, drop_vo = 0;
+	double mpv_fps = 0.0, container_fps = 0.0;
 	if (p && p->mpv) {
 		mpv_get_property(p->mpv, "drop-frame-count", MPV_FORMAT_INT64, &drop_dec);
 		mpv_get_property(p->mpv, "vo-drop-frame-count", MPV_FORMAT_INT64, &drop_vo);
+		mpv_get_property(p->mpv, "estimated-vf-fps", MPV_FORMAT_DOUBLE, &mpv_fps);
+		mpv_get_property(p->mpv, "container-fps", MPV_FORMAT_DOUBLE, &container_fps);
 	}
-	fprintf(stderr, "[stats] total=%.2fs frames=%llu avg_fps=%.2f inst_fps=%.2f dropped_dec=%lld dropped_vo=%lld\n",
+	fprintf(stderr, "[stats] total=%.2fs frames=%llu avg_fps=%.2f inst_fps=%.2f mpv_fps=%.1f container=%.1f dropped=%lld/%lld\n",
 			total, (unsigned long long)frames_now, avg_fps, inst_fps,
-			(long long)drop_dec, (long long)drop_vo);
+			mpv_fps, container_fps, (long long)drop_dec, (long long)drop_vo);
 	g_stats_last = now;
 	g_stats_last_frames = frames_now;
 }
@@ -1056,11 +1115,12 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	}
 	const char *vo_used = vo_req;
 	
-	// Hardware decoding: drm-copy is optimal for RPi4 with vo=libmpv
-	// It uses V4L2 hardware decoder and copies frames to GPU textures efficiently
+	// Hardware decoding: drm-copy is most stable for RPi4 with vo=libmpv
+	// Uses V4L2 hardware decoder with efficient GPU upload
 	const char *hwdec_pref = getenv("PICKLE_HWDEC");
-	if (!hwdec_pref || !*hwdec_pref) hwdec_pref = "drm-copy";  // Better than auto-safe for RPi4
-	r = mpv_set_option_string(p->mpv, "hwdec", hwdec_pref); log_opt_result("hwdec", r);
+	if (!hwdec_pref || !*hwdec_pref) hwdec_pref = "drm-copy";
+	r = mpv_set_option_string(p->mpv, "hwdec", hwdec_pref); 
+	log_opt_result("hwdec", r);
 	
 	// Specify V4L2 codec preference for RPi4 (uses hardware H.264/HEVC decoder)
 	r = mpv_set_option_string(p->mpv, "hwdec-codecs", "h264,hevc,mpeg2video,mpeg4,vp8,vp9");
@@ -1072,13 +1132,16 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	r = mpv_set_option_string(p->mpv, "keepaspect", "no");
 	log_opt_result("keepaspect=no", r);
 	
-	// Video sync mode for better frame timing
-	const char *video_sync = g_vsync_enabled ? "display-resample" : "audio";
+	// Video sync mode: use "display-vdrop" for better 60fps performance
+	// (drops/repeats frames to match display, less GPU overhead than interpolation)
+	const char *video_sync = g_vsync_enabled ? "display-vdrop" : "audio";
 	r = mpv_set_option_string(p->mpv, "video-sync", video_sync);
 	log_opt_result("video-sync", r);
 	
-	// Interpolation for smoother playback when display-resample is active
-	if (g_vsync_enabled) {
+	// Disable interpolation by default (saves GPU, especially with keystone shader)
+	// Can still be enabled via PICKLE_INTERPOLATION=1 for non-matching framerates
+	const char *interp_env = getenv("PICKLE_INTERPOLATION");
+	if (g_vsync_enabled && interp_env && *interp_env && strcmp(interp_env, "0") != 0) {
 		r = mpv_set_option_string(p->mpv, "interpolation", "yes");
 		log_opt_result("interpolation", r);
 		// Use fast bilinear for temporal interpolation (low GPU overhead)
@@ -1086,9 +1149,7 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 		log_opt_result("tscale=oversample", r);
 	}
 	
-	// Set a higher frame queue size for smoother playback
-	r = mpv_set_option_string(p->mpv, "vo-queue-size", "4");
-	log_opt_result("vo-queue-size", r);
+	// Note: vo-queue-size not supported in vo=libmpv mode (fails with -5)
 	
 	// Configure loop behavior if enabled
 	if (g_loop_playback) {
@@ -1133,13 +1194,12 @@ static bool init_mpv(mpv_player_t *p, const char *file) {
 	if (adv_env && *adv_env && strcmp(vo_used, "gpu") == 0) use_adv = 1;
 	fprintf(stderr, "[mpv] Advanced control %s (PICKLE_GL_ADV=%s vo=%s)\n", use_adv?"ENABLED":"disabled", adv_env?adv_env:"unset", vo_used);
 
-	int disable_audio = 0;
-	if (getenv("PICKLE_NO_AUDIO")) { fprintf(stderr, "[mpv] Disabling audio (PICKLE_NO_AUDIO set)\n"); disable_audio = 1; }
-	if (!disable_audio && !getenv("PICKLE_FORCE_AUDIO")) {
-		if (getuid() == 0) {
-			const char *xdg = getenv("XDG_RUNTIME_DIR");
-			if (!xdg || !*xdg) { fprintf(stderr, "[mpv] XDG_RUNTIME_DIR missing under root; disabling audio (set PICKLE_FORCE_AUDIO=1 to override)\n"); disable_audio = 1; }
-		}
+	// Audio is disabled by default for video-only playback (eliminates A/V desync warnings)
+	// Set PICKLE_FORCE_AUDIO=1 to enable audio output
+	int disable_audio = 1;  // Default: no audio
+	if (getenv("PICKLE_FORCE_AUDIO")) { 
+		fprintf(stderr, "[mpv] Audio enabled (PICKLE_FORCE_AUDIO set)\n"); 
+		disable_audio = 0; 
 	}
 	if (disable_audio) mpv_set_option_string(p->mpv, "audio", "no");
 	if (mpv_initialize(p->mpv) < 0) { fprintf(stderr, "mpv_initialize failed\n"); return false; }
@@ -1179,6 +1239,60 @@ static void destroy_mpv(mpv_player_t *p) {
 		mpv_terminate_destroy(p->mpv);
 		p->mpv = NULL;
 	}
+}
+
+// Initialize a single mpv instance that plays two videos via lavfi-complex and outputs a side-by-side composite
+static bool init_mpv_lavfi_dual(mpv_player_t *p, const char *file1, const char *file2) {
+	if (!p || !file1 || !file2) return false;
+	memset(p, 0, sizeof(*p));
+
+	p->mpv = mpv_create();
+	if (!p->mpv) { fprintf(stderr, "failed to create mpv context\n"); return false; }
+
+	const char *vo_env = getenv("PICKLE_VO");
+	const char *vo_used = vo_env ? vo_env : "gpu";
+	int r = mpv_set_option_string(p->mpv, "vo", vo_used);
+	if (r < 0) { fprintf(stderr, "mpv_set_option(vo=%s) failed (%d)\n", vo_used, r); return false; }
+
+	const char *hwdec_pref = getenv("PICKLE_HWDEC");
+	if (!hwdec_pref || !*hwdec_pref) hwdec_pref = "no"; // safer default
+	r = mpv_set_option_string(p->mpv, "hwdec", hwdec_pref);
+	log_opt_result("hwdec", r);
+
+	// Basic playback flags
+	mpv_set_option_string(p->mpv, "osd-level", "0");
+	mpv_set_option_string(p->mpv, "cursor-autohide", "always");
+	mpv_set_option_string(p->mpv, "audio", getenv("PICKLE_FORCE_AUDIO") ? "yes" : "no");
+
+	// GPU-friendly defaults
+	mpv_set_option_string(p->mpv, "scale", "bilinear");
+	mpv_set_option_string(p->mpv, "deband", "no");
+	mpv_set_option_string(p->mpv, "dither-depth", "no");
+
+	// Compose two inputs side-by-side at half resolution each (960x540 for 1080p sources)
+	const char *graph = "[vid1]scale=iw/2:ih/2[va];[vid2]scale=iw/2:ih/2[vb];[va][vb]hstack=inputs=2:shortest=1[vo]";
+	r = mpv_set_option_string(p->mpv, "lavfi-complex", graph);
+	log_opt_result("lavfi-complex", r);
+
+	if (mpv_initialize(p->mpv) < 0) { fprintf(stderr, "mpv_initialize failed\n"); return false; }
+
+	mpv_opengl_init_params gl_init = { .get_proc_address = mpv_get_proc_address, .get_proc_address_ctx = NULL };
+	mpv_render_param params[4]; memset(params,0,sizeof(params)); int pi=0;
+	params[pi].type = MPV_RENDER_PARAM_API_TYPE; params[pi++].data = (void*)MPV_RENDER_API_TYPE_OPENGL;
+	params[pi].type = MPV_RENDER_PARAM_OPENGL_INIT_PARAMS; params[pi++].data = &gl_init;
+	params[pi].type = 0;
+	int cr = mpv_render_context_create(&p->rctx, p->mpv, params);
+	if (cr < 0) { fprintf(stderr, "mpv_render_context_create failed (%d)\n", cr); return false; }
+	mpv_render_context_set_update_callback(p->rctx, on_mpv_events, NULL);
+	mpv_set_wakeup_callback(p->mpv, mpv_wakeup_cb, NULL);
+
+	const char *cmd1[] = {"loadfile", file1, NULL};
+	if (mpv_command(p->mpv, cmd1) < 0) { fprintf(stderr, "Failed to load file %s\n", file1); return false; }
+	const char *cmd2[] = {"loadfile", file2, "append", NULL};
+	if (mpv_command(p->mpv, cmd2) < 0) { fprintf(stderr, "Failed to append file %s\n", file2); return false; }
+
+	fprintf(stderr, "[mpv] Initialized lavfi-complex dual playback (vo=%s)\n", vo_used);
+	return true;
 }
 
 static void drain_mpv_events(mpv_handle *h) {
@@ -1269,6 +1383,7 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	struct timeval now; gettimeofday(&now, NULL);
 	g_last_frame_time = now;
 	g_last_flip_complete = now;
+	g_last_render_time = now;  // For frame pacing
 	
 	// Update flip timing metrics
 	if (g_frame_timing_enabled) {
@@ -1283,6 +1398,93 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 				g_min_flip_time * 1000.0, g_avg_flip_time * 1000.0, g_max_flip_time * 1000.0, g_flip_count);
 		}
 	}
+}
+
+/**
+ * Load keystone configuration from a specified file path into a specific keystone struct
+ * 
+ * @param path The file path to load the configuration from
+ * @param ks Pointer to keystone struct to load into
+ * @return true if the configuration was loaded successfully, false otherwise
+ */
+static bool keystone_load_config_to(const char* path, keystone_t *ks) {
+    if (!path || !ks) return false;
+    
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        if (strncmp(line, "enabled=", 8) == 0) {
+            ks->enabled = (atoi(line + 8) != 0);
+        }
+        else if (strncmp(line, "mesh_enabled=", 13) == 0) {
+            ks->mesh_enabled = (atoi(line + 13) != 0);
+        }
+        else if (strncmp(line, "corner1=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &ks->points[0][0], &ks->points[0][1]);
+        }
+        else if (strncmp(line, "corner2=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &ks->points[1][0], &ks->points[1][1]);
+        }
+        else if (strncmp(line, "corner3=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &ks->points[2][0], &ks->points[2][1]);
+        }
+        else if (strncmp(line, "corner4=", 8) == 0) {
+            sscanf(line + 8, "%f,%f", &ks->points[3][0], &ks->points[3][1]);
+        }
+        else if (strncmp(line, "pin1=", 5) == 0) {
+            ks->perspective_pins[0] = (atoi(line + 5) != 0);
+        }
+        else if (strncmp(line, "pin2=", 5) == 0) {
+            ks->perspective_pins[1] = (atoi(line + 5) != 0);
+        }
+        else if (strncmp(line, "pin3=", 5) == 0) {
+            ks->perspective_pins[2] = (atoi(line + 5) != 0);
+        }
+        else if (strncmp(line, "pin4=", 5) == 0) {
+            ks->perspective_pins[3] = (atoi(line + 5) != 0);
+        }
+    }
+    fclose(f);
+    
+    if (ks->enabled) {
+        keystone_update_matrix_for(ks);
+    }
+    
+    return true;
+}
+
+/**
+ * Save keystone configuration from a specific keystone struct to a file
+ * 
+ * @param path The file path to save the configuration to
+ * @param ks Pointer to keystone struct to save from
+ * @return true if the configuration was saved successfully, false otherwise
+ */
+static bool keystone_save_config_from(const char* path, const keystone_t *ks) {
+    if (!path || !ks) return false;
+    
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        LOG_ERROR("Failed to open file for writing: %s (%s)", path, strerror(errno));
+        return false;
+    }
+    
+    fprintf(f, "# Pickle keystone configuration\n");
+    fprintf(f, "enabled=%d\n", ks->enabled ? 1 : 0);
+    fprintf(f, "mesh_enabled=%d\n", ks->mesh_enabled ? 1 : 0);
+    
+    for (int i = 0; i < 4; i++) {
+        fprintf(f, "corner%d=%.6f,%.6f\n", i+1, ks->points[i][0], ks->points[i][1]);
+        fprintf(f, "pin%d=%d\n", i+1, ks->perspective_pins[i] ? 1 : 0);
+    }
+    
+    fclose(f);
+    return true;
 }
 
 /**
@@ -1457,14 +1659,20 @@ static void keystone_init(void) {
         }
     }
     
-    // Check for environment variable to enable keystone
+    // Check for environment variable to control keystone
+    // PICKLE_KEYSTONE=1 enables, PICKLE_KEYSTONE=0 disables
     const char* keystone_env = getenv("PICKLE_KEYSTONE");
     if (keystone_env && *keystone_env) {
-        g_keystone.enabled = true;
-        LOG_INFO("Keystone correction enabled via PICKLE_KEYSTONE");
+        if (strcmp(keystone_env, "0") == 0 || strcasecmp(keystone_env, "off") == 0 || strcasecmp(keystone_env, "no") == 0) {
+            g_keystone.enabled = false;
+            LOG_INFO("Keystone correction disabled via PICKLE_KEYSTONE=0");
+        } else {
+            g_keystone.enabled = true;
+            LOG_INFO("Keystone correction enabled via PICKLE_KEYSTONE");
+        }
         
         // Parse custom corner positions if provided in format "x1,y1,x2,y2,x3,y3,x4,y4"
-        if (strlen(keystone_env) > 10) // Arbitrary minimum length for valid data
+        if (g_keystone.enabled && strlen(keystone_env) > 10) // Arbitrary minimum length for valid data
         {
             float values[8];
             int count = 0;
@@ -1527,6 +1735,154 @@ static void keystone_init(void) {
 	// Corner markers env (1=on, 0=off)
 	const char* show_corners = getenv("PICKLE_SHOW_CORNERS");
 	if (show_corners && *show_corners) g_show_corner_markers = atoi(show_corners) ? true : false;
+
+	// Single mpv lavfi-complex mode (1=on, 0=off)
+	const char* single_mpv = getenv("PICKLE_SINGLE_MPV");
+	if (single_mpv && *single_mpv) g_single_mpv_mode = atoi(single_mpv) ? 1 : 0;
+	
+	// Alternate frame rendering mode for dual-video (1=on [default], 0=off)
+	// When enabled, only one video's FBO is updated per frame, halving GPU work
+	const char* alt_frame = getenv("PICKLE_ALTERNATE_FRAMES");
+	if (alt_frame && *alt_frame) g_alternate_frame_mode = atoi(alt_frame) ? 1 : 0;
+}
+
+/**
+ * Initialize keystone for a specific video instance with default position
+ * 
+ * @param inst Pointer to the video instance
+ * @param video_index Index of this video (0 or 1)
+ * @param total_videos Total number of videos (1 or 2)
+ */
+static void keystone_init_instance(video_instance_t *inst, int video_index, int total_videos) {
+    keystone_t *ks = &inst->keystone;
+    
+    // Initialize with default values
+    if (total_videos == 1) {
+        // Single video: full screen
+        ks->points[0][0] = 0.0f; ks->points[0][1] = 0.0f; // Top-left
+        ks->points[1][0] = 1.0f; ks->points[1][1] = 0.0f; // Top-right
+        ks->points[2][0] = 1.0f; ks->points[2][1] = 1.0f; // Bottom-right
+        ks->points[3][0] = 0.0f; ks->points[3][1] = 1.0f; // Bottom-left
+    } else {
+        // Dual video: split left/right
+        if (video_index == 0) {
+            // Video 0: left half
+            ks->points[0][0] = 0.0f; ks->points[0][1] = 0.0f; // Top-left
+            ks->points[1][0] = 0.5f; ks->points[1][1] = 0.0f; // Top-right
+            ks->points[2][0] = 0.5f; ks->points[2][1] = 1.0f; // Bottom-right
+            ks->points[3][0] = 0.0f; ks->points[3][1] = 1.0f; // Bottom-left
+        } else {
+            // Video 1: right half
+            ks->points[0][0] = 0.5f; ks->points[0][1] = 0.0f; // Top-left
+            ks->points[1][0] = 1.0f; ks->points[1][1] = 0.0f; // Top-right
+            ks->points[2][0] = 1.0f; ks->points[2][1] = 1.0f; // Bottom-right
+            ks->points[3][0] = 0.5f; ks->points[3][1] = 1.0f; // Bottom-left
+        }
+    }
+    
+    ks->active_corner = -1;
+    ks->enabled = true;  // Always enabled in multi-video mode
+    ks->mesh_enabled = false;
+    ks->mesh_size = 4;
+    ks->mesh_points = NULL;
+    ks->active_mesh_point[0] = -1;
+    ks->active_mesh_point[1] = -1;
+    
+    for (int i = 0; i < 4; i++) {
+        ks->perspective_pins[i] = false;
+    }
+    
+    // Initialize identity matrix
+    for (int i = 0; i < 16; i++) {
+        ks->matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    }
+    
+    // Initialize FBO to 0 (will be created during render)
+    inst->fbo = 0;
+    inst->fbo_texture = 0;
+    inst->fbo_w = 0;
+    inst->fbo_h = 0;
+    inst->index = video_index;
+    inst->update_flags = 0;
+    
+    // Set config path for this instance
+    snprintf(inst->config_path, sizeof(inst->config_path), "./keystone_%d.conf", video_index);
+    
+    LOG_INFO("Initialized keystone %d: TL(%.2f,%.2f) TR(%.2f,%.2f) BR(%.2f,%.2f) BL(%.2f,%.2f)",
+        video_index,
+        ks->points[0][0], ks->points[0][1],
+        ks->points[1][0], ks->points[1][1],
+        ks->points[2][0], ks->points[2][1],
+        ks->points[3][0], ks->points[3][1]);
+}
+
+/**
+ * Load keystone config for a specific video instance
+ * 
+ * @param inst Pointer to the video instance
+ * @return true if config was loaded, false otherwise
+ */
+static bool keystone_load_instance_config(video_instance_t *inst) {
+    // Try local config first
+    if (keystone_load_config_to(inst->config_path, &inst->keystone)) {
+        LOG_INFO("Loaded keystone %d config from %s", inst->index, inst->config_path);
+        return true;
+    }
+    
+    // Try home directory
+    const char *home = getenv("HOME");
+    if (home) {
+        char alt_path[512];
+        snprintf(alt_path, sizeof(alt_path), "%s/.config/pickle_keystone_%d.conf", home, inst->index);
+        if (keystone_load_config_to(alt_path, &inst->keystone)) {
+            LOG_INFO("Loaded keystone %d config from %s", inst->index, alt_path);
+            snprintf(inst->config_path, sizeof(inst->config_path), "%s", alt_path);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Save keystone config for a specific video instance
+ * 
+ * @param inst Pointer to the video instance
+ * @return true if config was saved, false otherwise
+ */
+static bool keystone_save_instance_config(video_instance_t *inst) {
+    return keystone_save_config_from(inst->config_path, &inst->keystone);
+}
+
+/**
+ * Update keystone matrix for a specific instance
+ * 
+ * @param ks Pointer to the keystone structure to update
+ */
+static void keystone_update_matrix_for(keystone_t *ks) {
+    if (!ks->enabled) {
+        for (int i = 0; i < 16; i++) {
+            ks->matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        }
+        return;
+    }
+    
+    // Convert normalized corner positions to clip space
+    float vertices[8];
+    for (int i = 0; i < 4; i++) {
+        vertices[i*2]   = ks->points[i][0] * 2.0f - 1.0f;
+        vertices[i*2+1] = (1.0f - ks->points[i][1]) * 2.0f - 1.0f;
+    }
+    
+    // Store as vertex positions
+    ks->matrix[0] = vertices[0];  // TL.x
+    ks->matrix[1] = vertices[1];  // TL.y
+    ks->matrix[2] = vertices[2];  // TR.x
+    ks->matrix[3] = vertices[3];  // TR.y
+    ks->matrix[4] = vertices[6];  // BL.x
+    ks->matrix[5] = vertices[7];  // BL.y
+    ks->matrix[6] = vertices[4];  // BR.x
+    ks->matrix[7] = vertices[5];  // BR.y
 }
 
 /**
@@ -1604,10 +1960,50 @@ static void keystone_toggle_pin(int corner) {
     LOG_INFO("Corner %d pin %s", corner + 1, g_keystone.perspective_pins[corner] ? "enabled" : "disabled");
 }
 
-static void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
-    if (corner < 0 || corner > 3) return;
+/**
+ * Adjust a corner on a specific keystone instance
+ * 
+ * @param ks Pointer to the keystone to adjust
+ * @param corner The corner index (0-3)
+ * @param x_delta The X adjustment delta
+ * @param y_delta The Y adjustment delta
+ */
+static void keystone_adjust_corner_on(keystone_t *ks, int corner, float x_delta, float y_delta) {
+    if (!ks || corner < 0 || corner > 3) return;
     
-    // If this corner is pinned, don't adjust it
+    if (ks->perspective_pins[corner]) {
+        LOG_INFO("Corner %d is pinned.", corner + 1);
+        return;
+    }
+    
+    x_delta *= 10.0f;
+    y_delta *= 10.0f;
+    
+    ks->points[corner][0] += x_delta;
+    ks->points[corner][1] += y_delta;
+    
+    ks->points[corner][0] = fmaxf(-0.5f, fminf(1.5f, ks->points[corner][0]));
+    ks->points[corner][1] = fmaxf(-0.5f, fminf(1.5f, ks->points[corner][1]));
+    
+    keystone_update_matrix_for(ks);
+    
+    LOG_DEBUG("Adjusted corner %d to (%.3f, %.3f)", 
+              corner + 1, ks->points[corner][0], ks->points[corner][1]);
+}
+
+static void keystone_adjust_corner(int corner, float x_delta, float y_delta) {
+    // In multi-video mode, adjust the correct keystone based on g_active_corner_global
+    if (g_num_videos > 1) {
+        int video_idx = CORNER_VIDEO(g_active_corner_global);
+        int local_corner = CORNER_LOCAL(g_active_corner_global);
+        if (video_idx >= 0 && video_idx < g_num_videos) {
+            keystone_adjust_corner_on(&g_videos[video_idx].keystone, local_corner, x_delta, y_delta);
+            return;
+        }
+    }
+    
+    // Single video mode: use legacy g_keystone
+    if (corner < 0 || corner > 3) return;
     if (g_keystone.perspective_pins[corner]) {
         LOG_INFO("Corner %d is pinned. Unpin with Shift+%d to adjust.", corner + 1, corner + 1);
         return;
@@ -1982,11 +2378,55 @@ static bool keystone_handle_key(char key) {
 			LOG_INFO("Keystone correction disabled");
             return true;
             
-        case '1': case '2': case '3': case '4': // Select corner
-            g_keystone.active_corner = key - '1';
-            g_keystone.active_mesh_point[0] = -1; // Deactivate mesh point
-            g_keystone.active_mesh_point[1] = -1;
-			LOG_INFO("Adjusting corner %d", g_keystone.active_corner + 1);
+        case '1': case '2': case '3': case '4': // Select corner (keystone 0)
+            if (g_num_videos == 1) {
+                // Single video mode: select corner 0-3
+                g_keystone.active_corner = key - '1';
+                g_keystone.active_mesh_point[0] = -1;
+                g_keystone.active_mesh_point[1] = -1;
+                LOG_INFO("Adjusting corner %d", g_keystone.active_corner + 1);
+            } else {
+                // Multi-video mode: keys 1-4 select corners on keystone 0
+                int local_corner = key - '1';
+                g_active_corner_global = CORNER_GLOBAL(0, local_corner);
+                g_videos[0].keystone.active_corner = local_corner;
+                g_videos[1].keystone.active_corner = -1;  // Deselect other keystone
+                LOG_INFO("Adjusting keystone 1, corner %d (global %d)", local_corner + 1, g_active_corner_global + 1);
+            }
+            return true;
+            
+        case '5': case '6': case '7': case '8': // Select corner (keystone 1, multi-video only)
+            if (g_num_videos > 1) {
+                int local_corner = key - '5';
+                g_active_corner_global = CORNER_GLOBAL(1, local_corner);
+                g_videos[1].keystone.active_corner = local_corner;
+                g_videos[0].keystone.active_corner = -1;  // Deselect other keystone
+                LOG_INFO("Adjusting keystone 2, corner %d (global %d)", local_corner + 1, g_active_corner_global + 1);
+                return true;
+            }
+            break;
+            
+        case '\t': // Tab: cycle through all corners
+            if (g_num_videos == 1) {
+                // Single video: cycle 0-3
+                g_keystone.active_corner = (g_keystone.active_corner + 1) % 4;
+                LOG_INFO("Adjusting corner %d", g_keystone.active_corner + 1);
+            } else {
+                // Multi-video: cycle 0-7
+                g_active_corner_global = (g_active_corner_global + 1) % (g_num_videos * 4);
+                int video_idx = CORNER_VIDEO(g_active_corner_global);
+                int local_corner = CORNER_LOCAL(g_active_corner_global);
+                
+                // Update active corners on each keystone
+                for (int i = 0; i < g_num_videos; i++) {
+                    if (i == video_idx) {
+                        g_videos[i].keystone.active_corner = local_corner;
+                    } else {
+                        g_videos[i].keystone.active_corner = -1;
+                    }
+                }
+                LOG_INFO("Adjusting keystone %d, corner %d (global %d)", video_idx + 1, local_corner + 1, g_active_corner_global + 1);
+            }
             return true;
             
         case '!': case '@': case '#': case '$': // Pin/unpin corners (shift+1,2,3,4)
@@ -2187,7 +2627,39 @@ static bool keystone_handle_key(char key) {
             return true;
             
         case 'r': // Reset to default
+            if (g_num_videos > 1) {
+                // Multi-video mode: reset the currently active keystone
+                int video_idx = CORNER_VIDEO(g_active_corner_global);
+                if (video_idx >= 0 && video_idx < g_num_videos) {
+                    keystone_t *ks = &g_videos[video_idx].keystone;
+                    
+                    // Reset to default split position for this video
+                    if (video_idx == 0) {
+                        // Video 0: left half
+                        ks->points[0][0] = 0.0f; ks->points[0][1] = 0.0f; // Top-left
+                        ks->points[1][0] = 0.5f; ks->points[1][1] = 0.0f; // Top-right
+                        ks->points[2][0] = 0.5f; ks->points[2][1] = 1.0f; // Bottom-right
+                        ks->points[3][0] = 0.0f; ks->points[3][1] = 1.0f; // Bottom-left
+                    } else {
+                        // Video 1: right half
+                        ks->points[0][0] = 0.5f; ks->points[0][1] = 0.0f; // Top-left
+                        ks->points[1][0] = 1.0f; ks->points[1][1] = 0.0f; // Top-right
+                        ks->points[2][0] = 1.0f; ks->points[2][1] = 1.0f; // Bottom-right
+                        ks->points[3][0] = 0.5f; ks->points[3][1] = 1.0f; // Bottom-left
+                    }
+                    
+                    // Reset pins
+                    for (int i = 0; i < 4; i++) {
+                        ks->perspective_pins[i] = false;
+                    }
+                    
+                    keystone_update_matrix_for(ks);
+                    LOG_INFO("Reset keystone %d to default position", video_idx + 1);
+                }
+                return true;
+            }
             {
+                // Single video mode: original behavior
                 // Save the current enabled state
                 bool was_enabled = g_keystone.enabled;
                 bool was_mesh_enabled = g_keystone.mesh_enabled;
@@ -2280,10 +2752,24 @@ static bool keystone_handle_key(char key) {
 			return false;
             
         case 'S': // Save keystone configuration to local file
-            if (keystone_save_config("./keystone.conf")) {
-                LOG_INFO("Keystone configuration saved to local file: keystone.conf");
+            if (g_num_videos > 1) {
+                // Multi-video mode: save each keystone to its own file
+                bool all_ok = true;
+                for (int i = 0; i < g_num_videos; i++) {
+                    if (!keystone_save_instance_config(&g_videos[i])) {
+                        LOG_ERROR("Failed to save keystone %d configuration", i + 1);
+                        all_ok = false;
+                    }
+                }
+                if (all_ok) {
+                    LOG_INFO("Keystone configurations saved to keystone_0.conf and keystone_1.conf");
+                }
             } else {
-                LOG_ERROR("Failed to save keystone configuration to local file");
+                if (keystone_save_config("./keystone.conf")) {
+                    LOG_INFO("Keystone configuration saved to local file: keystone.conf");
+                } else {
+                    LOG_ERROR("Failed to save keystone configuration to local file");
+                }
             }
             return true;
             
@@ -2688,13 +3174,269 @@ static void bo_destroy_handler(struct gbm_bo *bo, void *data) {
 	}
 }
 
+/**
+ * Update a video instance's FBO by rendering from mpv
+ * This is the expensive operation we want to do less frequently in dual-video mode
+ */
+static bool update_video_fbo(video_instance_t *inst, int screen_w, int screen_h) {
+	if (!inst || !inst->player || !inst->player->rctx) return false;
+	
+	mpv_player_t *p = inst->player;
+	
+	// In dual-video mode, use quarter resolution to reduce GPU load significantly
+	// mpv renders at 960x540, keystone shader upscales to screen
+	// This reduces pixel fill by 75% per video
+	int want_w = screen_w;
+	int want_h = screen_h;
+	if (g_num_videos > 1) {
+		want_w = screen_w / 2;
+		want_h = screen_h / 2;  // Quarter resolution (half width × half height)
+	}
+	bool need_recreate = (inst->fbo == 0) || (inst->fbo_w != want_w) || (inst->fbo_h != want_h);
+	if (need_recreate) {
+		if (inst->fbo) {
+			glDeleteFramebuffers(1, &inst->fbo);
+			inst->fbo = 0;
+		}
+		if (inst->fbo_texture) {
+			glDeleteTextures(1, &inst->fbo_texture);
+			inst->fbo_texture = 0;
+		}
+		glGenTextures(1, &inst->fbo_texture);
+		glBindTexture(GL_TEXTURE_2D, inst->fbo_texture);
+		// Use LINEAR filtering for smooth upscaling from quarter-res FBO
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		
+		glGenFramebuffers(1, &inst->fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, inst->fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, inst->fbo_texture, 0);
+		
+		GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		if (status != GL_FRAMEBUFFER_COMPLETE) {
+			LOG_ERROR("Instance %d FBO setup failed, status: %d", inst->index, status);
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glDeleteFramebuffers(1, &inst->fbo);
+			glDeleteTextures(1, &inst->fbo_texture);
+			inst->fbo = 0;
+			inst->fbo_texture = 0;
+			return false;
+		}
+		inst->fbo_w = want_w;
+		inst->fbo_h = want_h;
+	}
+	
+	// Render mpv to this instance's FBO
+	glBindFramebuffer(GL_FRAMEBUFFER, inst->fbo);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Transparent black
+	glClear(GL_COLOR_BUFFER_BIT);
+	
+	mpv_opengl_fbo mpv_fbo = { .fbo = (int)inst->fbo, .w = inst->fbo_w, .h = inst->fbo_h, .internal_format = 0 };
+	int mpv_flip_y = 0;
+	mpv_render_param r_params[] = {
+		{MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
+		{MPV_RENDER_PARAM_FLIP_Y, &mpv_flip_y},
+		{0}
+	};
+	mpv_render_context_render(p->rctx, r_params);
+	
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	return true;
+}
+
+// Render both videos (already composed by lavfi) into a single composite FBO
+static bool update_composite_fbo(mpv_player_t *p, int screen_w, int screen_h) {
+	if (!p || !p->rctx) return false;
+
+	// Composite output at half height to reduce fill; width matches screen for keystone mapping
+	int want_w = screen_w;
+	int want_h = screen_h / 2; // 1920x540 for 1080p
+	bool need_recreate = (g_composite_fbo == 0) || (g_composite_w != want_w) || (g_composite_h != want_h);
+	if (need_recreate) {
+		if (g_composite_fbo) { glDeleteFramebuffers(1, &g_composite_fbo); g_composite_fbo = 0; }
+		if (g_composite_texture) { glDeleteTextures(1, &g_composite_texture); g_composite_texture = 0; }
+		glGenTextures(1, &g_composite_texture);
+		glBindTexture(GL_TEXTURE_2D, g_composite_texture);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+		glGenFramebuffers(1, &g_composite_fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, g_composite_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_composite_texture, 0);
+		GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		if (status != GL_FRAMEBUFFER_COMPLETE) {
+			LOG_ERROR("Composite FBO setup failed, status: %d", status);
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glDeleteFramebuffers(1, &g_composite_fbo);
+			glDeleteTextures(1, &g_composite_texture);
+			g_composite_fbo = 0; g_composite_texture = 0;
+			return false;
+		}
+		g_composite_w = want_w;
+		g_composite_h = want_h;
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, g_composite_fbo);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	mpv_opengl_fbo mpv_fbo = { .fbo = (int)g_composite_fbo, .w = g_composite_w, .h = g_composite_h, .internal_format = 0 };
+	int mpv_flip_y = 0;
+	mpv_render_param r_params[] = {
+		{MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
+		{MPV_RENDER_PARAM_FLIP_Y, &mpv_flip_y},
+		{0}
+	};
+	mpv_render_context_render(p->rctx, r_params);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	return true;
+}
+
+/**
+ * Render the keystone quad for a video instance using its cached FBO texture
+ * This is cheap and can be done every frame
+ */
+static bool render_keystone_quad(video_instance_t *inst, int screen_w, int screen_h) {
+	if (!inst || inst->fbo_texture == 0) return false;
+	
+	keystone_t *ks = &inst->keystone;
+	
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	
+	glUseProgram(g_keystone_shader_program);
+	
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, inst->fbo_texture);
+	glUniform1i(g_keystone_u_texture_loc, 0);
+	
+	// Convert keystone points to clip space
+	float vertices[] = {
+		ks->points[0][0] * 2.0f - 1.0f, 1.0f - (ks->points[0][1] * 2.0f),  // Top left 
+		ks->points[1][0] * 2.0f - 1.0f, 1.0f - (ks->points[1][1] * 2.0f),  // Top right
+		ks->points[3][0] * 2.0f - 1.0f, 1.0f - (ks->points[3][1] * 2.0f),  // Bottom left 
+		ks->points[2][0] * 2.0f - 1.0f, 1.0f - (ks->points[2][1] * 2.0f)   // Bottom right
+	};
+	
+	float u0 = inst->use_subrect ? inst->u0 : 0.0f;
+	float u1 = inst->use_subrect ? inst->u1 : 1.0f;
+	float v0 = inst->use_subrect ? inst->v0 : 0.0f;
+	float v1 = inst->use_subrect ? inst->v1 : 1.0f;
+	float texcoords[] = {
+		u0, v0,  // Top left
+		u1, v0,  // Top right
+		u0, v1,  // Bottom left
+		u1, v1   // Bottom right
+	};
+	
+	glEnableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+	glBindBuffer(GL_ARRAY_BUFFER, g_keystone_vertex_buffer);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
+	glVertexAttribPointer((GLuint)g_keystone_a_position_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+	
+	if (g_keystone_texcoord_buffer == 0) {
+		glGenBuffers(1, &g_keystone_texcoord_buffer);
+	}
+	glBindBuffer(GL_ARRAY_BUFFER, g_keystone_texcoord_buffer);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_DYNAMIC_DRAW);
+	glEnableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+	glVertexAttribPointer((GLuint)g_keystone_a_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+	
+	if (g_keystone_index_buffer == 0) {
+		GLushort indices[] = {0, 1, 2, 2, 1, 3};
+		glGenBuffers(1, &g_keystone_index_buffer);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+	} else {
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_keystone_index_buffer);
+	}
+	
+	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+	
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+	glDisableVertexAttribArray((GLuint)g_keystone_a_position_loc);
+	glDisableVertexAttribArray((GLuint)g_keystone_a_texcoord_loc);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glUseProgram(0);
+	glDisable(GL_BLEND);
+	
+	// Draw corner markers for this keystone (always show when enabled)
+	if (g_show_corner_markers) {
+		int corner_size = 12;
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		
+		for (int i = 0; i < 4; i++) {
+			int x = (int)(ks->points[i][0] * (float)screen_w);
+			int y = (int)(ks->points[i][1] * (float)screen_h);
+			
+			// Color: active corner = yellow, inactive corners = green/blue by keystone
+			if (i == ks->active_corner) {
+				glClearColor(1.0f, 1.0f, 0.0f, 0.9f);  // Yellow for active corner
+			} else if (inst->index == 0) {
+				glClearColor(0.0f, 0.7f, 0.0f, 0.6f);  // Green for keystone 0
+			} else {
+				glClearColor(0.0f, 0.4f, 0.8f, 0.6f);  // Blue for keystone 1
+			}
+			
+			x = x - corner_size/2;
+			y = y - corner_size/2;
+			if (x < 0) x = 0; else if (x > screen_w - corner_size) x = screen_w - corner_size;
+			if (y < 0) y = 0; else if (y > screen_h - corner_size) y = screen_h - corner_size;
+			
+			glScissor(x, screen_h - y - corner_size, corner_size, corner_size);
+			glEnable(GL_SCISSOR_TEST);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
+		
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_BLEND);
+	}
+	
+	return true;
+}
+
+/**
+ * Render a single video instance with its keystone to the current framebuffer
+ * Used in multi-video mode (legacy wrapper, now uses split functions)
+ * 
+ * @param d DRM context
+ * @param e EGL context
+ * @param inst Video instance to render
+ * @param screen_w Screen width
+ * @param screen_h Screen height
+ * @return true on success
+ */
+/**
+ * Combined render function - updates FBO and renders keystone quad
+ * Used for single video mode or when alternate frame mode is disabled
+ */
+static bool render_video_instance(kms_ctx_t *d, egl_ctx_t *e, video_instance_t *inst, int screen_w, int screen_h) {
+	(void)d; (void)e;  // Unused parameters, kept for API compatibility
+	if (!inst || !inst->player || !inst->player->rctx) return false;
+	
+	// Update FBO from mpv
+	if (!update_video_fbo(inst, screen_w, screen_h)) return false;
+	
+	// Render keystone quad to screen
+	return render_keystone_quad(inst, screen_w, screen_h);
+}
+
 static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	if (!eglMakeCurrent(e->dpy, e->surf, e->surf, e->ctx)) {
 		fprintf(stderr, "eglMakeCurrent failed\n"); return false; 
 	}
 	
-	// Initialize keystone shader if needed and enabled
-	if (g_keystone.enabled && g_keystone_shader_program == 0) {
+	// Initialize keystone shader if needed
+	bool any_keystone = g_keystone.enabled || (g_num_videos > 1);
+	if (any_keystone && g_keystone_shader_program == 0) {
 		if (!init_keystone_shader()) {
 			LOG_ERROR("Failed to initialize keystone shader, disabling keystone correction");
 			g_keystone.enabled = false;
@@ -2712,6 +3454,59 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 	
+	// Multi-video mode: render each video instance with its own keystone
+	if (g_num_videos > 1) {
+		int screen_w = (int)d->mode.hdisplay;
+		int screen_h = (int)d->mode.vdisplay;
+		
+		// Update active_corner for each keystone based on g_active_corner_global
+		// Each keystone only has its corner active if it's the currently selected keystone
+		for (int i = 0; i < g_num_videos; i++) {
+			int current_video = CORNER_VIDEO(g_active_corner_global);
+			if (i == current_video) {
+				g_videos[i].keystone.active_corner = CORNER_LOCAL(g_active_corner_global);
+			} else {
+				g_videos[i].keystone.active_corner = -1;  // Not active
+			}
+		}
+		
+		if (g_single_mpv_mode) {
+			// Single mpv: render composite once, then two keystones sampling sub-rects
+			if (!update_composite_fbo(g_videos[0].player, screen_w, screen_h)) {
+				LOG_WARN("Failed to update composite FBO");
+			}
+			for (int i = 0; i < g_num_videos; i++) {
+				g_videos[i].fbo_texture = g_composite_texture;
+				if (!render_keystone_quad(&g_videos[i], screen_w, screen_h)) {
+					LOG_WARN("Failed to render keystone quad for video %d", i);
+				}
+			}
+		} else if (g_alternate_frame_mode && g_num_videos == 2) {
+			int video_to_update = g_render_frame_count % 2;
+			g_render_frame_count++;
+			if (!update_video_fbo(&g_videos[video_to_update], screen_w, screen_h)) {
+				LOG_WARN("Failed to update FBO for video instance %d", video_to_update);
+			}
+			for (int i = 0; i < g_num_videos; i++) {
+				if (g_videos[i].fbo_texture != 0) {
+					if (!render_keystone_quad(&g_videos[i], screen_w, screen_h)) {
+						LOG_WARN("Failed to render keystone quad for video %d", i);
+					}
+				}
+			}
+		} else {
+			for (int i = 0; i < g_num_videos; i++) {
+				if (!render_video_instance(d, e, &g_videos[i], screen_w, screen_h)) {
+					LOG_WARN("Failed to render video instance %d", i);
+				}
+			}
+		}
+		
+		// Skip single-video rendering path below
+		goto do_swap;
+	}
+	
+	// Single video mode: use legacy keystone rendering
 	// Ensure reusable FBO exists when keystone is enabled, sized to current mode
 	if (g_keystone.enabled) {
 		int want_w = (int)d->mode.hdisplay;
@@ -2727,13 +3522,15 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 				glDeleteTextures(1, &g_keystone_fbo_texture);
 				g_keystone_fbo_texture = 0;
 			}
-			// Create texture
+			// Create texture - use RGB instead of RGBA to save bandwidth
 			glGenTextures(1, &g_keystone_fbo_texture);
 			glBindTexture(GL_TEXTURE_2D, g_keystone_fbo_texture);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			// Use nearest filtering for maximum performance
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			// Use RGBA back - RGB might not be compatible with mpv output
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 			// Create FBO
 			glGenFramebuffers(1, &g_keystone_fbo);
@@ -2929,6 +3726,7 @@ static bool render_frame_fixed(kms_ctx_t *d, egl_ctx_t *e, mpv_player_t *p) {
 		glDisable(GL_BLEND);
 	}
 	
+do_swap:
 	// Swap buffers to display the rendered frame
 	eglSwapBuffers(e->dpy, e->surf);
 
@@ -3077,16 +3875,20 @@ int main(int argc, char **argv) {
 	// Parse command line options
 	static struct option long_options[] = {
 		{"loop", no_argument, NULL, 'l'},
+		{"stats", no_argument, NULL, 's'},
 		{"help", no_argument, NULL, 'h'},
 		{"version", no_argument, NULL, 'V'},
 		{0, 0, 0, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "lhV", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "lshV", long_options, NULL)) != -1) {
 		switch (opt) {
 			case 'l':
 				g_loop_playback = 1;
+				break;
+			case 's':
+				g_stats_enabled = 1;
 				break;
 			case 'V':
 				fprintf(stderr, "pickle %s (built %s)\n", PICKLE_VERSION_STRING, PICKLE_BUILD_DATE);
@@ -3094,11 +3896,17 @@ int main(int argc, char **argv) {
 				return 0;
 			case 'h':
 				fprintf(stderr, "pickle %s - DRM/KMS video player for Raspberry Pi 4\n\n", PICKLE_VERSION_STRING);
-				fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
+				fprintf(stderr, "Usage: %s [options] <video-file> [video-file2]\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -l, --loop            Loop playback continuously\n");
+				fprintf(stderr, "  -s, --stats           Enable performance statistics overlay\n");
 				fprintf(stderr, "  -h, --help            Show this help message\n");
 				fprintf(stderr, "  -V, --version         Show version information\n");
+				fprintf(stderr, "\nDual video mode:\n");
+				fprintf(stderr, "  When two video files are specified, each video plays in its own\n");
+				fprintf(stderr, "  keystone region. Use Tab to cycle corners (1-8) across both keystones.\n");
+				fprintf(stderr, "  Keystone 1 (green corners) = left half, Keystone 2 (blue corners) = right half.\n");
+				fprintf(stderr, "  Configs saved to keystone_0.conf and keystone_1.conf respectively.\n");
 				fprintf(stderr, "\nSee README.md for environment variables and keystone controls.\n");
 				return 0;
 			default:
@@ -3109,11 +3917,42 @@ int main(int argc, char **argv) {
 
 	if (optind >= argc) {
 		fprintf(stderr, "Error: No input file specified\n");
-		fprintf(stderr, "Usage: %s [options] <video-file>\n", argv[0]);
+		fprintf(stderr, "Usage: %s [options] <video-file> [video-file2]\n", argv[0]);
 		return 1;
 	}
 
-	const char *file = argv[optind];
+	// Count video files (1 or 2 supported)
+	int num_files = argc - optind;
+	if (num_files > MAX_VIDEOS) {
+		fprintf(stderr, "Warning: Only %d video files supported, ignoring extras\n", MAX_VIDEOS);
+		num_files = MAX_VIDEOS;
+	}
+	g_num_videos = num_files;
+	if (g_num_videos == 1 && g_single_mpv_mode) {
+		// Single-mpv mode is only meaningful in dual-video; disable to avoid confusion
+		g_single_mpv_mode = 0;
+	}
+	
+	// Target FPS can be set via environment variable for frame pacing
+	// By default, let GPU render at natural rate (vsync handles timing)
+	const char *target_fps_env = getenv("PICKLE_TARGET_FPS");
+	if (target_fps_env && *target_fps_env) {
+		g_target_fps = atoi(target_fps_env);
+		if (g_target_fps > 0) {
+			g_frame_interval_us = 1000000.0 / g_target_fps;
+			LOG_INFO("Target FPS: %d (frame interval: %.1f ms)", g_target_fps, g_frame_interval_us / 1000.0);
+		}
+	}
+	
+	// Store video file paths
+	const char *files[MAX_VIDEOS] = {NULL, NULL};
+	for (int i = 0; i < num_files; i++) {
+		files[i] = argv[optind + i];
+		g_videos[i].video_file = files[i];
+	}
+	
+	// For backward compatibility with single video mode
+	const char *file = files[0];
 	
 	// Environment variable override
 	const char *loop_env = getenv("PICKLE_LOOP");
@@ -3166,12 +4005,22 @@ int main(int argc, char **argv) {
 
 	struct kms_ctx drm = {0};
 	struct egl_ctx eglc = {0};
-	mpv_player_t player = {0};
+	mpv_player_t player = {0};      // Primary player (for single video mode)
+	mpv_player_t player2 = {0};     // Secondary player (for dual video mode)
 
 	// Parse stats env
 	const char *stats_env = getenv("PICKLE_STATS");
 	if (stats_env && *stats_env && strcmp(stats_env, "0") != 0 && strcasecmp(stats_env, "off") != 0) {
 		g_stats_enabled = 1;
+		const char *ival = getenv("PICKLE_STATS_INTERVAL");
+		if (ival && *ival) {
+			double v = atof(ival);
+			if (v > 0.05) g_stats_interval_sec = v; // clamp minimal interval
+		}
+	}
+	
+	// Initialize stats timer if enabled (by flag or env)
+	if (g_stats_enabled) {
 		const char *ival = getenv("PICKLE_STATS_INTERVAL");
 		if (ival && *ival) {
 			double v = atof(ival);
@@ -3192,28 +4041,79 @@ int main(int argc, char **argv) {
 	}
 	preallocate_fb_ring(&drm, &eglc, fb_ring_n);
 	
-	// Initialize keystone correction
-	keystone_init();
+	// Initialize keystone correction based on number of videos
+	if (g_num_videos == 1) {
+		// Single video mode: use legacy keystone_init()
+		keystone_init();
+		g_videos[0].player = &player;
+		g_videos[0].use_subrect = 0;
+	} else {
+		// Multi-video mode: initialize each video instance with split keystones
+		for (int i = 0; i < g_num_videos; i++) {
+			keystone_init_instance(&g_videos[i], i, g_num_videos);
+			keystone_load_instance_config(&g_videos[i]);
+			keystone_update_matrix_for(&g_videos[i].keystone);
+			g_videos[i].use_subrect = 0;
+		}
+		if (g_single_mpv_mode) {
+			// Both keystones sample from the same composite texture; set sub-rects
+			g_videos[0].player = &player;
+			g_videos[1].player = &player; // shared mpv
+			g_videos[0].use_subrect = 1; g_videos[0].u0 = 0.0f; g_videos[0].u1 = 0.5f; g_videos[0].v0 = 0.0f; g_videos[0].v1 = 1.0f;
+			g_videos[1].use_subrect = 1; g_videos[1].u0 = 0.5f; g_videos[1].u1 = 1.0f; g_videos[1].v0 = 0.0f; g_videos[1].v1 = 1.0f;
+		} else {
+			g_videos[0].player = &player;
+			g_videos[1].player = &player2;
+		}
+		// Set initial active corner to video 0, corner 0 (top-left)
+		g_active_corner_global = 0;
+		g_videos[0].keystone.active_corner = 0;
+		fprintf(stderr, "\nDual video mode: %d videos loaded\n", g_num_videos);
+	}
 	
-	if (!init_mpv(&player, file)) RET("init_mpv");
+	// Initialize mpv player(s)
+	if (g_num_videos > 1 && g_single_mpv_mode) {
+		if (!init_mpv_lavfi_dual(&player, files[0], files[1])) RET("init_mpv_lavfi_dual");
+		// Shared player already assigned above
+	} else {
+		if (!init_mpv(&player, files[0])) RET("init_mpv");
+		if (g_num_videos > 1) {
+			if (!init_mpv(&player2, files[1])) RET("init_mpv (video 2)");
+		}
+	}
 	// Prime event processing in case mpv already queued wakeups before pipe creation.
 	g_mpv_wakeup = 1;
 
 	fprintf(stderr, "pickle %s (built %s)\n", PICKLE_VERSION_STRING, PICKLE_BUILD_DATE);
-	fprintf(stderr, "Playing %s at %dx%d %.2f Hz\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
-			(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal))); 
+	if (g_num_videos == 1) {
+		fprintf(stderr, "Playing %s at %dx%d %.2f Hz\n", file, drm.mode.hdisplay, drm.mode.vdisplay,
+				(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal)));
+	} else {
+		fprintf(stderr, "Playing %d videos at %dx%d %.2f Hz\n", g_num_videos, drm.mode.hdisplay, drm.mode.vdisplay,
+				(drm.mode.vrefresh ? (double)drm.mode.vrefresh : (double)drm.mode.clock / (drm.mode.htotal * drm.mode.vtotal)));
+		for (int i = 0; i < g_num_videos; i++) {
+			fprintf(stderr, "  Video %d: %s\n", i + 1, files[i]);
+		}
+	}
 	
 	// Print keystone control instructions
-	if (g_keystone.enabled) {
-		fprintf(stderr, "\nKeystone correction enabled. Controls:\n");
+	if (g_num_videos == 1) {
+		if (g_keystone.enabled) {
+			fprintf(stderr, "\nKeystone correction enabled. Controls:\n");
+		} else {
+			fprintf(stderr, "\nKeystone correction available. Controls:\n");
+		}
+		fprintf(stderr, "  k - Toggle keystone mode\n");
+		fprintf(stderr, "  1-4 - Select corner to adjust\n");
 	} else {
-		fprintf(stderr, "\nKeystone correction available. Controls:\n");
+		fprintf(stderr, "\nDual keystone mode. Controls:\n");
+		fprintf(stderr, "  Tab - Cycle through all 8 corners (both keystones)\n");
+		fprintf(stderr, "  1-4 - Select corner on keystone 1 (green)\n");
+		fprintf(stderr, "  5-8 - Select corner on keystone 2 (blue)\n");
 	}
-	fprintf(stderr, "  k - Toggle keystone mode\n");
-	fprintf(stderr, "  1-4 - Select corner to adjust\n");
 	fprintf(stderr, "  w/a/s/d - Move selected corner up/left/down/right\n");
 	fprintf(stderr, "  +/- - Increase/decrease adjustment step size\n");
-	fprintf(stderr, "  r - Reset keystone to default\n");
+	fprintf(stderr, "  r - Reset current keystone to default\n");
 	fprintf(stderr, "  b - Toggle border around video\n");
 	fprintf(stderr, "  [/] - Decrease/increase border width\n");
 	fprintf(stderr, "  (border draws around keystone quad; background is always black)\n\n");
@@ -3265,6 +4165,14 @@ int main(int argc, char **argv) {
 			if (player.rctx) {
 				uint64_t flags = mpv_render_context_update(player.rctx);
 				g_mpv_update_flags |= flags;
+			}
+			// Handle second player in dual-video mode
+			if (g_num_videos > 1 && player2.mpv) {
+				drain_mpv_events(player2.mpv);
+				if (player2.rctx) {
+					uint64_t flags = mpv_render_context_update(player2.rctx);
+					g_mpv_update_flags |= flags;
+				}
 			}
 		}
 		// Check controller quit combo (START+SELECT 2s)
@@ -3417,10 +4325,26 @@ int main(int argc, char **argv) {
 			}
 		}
 		if (g_stop) break;
+		
+		// Check if we can render a new frame
+		// With triple buffering, we could allow more parallelism, but for stability
+		// we wait until the current flip completes
 		int need_frame = 0;
 		if (frames == 0 && !g_pending_flip) need_frame = 1; // guarantee first frame submission
 		else if (force_loop && !g_pending_flip) need_frame = 1; // continuous mode
 		else if ((g_mpv_update_flags & MPV_RENDER_UPDATE_FRAME) && !g_pending_flip) need_frame = 1;
+		
+		// Frame pacing: if target FPS is set, throttle frame rate for smooth playback
+		if (need_frame && g_target_fps > 0 && frames > 0) {
+			struct timeval now;
+			gettimeofday(&now, NULL);
+			double elapsed_us = (double)(now.tv_sec - g_last_render_time.tv_sec) * 1000000.0 +
+			                    (double)(now.tv_usec - g_last_render_time.tv_usec);
+			if (elapsed_us < g_frame_interval_us) {
+				// Not enough time has passed, skip this frame
+				need_frame = 0;
+			}
+		}
 
 		// Watchdog: if still no frame after WD_FIRST_MS since start, force once.
 		if (!frames && !need_frame && !wd_forced_first) {
@@ -3444,6 +4368,7 @@ int main(int argc, char **argv) {
 				
 				// Reset potential stuck state
 				g_pending_flip = 0;
+				g_pending_flips = 0;
 				g_mpv_update_flags |= MPV_RENDER_UPDATE_FRAME; // Force frame rendering
 				need_frame = 1;
 				g_stall_reset_count++;
@@ -3509,24 +4434,31 @@ int main(int argc, char **argv) {
 
 	stats_log_final(&player);
 	
-	// Save keystone settings to a file if they were modified
-	if (g_keystone.enabled) {
-		// First try to save to local directory
-		if (keystone_save_config("./keystone.conf")) {
-			LOG_INFO("Saved keystone configuration to ./keystone.conf");
-		} else {
-			// If that fails, save to user's home directory
-			const char* home = getenv("HOME");
-			if (home) {
-				char config_path[512];
-				snprintf(config_path, sizeof(config_path), "%s/.config", home);
-				
-				// Create .config directory if it doesn't exist
-				mkdir(config_path, 0755);
-				
-				snprintf(config_path, sizeof(config_path), "%s/.config/pickle_keystone.conf", home);
-				if (keystone_save_config(config_path)) {
-					LOG_INFO("Saved keystone configuration to %s", config_path);
+	// Save keystone settings based on mode
+	if (g_num_videos == 1) {
+		// Single video mode: save legacy keystone
+		if (g_keystone.enabled) {
+			if (keystone_save_config("./keystone.conf")) {
+				LOG_INFO("Saved keystone configuration to ./keystone.conf");
+			} else {
+				const char* home = getenv("HOME");
+				if (home) {
+					char config_path[512];
+					snprintf(config_path, sizeof(config_path), "%s/.config", home);
+					mkdir(config_path, 0755);
+					snprintf(config_path, sizeof(config_path), "%s/.config/pickle_keystone.conf", home);
+					if (keystone_save_config(config_path)) {
+						LOG_INFO("Saved keystone configuration to %s", config_path);
+					}
+				}
+			}
+		}
+	} else {
+		// Multi-video mode: save each keystone config
+		for (int i = 0; i < g_num_videos; i++) {
+			if (g_videos[i].keystone.enabled) {
+				if (keystone_save_instance_config(&g_videos[i])) {
+					LOG_INFO("Saved keystone %d configuration to %s", i, g_videos[i].config_path);
 				}
 			}
 		}
@@ -3541,6 +4473,9 @@ int main(int argc, char **argv) {
 	}
 	
 	destroy_mpv(&player);
+	if (g_num_videos > 1) {
+		destroy_mpv(&player2);
+	}
 	deinit_gbm_egl(&eglc);
 	deinit_drm(&drm);
 	return 0;
@@ -3554,9 +4489,11 @@ fail:
 	}
 	
 	destroy_mpv(&player);
+	if (g_num_videos > 1) {
+		destroy_mpv(&player2);
+	}
 	deinit_gbm_egl(&eglc);
 	deinit_drm(&drm);
 	
 	return 1;
 }
-
